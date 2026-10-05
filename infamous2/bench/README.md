@@ -24,6 +24,9 @@ Scripts:
 - `ab3.sh <label> <reps> <seconds> "<live controls 8..>" ...`: switch changes on and off inside one boot through
   `live.ctl` and print FPS, power, GPU clock, GPU busy and render-thread CPU per arm. `ab.sh` is the older two-control
   form. Only arms switched inside one boot are comparable: the camera does not land on the same view every boot.
+- `compare.sh <label> <stock|stock-nostrict|play> <pier|dock|city|street>`: one boot of a scene with RPCS3's own
+  paths or with the launcher's settings, three arms of 10 s and a screenshot; `UNCAPPED=1` lifts the 60 FPS cap. This
+  produced the table in the top-level README.
 - `spawn-bench.sh <label> <binary> <state> <capped|uncapped>`: one build at a state's spawn camera, four arms of 10 s.
 - `replace_bench.sh`, `lightning_shots.sh`: dock state standing still and firing lightning, per lighting mode.
 - `roam.sh <rounds>`: walk, turn, jump and fire, for the content-check modes.

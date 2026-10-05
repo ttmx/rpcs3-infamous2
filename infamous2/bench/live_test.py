@@ -68,7 +68,9 @@ def serve(label, extra=()):
         raw_target.write_bytes(raw_source.read_bytes())
         (session/'guest-bytecode-cache.json').write_text(json.dumps(dict(source=str(raw_source),sha256=sha(raw_source),kind='guest SPU bytecode, no native host objects'),indent=2)+'\n')
     cfg=ROOT/'play-config.yml'
-    text=(ROOT.parent/'play-config.yml').read_text()
+    # LIVE_TEST_FLAGS: 'stock' = no switches and Strict Rendering Mode on (RPCS3's own paths), 'play' = what ../launch.py sets
+    preset=os.environ.get('LIVE_TEST_FLAGS')
+    text=(ROOT.parent/('play-config-strict.yml' if preset=='stock' else 'play-config.yml')).read_text()
     # CFG:<setting>=<value> arguments override one line of the playable configuration for this test only.
     for name,value in (e[4:].split('=',1) for e in extra if e.startswith('CFG:')):
         import re as _re
@@ -80,9 +82,16 @@ def serve(label, extra=()):
     if not profile.is_dir(): raise RuntimeError('No test profile: copy your RPCS3 configuration folder to '+str(profile))
     (profile/'vfs.yml').write_text('"$(EmulatorDir)": "'+str(profile)+'/"\n')
     (ROOT/'live.ctl').write_text('1000 65536 1 0 0 0 0\n')
-    env=launcher.base_env(launcher.BASE_FLAGS,cache=cache,profile=ROOT/'profile')
-    env.update(RPCS3_NATIVE_SSAO='5',RPCS3_VK_LIVE_CTL=str(ROOT/'live.ctl'),RPCS3_VK_PERIODIC_SUBMIT_US='1000',
-               RPCS3_EXPERIMENT_BLIT_COMPLEMENT='1',RPCS3_FIFO_INLINE_CACHE='1',RPCS3_EXPERIMENT_LAST_IMAGE_VIEW='1')
+    if preset=='stock':
+        env=launcher.base_env({},cache=cache,profile=ROOT/'profile')
+        del env['RPCS3_VK_LIVE_CTL']
+    elif preset=='play':
+        env=launcher.base_env(cache=cache,profile=ROOT/'profile')
+        env['RPCS3_VK_LIVE_CTL']=str(ROOT/'live.ctl')
+    else:
+        env=launcher.base_env(launcher.BASE_FLAGS,cache=cache,profile=ROOT/'profile')
+        env.update(RPCS3_NATIVE_SSAO='5',RPCS3_VK_LIVE_CTL=str(ROOT/'live.ctl'),RPCS3_VK_PERIODIC_SUBMIT_US='1000',
+                   RPCS3_EXPERIMENT_BLIT_COMPLEMENT='1',RPCS3_FIFO_INLINE_CACHE='1',RPCS3_EXPERIMENT_LAST_IMAGE_VIEW='1')
     # Extra NAME=VALUE flags; {session} expands to this run's directory.
     env.update(dict(e.replace('{session}',str(session)).split('=',1) for e in extra))
     argv=[str(binary),'--no-gui','--input-config=ProfilingKeyboard','--config='+str(cfg),os.environ.get('LIVE_TEST_BOOT',str(ROOT/'states/dock.SAVESTAT.zst'))]

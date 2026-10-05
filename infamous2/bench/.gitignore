@@ -1,8 +1,8 @@
 # Local test state: your profile copy, savestates, per-run sessions and caches
-/profile/
-/states/
-/sessions/
-/cache-*/
+/profile
+/states
+/sessions
+/cache-*
 /play-config.yml
 /live.ctl
 /state.json

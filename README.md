@@ -5,13 +5,26 @@ inFamous 2 (BCES01143, v1.04) lighter to run on the Vulkan renderer. Upstream's 
 [README.upstream.md](README.upstream.md).
 
 Everything was measured on one machine: a Ryzen 7 8845HS laptop with its integrated Radeon 780M (RADV), Linux, game
-at 1280x720 with no quality settings lowered. On that machine, with the GPU left on its default governor:
+at 1280x720 with no quality settings lowered, on AC with the GPU left on its default governor.
 
-| Scene | Before | Now |
-|---|---|---|
-| Burning dock (heavy lighting and effects) | 17.6 FPS | 60 FPS (the game's cap) at about 37 W |
-| City, slow street view (about 10,000 draws per frame) | 44 FPS | 59-61 FPS |
-| Swamp pier (mission start) | 46.8 FPS | 60 FPS (cap) |
+| Scene | Stock, Strict Rendering on | Stock, Strict Rendering off | This build, 60 FPS cap | This build, uncapped |
+|---|---|---|---|---|
+| Burning dock (heavy lighting and effects) | 14.6 FPS | 27.6 FPS | 60.0 FPS | 95.7 FPS |
+| City, slow street view (about 10,000 draws per frame) | 22.7 FPS | 31.8 FPS | 59.0 FPS | 60.5 FPS |
+| City, savestate spawn view | 26.5 FPS | 33.1 FPS | 59.9 FPS | 69.9 FPS |
+| Swamp pier (mission start) | 34.7 FPS | not measured | 60.0 FPS | 108.0 FPS |
+
+"Stock" is this same binary with every switch unset, which leaves RPCS3's own code paths; Strict Rendering Mode is
+an RPCS3 setting, so the second column is the fair baseline. The game caps itself at 60 FPS. "Uncapped" turns the
+frame limit off and sets the vblank rate to 120, which shows the headroom but is a benchmark setting, not a way to
+play. Each figure is the mean of three 10-second samples from one boot of a savestate
+(`infamous2/bench/compare.sh`); package power went from 31 W (stock, Strict off) to 38 W at the dock's 60 FPS cap.
+
+Stock with Strict Rendering off on the left, this build uncapped on the right (FPS counter top left):
+
+![Burning dock: 27.7 FPS stock, 93.4 FPS with this build](infamous2/docs/images/dock-before-after.jpg)
+
+![City street: 31.7 FPS stock, 62.0 FPS with this build](infamous2/docs/images/street-before-after.jpg)
 
 These are software changes. The two host tuning steps that were also tried (a GPU clock floor and a power profile)
 are kept apart in [`infamous2/hardware/`](infamous2/hardware/) and are off unless you ask for them.
