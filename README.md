@@ -12,7 +12,7 @@ at 1280x720 with no quality settings lowered, on AC with the GPU left on its def
 | Burning dock (heavy lighting and effects) | 14.6 FPS | 27.6 FPS | 60.0 FPS | 95.7 FPS |
 | City, slow street view (about 10,000 draws per frame) | 22.7 FPS | 31.8 FPS | 59.0 FPS | 60.5 FPS |
 | City, savestate spawn view | 26.5 FPS | 33.1 FPS | 59.9 FPS | 69.9 FPS |
-| Swamp pier (mission start) | 34.7 FPS | not measured | 60.0 FPS | 108.0 FPS |
+| Swamp pier (mission start) | 34.7 FPS | 34.3 FPS | 60.0 FPS | 108.0 FPS |
 
 "Stock" is this same binary with every switch unset, which leaves RPCS3's own code paths; Strict Rendering Mode is
 an RPCS3 setting, so the second column is the fair baseline. The game caps itself at 60 FPS. "Uncapped" turns the
@@ -137,7 +137,9 @@ the SPUs, and uploads the results as textures. Emulated, that round trip was mos
 
 ### Configuration
 
-- **Strict Rendering Mode off**: pier 49.4 to 52.8 FPS; `infamous2/launch.py --strict` turns it back on.
+- **Strict Rendering Mode off**: on stock paths it nearly doubles the dock (14.6 to 27.6 FPS) and does nothing at
+  the pier; with periodic submission on, the pier went from 49.4 to 52.8 FPS. `infamous2/launch.py --strict` turns it
+  back on.
 
 ### Host tuning, kept separate
 
