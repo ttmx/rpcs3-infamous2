@@ -4546,10 +4546,19 @@ public:
 		fpm.addPass(SimplifyCFGPass());
 		fpm.addPass(DSEPass());
 		fpm.addPass(createFunctionToLoopPassAdaptor(LICMPass(LICMOptions()), true));
+		// GVN without partial redundancy elimination. LLVM renamed setPRE to setScalarPRE.
+		const auto gvn_no_pre = [](auto options)
+		{
+			if constexpr (requires { options.setScalarPRE(false); })
+				options.setScalarPRE(false);
+			else
+				options.setPRE(false);
+			return options.setLoadPRE(false);
+		};
 		if (g_spu_gvn_experiment)
 		{
 			// Preserve the existing floating-point flags and memory semantics.
-			fpm.addPass(GVNPass(GVNOptions().setScalarPRE(false).setLoadPRE(false)));
+			fpm.addPass(GVNPass(gvn_no_pre(GVNOptions())));
 			fpm.addPass(InstCombinePass());
 		}
 		if (g_spu_gather_pack_experiment && g_spu_pack_thread_experiment
@@ -4561,7 +4570,7 @@ public:
 			fpm.addPass(JumpThreadingPass(250));
 			if (g_spu_pack_cleanup_experiment)
 			{
-				fpm.addPass(GVNPass(GVNOptions().setScalarPRE(false).setLoadPRE(false)));
+				fpm.addPass(GVNPass(gvn_no_pre(GVNOptions())));
 				fpm.addPass(InstCombinePass());
 			}
 			fpm.addPass(SimplifyCFGPass());
