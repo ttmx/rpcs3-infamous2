@@ -1,0 +1,67 @@
+name: Build inFamous 2 AppImage
+
+# Linux x86_64 AppImage of this branch, built the way upstream's "Build RPCS3" workflow builds its clang one.
+# Started by hand from the Actions tab; the AppImage is attached to the run as an artifact.
+on:
+  workflow_dispatch:
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  BUILD_REPOSITORY_NAME: ${{ github.repository }}
+  BUILD_SOURCEBRANCHNAME: ${{ github.ref_name }}
+  BUILD_SOURCEVERSION: ${{ github.sha }}
+  BUILD_ARTIFACTSTAGINGDIRECTORY: ${{ github.workspace }}/artifacts/
+
+jobs:
+  Linux_Build:
+    name: RPCS3 Linux x86_64 clang
+    runs-on: ubuntu-24.04
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/ccache
+      DEPLOY_APPIMAGE: true
+      APPDIR: "/rpcs3/build/appdir"
+      ARTDIR: "/root/artifacts"
+      RELEASE_MESSAGE: "/rpcs3/GitHubReleaseMessage.txt"
+      COMPILER: clang
+      RUN_UNIT_TESTS: "OFF"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@main
+        with:
+          fetch-depth: 0
+
+      - name: Restore build Ccache
+        uses: actions/cache/restore@main
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ${{ runner.os }}-ccache-clang-${{ runner.arch }}-${{ github.run_id }}
+          restore-keys: ${{ runner.os }}-ccache-clang-${{ runner.arch }}-
+
+      - name: Docker setup and build
+        run: |
+          docker pull --quiet rpcs3/rpcs3-ci-jammy:2.1
+          docker run \
+            -v $PWD:/rpcs3 \
+            --env-file .ci/docker.env \
+            -v ${{ env.CCACHE_DIR }}:/root/.ccache \
+            -v ${{ env.BUILD_ARTIFACTSTAGINGDIRECTORY }}:/root/artifacts \
+            rpcs3/rpcs3-ci-jammy:2.1 \
+            /rpcs3/.ci/build-linux.sh
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@main
+        with:
+          name: RPCS3 inFamous 2 for Linux (x86_64)
+          path: ${{ env.BUILD_ARTIFACTSTAGINGDIRECTORY }}/*.AppImage
+          compression-level: 0
+          if-no-files-found: error
+
+      - name: Save build Ccache
+        if: always()
+        uses: actions/cache/save@main
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ${{ runner.os }}-ccache-clang-${{ runner.arch }}-${{ github.run_id }}
