@@ -1,0 +1,1253 @@
+{
+  "cases": [
+    {
+      "count": 1,
+      "kind": "point",
+      "metrics": {
+        "native": {
+          "A": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          },
+          "B": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          }
+        },
+        "gpu": {
+          "A": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          },
+          "B": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          }
+        }
+      },
+      "passed": true
+    },
+    {
+      "count": 1,
+      "kind": "mixed",
+      "metrics": {
+        "native": {
+          "A": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          },
+          "B": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          }
+        },
+        "gpu": {
+          "A": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          },
+          "B": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          }
+        }
+      },
+      "passed": true
+    },
+    {
+      "count": 31,
+      "kind": "point",
+      "metrics": {
+        "native": {
+          "A": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          },
+          "B": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          }
+        },
+        "gpu": {
+          "A": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          },
+          "B": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          }
+        }
+      },
+      "passed": true
+    },
+    {
+      "count": 31,
+      "kind": "mixed",
+      "metrics": {
+        "native": {
+          "A": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          },
+          "B": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          }
+        },
+        "gpu": {
+          "A": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          },
+          "B": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          }
+        }
+      },
+      "passed": true
+    },
+    {
+      "count": 32,
+      "kind": "point",
+      "metrics": {
+        "native": {
+          "A": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          },
+          "B": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          }
+        },
+        "gpu": {
+          "A": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          },
+          "B": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          }
+        }
+      },
+      "passed": true
+    },
+    {
+      "count": 32,
+      "kind": "mixed",
+      "metrics": {
+        "native": {
+          "A": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          },
+          "B": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          }
+        },
+        "gpu": {
+          "A": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          },
+          "B": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          }
+        }
+      },
+      "passed": true
+    },
+    {
+      "count": 33,
+      "kind": "point",
+      "metrics": {
+        "native": {
+          "A": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          },
+          "B": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          }
+        },
+        "gpu": {
+          "A": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          },
+          "B": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          }
+        }
+      },
+      "passed": true
+    },
+    {
+      "count": 33,
+      "kind": "mixed",
+      "metrics": {
+        "native": {
+          "A": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          },
+          "B": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          }
+        },
+        "gpu": {
+          "A": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          },
+          "B": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          }
+        }
+      },
+      "passed": true
+    },
+    {
+      "count": 59,
+      "kind": "point",
+      "metrics": {
+        "native": {
+          "A": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          },
+          "B": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          }
+        },
+        "gpu": {
+          "A": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          },
+          "B": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          }
+        }
+      },
+      "passed": true
+    },
+    {
+      "count": 59,
+      "kind": "mixed",
+      "metrics": {
+        "native": {
+          "A": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          },
+          "B": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          }
+        },
+        "gpu": {
+          "A": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          },
+          "B": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          }
+        }
+      },
+      "passed": true
+    },
+    {
+      "count": 63,
+      "kind": "point",
+      "metrics": {
+        "native": {
+          "A": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          },
+          "B": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          }
+        },
+        "gpu": {
+          "A": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          },
+          "B": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          }
+        }
+      },
+      "passed": true
+    },
+    {
+      "count": 63,
+      "kind": "mixed",
+      "metrics": {
+        "native": {
+          "A": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          },
+          "B": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          }
+        },
+        "gpu": {
+          "A": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          },
+          "B": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          }
+        }
+      },
+      "passed": true
+    },
+    {
+      "count": 64,
+      "kind": "point",
+      "metrics": {
+        "native": {
+          "A": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          },
+          "B": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          }
+        },
+        "gpu": {
+          "A": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          },
+          "B": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          }
+        }
+      },
+      "passed": true
+    },
+    {
+      "count": 64,
+      "kind": "mixed",
+      "metrics": {
+        "native": {
+          "A": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          },
+          "B": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          }
+        },
+        "gpu": {
+          "A": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          },
+          "B": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          }
+        }
+      },
+      "passed": true
+    },
+    {
+      "count": 65,
+      "kind": "point",
+      "metrics": {
+        "native": {
+          "A": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          },
+          "B": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          }
+        },
+        "gpu": {
+          "A": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          },
+          "B": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          }
+        }
+      },
+      "passed": true
+    },
+    {
+      "count": 65,
+      "kind": "mixed",
+      "metrics": {
+        "native": {
+          "A": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          },
+          "B": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          }
+        },
+        "gpu": {
+          "A": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          },
+          "B": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          }
+        }
+      },
+      "passed": true
+    },
+    {
+      "count": 69,
+      "kind": "point",
+      "metrics": {
+        "native": {
+          "A": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          },
+          "B": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          }
+        },
+        "gpu": {
+          "A": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          },
+          "B": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          }
+        }
+      },
+      "passed": true
+    },
+    {
+      "count": 69,
+      "kind": "mixed",
+      "metrics": {
+        "native": {
+          "A": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          },
+          "B": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          }
+        },
+        "gpu": {
+          "A": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          },
+          "B": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          }
+        }
+      },
+      "passed": true
+    },
+    {
+      "count": 96,
+      "kind": "point",
+      "metrics": {
+        "native": {
+          "A": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          },
+          "B": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          }
+        },
+        "gpu": {
+          "A": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          },
+          "B": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          }
+        }
+      },
+      "passed": true
+    },
+    {
+      "count": 96,
+      "kind": "mixed",
+      "metrics": {
+        "native": {
+          "A": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          },
+          "B": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          }
+        },
+        "gpu": {
+          "A": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          },
+          "B": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          }
+        }
+      },
+      "passed": true
+    },
+    {
+      "count": 127,
+      "kind": "point",
+      "metrics": {
+        "native": {
+          "A": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          },
+          "B": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          }
+        },
+        "gpu": {
+          "A": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          },
+          "B": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          }
+        }
+      },
+      "passed": true
+    },
+    {
+      "count": 127,
+      "kind": "mixed",
+      "metrics": {
+        "native": {
+          "A": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          },
+          "B": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          }
+        },
+        "gpu": {
+          "A": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          },
+          "B": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          }
+        }
+      },
+      "passed": true
+    },
+    {
+      "count": 128,
+      "kind": "point",
+      "metrics": {
+        "native": {
+          "A": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          },
+          "B": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          }
+        },
+        "gpu": {
+          "A": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          },
+          "B": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          }
+        }
+      },
+      "passed": true
+    },
+    {
+      "count": 128,
+      "kind": "mixed",
+      "metrics": {
+        "native": {
+          "A": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          },
+          "B": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          }
+        },
+        "gpu": {
+          "A": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          },
+          "B": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          }
+        }
+      },
+      "passed": true
+    },
+    {
+      "count": 129,
+      "kind": "point",
+      "metrics": {
+        "native": {
+          "A": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          },
+          "B": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          }
+        },
+        "gpu": {
+          "A": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          },
+          "B": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          }
+        }
+      },
+      "passed": true
+    },
+    {
+      "count": 129,
+      "kind": "mixed",
+      "metrics": {
+        "native": {
+          "A": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          },
+          "B": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          }
+        },
+        "gpu": {
+          "A": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          },
+          "B": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          }
+        }
+      },
+      "passed": true
+    },
+    {
+      "count": 200,
+      "kind": "point",
+      "metrics": {
+        "native": {
+          "A": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          },
+          "B": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          }
+        },
+        "gpu": {
+          "A": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          },
+          "B": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          }
+        }
+      },
+      "passed": true
+    },
+    {
+      "count": 200,
+      "kind": "mixed",
+      "metrics": {
+        "native": {
+          "A": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          },
+          "B": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          }
+        },
+        "gpu": {
+          "A": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          },
+          "B": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          }
+        }
+      },
+      "passed": true
+    },
+    {
+      "count": 255,
+      "kind": "point",
+      "metrics": {
+        "native": {
+          "A": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          },
+          "B": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          }
+        },
+        "gpu": {
+          "A": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          },
+          "B": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          }
+        }
+      },
+      "passed": true
+    },
+    {
+      "count": 255,
+      "kind": "mixed",
+      "metrics": {
+        "native": {
+          "A": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          },
+          "B": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          }
+        },
+        "gpu": {
+          "A": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          },
+          "B": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          }
+        }
+      },
+      "passed": true
+    },
+    {
+      "count": 256,
+      "kind": "point",
+      "metrics": {
+        "native": {
+          "A": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          },
+          "B": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          }
+        },
+        "gpu": {
+          "A": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          },
+          "B": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          }
+        }
+      },
+      "passed": true
+    },
+    {
+      "count": 256,
+      "kind": "mixed",
+      "metrics": {
+        "native": {
+          "A": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          },
+          "B": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          }
+        },
+        "gpu": {
+          "A": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          },
+          "B": {
+            "identical_bytes": 1.0,
+            "pixels_within_1": 1.0,
+            "pixels_within_4": 1.0,
+            "max_error": 0,
+            "mean_error": 0.0
+          }
+        }
+      },
+      "passed": true
+    }
+  ],
+  "passed": true
+}

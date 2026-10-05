@@ -1,0 +1,31 @@
+#!/bin/sh
+# Sets the AMD GPU power policy: high | auto | floor-<MHz> (minimum GPU clock, inside the stock range only).
+# Needs root. The first amdgpu card with clock controls is used; set CARD=/sys/class/drm/cardN/device to pick one.
+d=$CARD
+if [ -z "$d" ]; then
+  for c in /sys/class/drm/card[0-9]*/device; do
+    [ "$(cat "$c/vendor" 2>/dev/null)" = "0x1002" ] && [ -e "$c/pp_od_clk_voltage" ] && { d=$c; break; }
+  done
+fi
+[ -n "$d" ] && [ "$(cat "$d/vendor" 2>/dev/null)" = "0x1002" ] || { echo "no AMD GPU with clock controls found" >&2; exit 1; }
+f=$d/power_dpm_force_performance_level
+# Stock clock range in MHz, from the "SCLK: <min>Mhz <max>Mhz" line.
+range=$(sed -n '/^OD_RANGE:/,$ s/^SCLK: *\([0-9]*\)Mhz *\([0-9]*\)Mhz.*/\1 \2/p' "$d/pp_od_clk_voltage")
+min=${range% *}; max=${range#* }
+reset() {
+  if [ "$(cat $f)" = "manual" ]; then echo r > $d/pp_od_clk_voltage; echo c > $d/pp_od_clk_voltage; fi
+}
+case "$1" in
+  range) echo "$d: $min-$max MHz, policy $(cat $f)" ;;
+  auto) [ "$(cat $f)" = "manual" ] || echo manual > $f; reset; echo auto > $f ;;
+  high) reset; echo high > $f ;;
+  floor-*)
+    mhz=${1#floor-}
+    case "$mhz" in ''|*[!0-9]*) echo "floor-<MHz> needs a number" >&2; exit 2 ;; esac
+    [ -n "$min" ] && [ "$mhz" -ge "$min" ] && [ "$mhz" -le "$max" ] || { echo "floor must be within $min-$max MHz" >&2; exit 2; }
+    echo manual > $f
+    echo "s 0 $mhz" > $d/pp_od_clk_voltage
+    echo "s 1 $max" > $d/pp_od_clk_voltage
+    echo c > $d/pp_od_clk_voltage ;;
+  *) echo "usage: rpcs3-gpu-perf high|auto|floor-<MHz>|range" >&2; exit 2 ;;
+esac

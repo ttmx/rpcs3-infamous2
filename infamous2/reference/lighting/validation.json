@@ -1,0 +1,231 @@
+{
+  "capture": "cap/run050",
+  "oracle": "SPU interpreter, unfused arithmetic",
+  "cases": {
+    "point": {
+      "A": {
+        "identical_bytes": 1.0,
+        "pixels_within_1": 1.0,
+        "pixels_within_4": 1.0,
+        "max_error": 0,
+        "mean_error": 0.0
+      },
+      "B": {
+        "identical_bytes": 1.0,
+        "pixels_within_1": 1.0,
+        "pixels_within_4": 1.0,
+        "max_error": 0,
+        "mean_error": 0.0
+      }
+    },
+    "overlapping_points": {
+      "A": {
+        "identical_bytes": 1.0,
+        "pixels_within_1": 1.0,
+        "pixels_within_4": 1.0,
+        "max_error": 0,
+        "mean_error": 0.0
+      },
+      "B": {
+        "identical_bytes": 1.0,
+        "pixels_within_1": 1.0,
+        "pixels_within_4": 1.0,
+        "max_error": 0,
+        "mean_error": 0.0
+      }
+    },
+    "spot_centre": {
+      "A": {
+        "identical_bytes": 1.0,
+        "pixels_within_1": 1.0,
+        "pixels_within_4": 1.0,
+        "max_error": 0,
+        "mean_error": 0.0
+      },
+      "B": {
+        "identical_bytes": 1.0,
+        "pixels_within_1": 1.0,
+        "pixels_within_4": 1.0,
+        "max_error": 0,
+        "mean_error": 0.0
+      }
+    },
+    "spot_falloff": {
+      "A": {
+        "identical_bytes": 1.0,
+        "pixels_within_1": 1.0,
+        "pixels_within_4": 1.0,
+        "max_error": 0,
+        "mean_error": 0.0
+      },
+      "B": {
+        "identical_bytes": 1.0,
+        "pixels_within_1": 1.0,
+        "pixels_within_4": 1.0,
+        "max_error": 0,
+        "mean_error": 0.0
+      }
+    },
+    "spot_outside": {
+      "A": {
+        "identical_bytes": 1.0,
+        "pixels_within_1": 1.0,
+        "pixels_within_4": 1.0,
+        "max_error": 0,
+        "mean_error": 0.0
+      },
+      "B": {
+        "identical_bytes": 1.0,
+        "pixels_within_1": 1.0,
+        "pixels_within_4": 1.0,
+        "max_error": 0,
+        "mean_error": 0.0
+      }
+    },
+    "spot_near_cutoff": {
+      "A": {
+        "identical_bytes": 1.0,
+        "pixels_within_1": 1.0,
+        "pixels_within_4": 1.0,
+        "max_error": 0,
+        "mean_error": 0.0
+      },
+      "B": {
+        "identical_bytes": 1.0,
+        "pixels_within_1": 1.0,
+        "pixels_within_4": 1.0,
+        "max_error": 0,
+        "mean_error": 0.0
+      }
+    },
+    "point_and_spot": {
+      "A": {
+        "identical_bytes": 1.0,
+        "pixels_within_1": 1.0,
+        "pixels_within_4": 1.0,
+        "max_error": 0,
+        "mean_error": 0.0
+      },
+      "B": {
+        "identical_bytes": 1.0,
+        "pixels_within_1": 1.0,
+        "pixels_within_4": 1.0,
+        "max_error": 0,
+        "mean_error": 0.0
+      }
+    },
+    "no_lights": {
+      "A": {
+        "identical_bytes": 1.0,
+        "pixels_within_1": 1.0,
+        "pixels_within_4": 1.0,
+        "max_error": 0,
+        "mean_error": 0.0
+      },
+      "B": {
+        "identical_bytes": 1.0,
+        "pixels_within_1": 1.0,
+        "pixels_within_4": 1.0,
+        "max_error": 0,
+        "mean_error": 0.0
+      }
+    },
+    "collapsed_tile": {
+      "A": {
+        "identical_bytes": 1.0,
+        "pixels_within_1": 1.0,
+        "pixels_within_4": 1.0,
+        "max_error": 0,
+        "mean_error": 0.0
+      },
+      "B": {
+        "identical_bytes": 1.0,
+        "pixels_within_1": 1.0,
+        "pixels_within_4": 1.0,
+        "max_error": 0,
+        "mean_error": 0.0
+      }
+    },
+    "sky_tile": {
+      "A": {
+        "identical_bytes": 1.0,
+        "pixels_within_1": 1.0,
+        "pixels_within_4": 1.0,
+        "max_error": 0,
+        "mean_error": 0.0
+      },
+      "B": {
+        "identical_bytes": 1.0,
+        "pixels_within_1": 1.0,
+        "pixels_within_4": 1.0,
+        "max_error": 0,
+        "mean_error": 0.0
+      }
+    },
+    "depth_byte3": {
+      "A": {
+        "identical_bytes": 1.0,
+        "pixels_within_1": 1.0,
+        "pixels_within_4": 1.0,
+        "max_error": 0,
+        "mean_error": 0.0
+      },
+      "B": {
+        "identical_bytes": 1.0,
+        "pixels_within_1": 1.0,
+        "pixels_within_4": 1.0,
+        "max_error": 0,
+        "mean_error": 0.0
+      }
+    },
+    "gloss_extremes": {
+      "A": {
+        "identical_bytes": 1.0,
+        "pixels_within_1": 1.0,
+        "pixels_within_4": 1.0,
+        "max_error": 0,
+        "mean_error": 0.0
+      },
+      "B": {
+        "identical_bytes": 0.99296875,
+        "pixels_within_1": 1.0,
+        "pixels_within_4": 1.0,
+        "max_error": 1,
+        "mean_error": 0.00703125
+      }
+    }
+  },
+  "frame_vs_interpreter": {
+    "A": {
+      "identical_bytes": 0.9999997287326389,
+      "pixels_within_1": 1.0,
+      "pixels_within_4": 1.0,
+      "max_error": 1,
+      "mean_error": 2.712673611111111e-07
+    },
+    "B": {
+      "identical_bytes": 0.9999557834201389,
+      "pixels_within_1": 1.0,
+      "pixels_within_4": 1.0,
+      "max_error": 1,
+      "mean_error": 4.421657986111111e-05
+    }
+  },
+  "frame_vs_game": {
+    "A": {
+      "identical_bytes": 0.9982975260416667,
+      "pixels_within_1": 0.9999403211805555,
+      "pixels_within_4": 1.0,
+      "max_error": 4,
+      "mean_error": 0.0017190212673611112
+    },
+    "B": {
+      "identical_bytes": 0.9997501627604166,
+      "pixels_within_1": 1.0,
+      "pixels_within_4": 1.0,
+      "max_error": 1,
+      "mean_error": 0.00024983723958333336
+    }
+  },
+  "passed": true
+}

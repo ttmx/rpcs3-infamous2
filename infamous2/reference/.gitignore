@@ -1,0 +1,14 @@
+# Captures of game data and build products of the offline harnesses
+cap/
+captures/
+stages/
+capture/
+*.npy
+*.npz
+*.pkl
+*.bin
+*.spv
+*.elf
+runner
+/lighting/offline-io/*.comp
+__pycache__/

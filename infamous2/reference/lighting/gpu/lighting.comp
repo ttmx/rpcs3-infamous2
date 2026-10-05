@@ -1,0 +1,56 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+layout(local_size_x=64) in;
+void main()
+{
+    uint index=gl_GlobalInvocationID.x;
+    if(index>=PIXELS) return;
+    uint x=index%W,y=index/W,tile=(y/40u)*40u+x/32u;
+    uint any_light=0u;
+    for(uint i=0u;i<MASK_WORDS;i++) any_light|=tile_data[MASK_WORDS*tile+i];
+    if(any_light==0u) { output_data[index]=0u; output_data[PIXELS+index]=0u; return; }
+    uvec4 a=bytes(data[data[18]+index]);
+    precise vec3 n=norm(vec3(a.yzw)*(1.0/256.0)*cf(0x40008081u)-1.0);
+    precise vec3 p=position_data[index].xyz,view=norm(p);
+    float g=gloss(float(a.x));
+    precise float spec_gain=g*cf(0x3f6d097bu)+1.0;
+    precise vec3 rgb=vec3(0);
+    precise float spec=0.0;
+    for(uint l=0u;l<data[17];l++)
+    {
+        if((tile_data[MASK_WORDS*tile+l/32u]&(1u<<(l%32u)))==0u) continue;
+        precise vec3 delta=light_vector(l,0u)-p;
+        float dsq=dot3(delta,delta),inv=estimate(dsq,true);
+        precise float dist=inv*dsq;
+        float inner=light_value(l,7u),outer=light_value(l,8u);
+        float denom=estimate(outer-inner,false);
+        precise float att=clamp(dist*(-denom)+outer*denom,0.0,1.0);
+        if(light_kind(l)==2u)
+        {
+            float gain=light_value(l,9u),cos_outer=light_value(l,10u);
+            precise float angle=dot3(delta,-light_vector(l,12u))*inv;
+            precise float cone=clamp(angle*(-gain)+gain*cos_outer,0.0,1.0);
+            att=dist>light_value(l,11u) ? att*cone : 0.0;
+        }
+        float ndl=max(dot3(n,delta)*inv,0.0);
+        precise float intensity=ndl*(att*att);
+        precise vec3 colour=light_vector(l,4u)*parameter(16u);
+        rgb=colour*intensity+rgb;
+        precise vec3 halfway=delta*inv-view;
+        float ndh=max(dot3(n,halfway)*estimate(dot3(halfway,halfway),true),0.0);
+        precise float shape=(1.0-ndh)*g+1.0;
+        shape=shape*shape; shape=shape*shape; shape=shape*shape;
+        float magnitude=dot3(colour,colour);
+        magnitude=magnitude*estimate(magnitude,true);
+        spec=(estimate(shape,false)*spec_gain)*(intensity*magnitude)+spec;
+    }
+    vec3 v=vec3(square_root(rgb.x),square_root(rgb.y),square_root(rgb.z));
+    float m=max(max(max(v.x,v.y),v.z)*cf(0x3eb504f3u),cf(0x3eb504f3u));
+    uint alpha=uint(min(floor(m*255.0),255.0));
+    precise float invm=estimate(float(alpha)*(1.0/256.0)*cf(0x3f808081u),false)*cf(0x3eb504f3u);
+    uvec3 packed=uvec3(min(floor(v*invm*255.0),vec3(255.0)));
+    output_data[index]=pack_bytes(uvec4(alpha,packed));
+    uint s=uint(min(floor(square_root(spec)*cf(0x3eb504f3u)*255.0),255.0));
+    output_data[PIXELS+index]=s<<24u;
+}

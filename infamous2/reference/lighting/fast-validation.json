@@ -1,0 +1,259 @@
+{
+  "captured_frame": {
+    "lights": 8,
+    "fast_vs_reference": {
+      "A": {
+        "identical_bytes": 0.9977688259548612,
+        "pixels_within_1": 0.999931640625,
+        "pixels_within_4": 1.0,
+        "max_error": 3,
+        "mean_error": 0.0022493489583333332
+      },
+      "B": {
+        "identical_bytes": 0.9994712999131945,
+        "pixels_within_1": 0.9999848090277778,
+        "pixels_within_4": 1.0,
+        "max_error": 3,
+        "mean_error": 0.0005330403645833333
+      }
+    },
+    "fast_vs_exact": {
+      "A": {
+        "identical_bytes": 0.9977688259548612,
+        "pixels_within_1": 0.999931640625,
+        "pixels_within_4": 1.0,
+        "max_error": 3,
+        "mean_error": 0.0022493489583333332
+      },
+      "B": {
+        "identical_bytes": 0.9994712999131945,
+        "pixels_within_1": 0.9999848090277778,
+        "pixels_within_4": 1.0,
+        "max_error": 3,
+        "mean_error": 0.0005330403645833333
+      }
+    },
+    "ms": {
+      "exact": 2.283,
+      "fast": 0.448
+    }
+  },
+  "spot_centre": {
+    "lights": 1,
+    "fast_vs_reference": {
+      "A": {
+        "identical_bytes": 0.9992333984375,
+        "pixels_within_1": 0.9999565972222222,
+        "pixels_within_4": 1.0,
+        "max_error": 2,
+        "mean_error": 0.0007823350694444444
+      },
+      "B": {
+        "identical_bytes": 0.9999639214409722,
+        "pixels_within_1": 1.0,
+        "pixels_within_4": 1.0,
+        "max_error": 1,
+        "mean_error": 3.607855902777778e-05
+      }
+    },
+    "fast_vs_exact": {
+      "A": {
+        "identical_bytes": 0.9992333984375,
+        "pixels_within_1": 0.9999565972222222,
+        "pixels_within_4": 1.0,
+        "max_error": 2,
+        "mean_error": 0.0007823350694444444
+      },
+      "B": {
+        "identical_bytes": 0.9999639214409722,
+        "pixels_within_1": 1.0,
+        "pixels_within_4": 1.0,
+        "max_error": 1,
+        "mean_error": 3.607855902777778e-05
+      }
+    },
+    "ms": {
+      "exact": 1.537,
+      "fast": 0.394
+    }
+  },
+  "point_and_spot": {
+    "lights": 2,
+    "fast_vs_reference": {
+      "A": {
+        "identical_bytes": 0.998623046875,
+        "pixels_within_1": 0.9998969184027777,
+        "pixels_within_4": 1.0,
+        "max_error": 3,
+        "mean_error": 0.001420627170138889
+      },
+      "B": {
+        "identical_bytes": 0.9997512478298611,
+        "pixels_within_1": 0.9999967447916667,
+        "pixels_within_4": 1.0,
+        "max_error": 2,
+        "mean_error": 0.0002495659722222222
+      }
+    },
+    "fast_vs_exact": {
+      "A": {
+        "identical_bytes": 0.9986227756076389,
+        "pixels_within_1": 0.9998969184027777,
+        "pixels_within_4": 1.0,
+        "max_error": 3,
+        "mean_error": 0.0014208984375
+      },
+      "B": {
+        "identical_bytes": 0.9997512478298611,
+        "pixels_within_1": 0.9999967447916667,
+        "pixels_within_4": 1.0,
+        "max_error": 2,
+        "mean_error": 0.0002495659722222222
+      }
+    },
+    "ms": {
+      "exact": 1.711,
+      "fast": 0.461
+    }
+  },
+  "spot_falloff": {
+    "lights": 1,
+    "fast_vs_reference": {
+      "A": {
+        "identical_bytes": 0.9994411892361111,
+        "pixels_within_1": 0.9999793836805555,
+        "pixels_within_4": 1.0,
+        "max_error": 2,
+        "mean_error": 0.0005674913194444445
+      },
+      "B": {
+        "identical_bytes": 0.9999565972222222,
+        "pixels_within_1": 1.0,
+        "pixels_within_4": 1.0,
+        "max_error": 1,
+        "mean_error": 4.340277777777778e-05
+      }
+    },
+    "fast_vs_exact": {
+      "A": {
+        "identical_bytes": 0.9994411892361111,
+        "pixels_within_1": 0.9999793836805555,
+        "pixels_within_4": 1.0,
+        "max_error": 2,
+        "mean_error": 0.0005674913194444445
+      },
+      "B": {
+        "identical_bytes": 0.9999565972222222,
+        "pixels_within_1": 1.0,
+        "pixels_within_4": 1.0,
+        "max_error": 1,
+        "mean_error": 4.340277777777778e-05
+      }
+    },
+    "ms": {
+      "exact": 1.514,
+      "fast": 0.451
+    }
+  },
+  "no_lights": {
+    "lights": 0,
+    "fast_vs_reference": {
+      "A": {
+        "identical_bytes": 1.0,
+        "pixels_within_1": 1.0,
+        "pixels_within_4": 1.0,
+        "max_error": 0,
+        "mean_error": 0.0
+      },
+      "B": {
+        "identical_bytes": 1.0,
+        "pixels_within_1": 1.0,
+        "pixels_within_4": 1.0,
+        "max_error": 0,
+        "mean_error": 0.0
+      }
+    },
+    "fast_vs_exact": {
+      "A": {
+        "identical_bytes": 1.0,
+        "pixels_within_1": 1.0,
+        "pixels_within_4": 1.0,
+        "max_error": 0,
+        "mean_error": 0.0
+      },
+      "B": {
+        "identical_bytes": 1.0,
+        "pixels_within_1": 1.0,
+        "pixels_within_4": 1.0,
+        "max_error": 0,
+        "mean_error": 0.0
+      }
+    },
+    "ms": {
+      "exact": 1.167,
+      "fast": 0.33
+    }
+  },
+  "gloss_extremes": {
+    "lights": 1,
+    "fast_vs_reference": {
+      "A": {
+        "identical_bytes": 0.9990101453993055,
+        "pixels_within_1": 0.9999576822916667,
+        "pixels_within_4": 1.0,
+        "max_error": 3,
+        "mean_error": 0.0010009765625
+      },
+      "B": {
+        "identical_bytes": 0.9997618272569444,
+        "pixels_within_1": 0.9999978298611111,
+        "pixels_within_4": 1.0,
+        "max_error": 2,
+        "mean_error": 0.00023871527777777777
+      }
+    },
+    "fast_vs_exact": {
+      "A": {
+        "identical_bytes": 0.9990101453993055,
+        "pixels_within_1": 0.9999576822916667,
+        "pixels_within_4": 1.0,
+        "max_error": 3,
+        "mean_error": 0.0010009765625
+      },
+      "B": {
+        "identical_bytes": 0.9997615559895834,
+        "pixels_within_1": 0.9999978298611111,
+        "pixels_within_4": 1.0,
+        "max_error": 2,
+        "mean_error": 0.0002389865451388889
+      }
+    },
+    "ms": {
+      "exact": 1.374,
+      "fast": 0.417
+    }
+  },
+  "lights_x8": {
+    "lights": 64,
+    "fast_vs_exact": {
+      "A": {
+        "identical_bytes": 0.9950233289930556,
+        "pixels_within_1": 0.9998122829861111,
+        "pixels_within_4": 0.9999848090277778,
+        "max_error": 7,
+        "mean_error": 0.005067003038194445
+      },
+      "B": {
+        "identical_bytes": 0.9991815863715278,
+        "pixels_within_1": 0.9999565972222222,
+        "pixels_within_4": 1.0,
+        "max_error": 3,
+        "mean_error": 0.0008295355902777778
+      }
+    },
+    "ms": {
+      "exact": 11.112,
+      "fast": 1.263
+    }
+  }
+}

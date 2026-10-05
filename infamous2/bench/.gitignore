@@ -1,0 +1,15 @@
+# Local test state: your profile copy, savestates, per-run sessions and caches
+/profile/
+/states/
+/sessions/
+/cache-*/
+/play-config.yml
+/live.ctl
+/state.json
+/lease.json
+/lease.log
+/launch.log
+/results.jsonl
+/performance-lane.lock
+/ready-*.png
+__pycache__/

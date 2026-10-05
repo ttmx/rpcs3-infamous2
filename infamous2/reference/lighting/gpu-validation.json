@@ -1,0 +1,117 @@
+{
+  "hardware_vs_reference": {
+    "A": {
+      "identical_bytes": 1.0,
+      "pixels_within_1": 1.0,
+      "pixels_within_4": 1.0,
+      "max_error": 0,
+      "mean_error": 0.0
+    },
+    "B": {
+      "identical_bytes": 1.0,
+      "pixels_within_1": 1.0,
+      "pixels_within_4": 1.0,
+      "max_error": 0,
+      "mean_error": 0.0
+    }
+  },
+  "hardware_vs_interpreter": {
+    "A": {
+      "identical_bytes": 0.9999997287326389,
+      "pixels_within_1": 1.0,
+      "pixels_within_4": 1.0,
+      "max_error": 1,
+      "mean_error": 2.712673611111111e-07
+    },
+    "B": {
+      "identical_bytes": 0.9999557834201389,
+      "pixels_within_1": 1.0,
+      "pixels_within_4": 1.0,
+      "max_error": 1,
+      "mean_error": 4.421657986111111e-05
+    }
+  },
+  "cases": {
+    "spot_centre": {
+      "A": {
+        "identical_bytes": 1.0,
+        "pixels_within_1": 1.0,
+        "pixels_within_4": 1.0,
+        "max_error": 0,
+        "mean_error": 0.0
+      },
+      "B": {
+        "identical_bytes": 1.0,
+        "pixels_within_1": 1.0,
+        "pixels_within_4": 1.0,
+        "max_error": 0,
+        "mean_error": 0.0
+      }
+    },
+    "point_and_spot": {
+      "A": {
+        "identical_bytes": 0.9999997287326389,
+        "pixels_within_1": 1.0,
+        "pixels_within_4": 1.0,
+        "max_error": 1,
+        "mean_error": 2.712673611111111e-07
+      },
+      "B": {
+        "identical_bytes": 1.0,
+        "pixels_within_1": 1.0,
+        "pixels_within_4": 1.0,
+        "max_error": 0,
+        "mean_error": 0.0
+      }
+    },
+    "spot_falloff": {
+      "A": {
+        "identical_bytes": 1.0,
+        "pixels_within_1": 1.0,
+        "pixels_within_4": 1.0,
+        "max_error": 0,
+        "mean_error": 0.0
+      },
+      "B": {
+        "identical_bytes": 1.0,
+        "pixels_within_1": 1.0,
+        "pixels_within_4": 1.0,
+        "max_error": 0,
+        "mean_error": 0.0
+      }
+    },
+    "no_lights": {
+      "A": {
+        "identical_bytes": 1.0,
+        "pixels_within_1": 1.0,
+        "pixels_within_4": 1.0,
+        "max_error": 0,
+        "mean_error": 0.0
+      },
+      "B": {
+        "identical_bytes": 1.0,
+        "pixels_within_1": 1.0,
+        "pixels_within_4": 1.0,
+        "max_error": 0,
+        "mean_error": 0.0
+      }
+    },
+    "gloss_extremes": {
+      "A": {
+        "identical_bytes": 1.0,
+        "pixels_within_1": 1.0,
+        "pixels_within_4": 1.0,
+        "max_error": 0,
+        "mean_error": 0.0
+      },
+      "B": {
+        "identical_bytes": 0.9999997287326389,
+        "pixels_within_1": 1.0,
+        "pixels_within_4": 1.0,
+        "max_error": 1,
+        "mean_error": 2.712673611111111e-07
+      }
+    }
+  },
+  "passed": true
+}
