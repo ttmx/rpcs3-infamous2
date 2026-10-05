@@ -417,6 +417,10 @@ VKGSRender::VKGSRender(utils::serial* ar) noexcept : GSRender(ar)
 		m_draw_prefix_submit_enabled = std::string_view(enabled) == "1";
 	}
 
+	// Same-frame vertex cache: on unless the live control file says otherwise (the streaming loads, values[1], are
+	// switched on through the environment, see infamous2_defaults.h)
+	vk::live_ctl::values[2] = 1;
+
 	if (const char* length = std::getenv("RPCS3_VK_STREAM_DMA_LOAD_MIN"))
 	{
 		vk::live_ctl::values[1] = std::strtoull(length, nullptr, 10);

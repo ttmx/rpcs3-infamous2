@@ -3983,7 +3983,7 @@ bool spu_thread::do_list_transfer(spu_mfc_cmd& args)
 	{
 		const u8* first = this->ls + (args.eal & 0x3fff8);
 		if (first[2] == 1 && first[3] == 0 && first[4] == 0x00 && first[5] == 0xa9 && first[6] == 0x3c && first[7] == 0x80 &&
-			(args.cmd & ~(MFC_BARRIER_MASK | MFC_FENCE_MASK | MFC_START_MASK)) == MFC_GETL_CMD)
+			(args.cmd & ~(MFC_BARRIER_MASK | MFC_FENCE_MASK | MFC_START_MASK)) == MFC_GETL_CMD && Emu.GetTitleID() == "BCES01143")
 		{
 			// Second element: the light table
 			const bool has_table = args.size >= 16;

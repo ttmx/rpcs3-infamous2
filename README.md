@@ -29,8 +29,8 @@ Stock with Strict Rendering off on the left, this build uncapped on the right (F
 These are software changes. The two host tuning steps that were also tried (a GPU clock floor and a power profile)
 are kept apart in [`infamous2/hardware/`](infamous2/hardware/) and are off unless you ask for them.
 
-This is experimental work on one game, tested in three areas of it, on one GPU driver. Every change is off unless its
-switch is set, and the tree still contains the diagnostics and the rejected experiments of the whole project.
+This is experimental work on one game, tested in three areas of it, on one GPU driver. The changes that helped are on by
+default (see below), and the tree still contains the diagnostics and the rejected experiments of the whole project.
 It is not affiliated with or endorsed by the RPCS3 team.
 
 ## Using it
@@ -66,7 +66,11 @@ Requirements and limits:
 
 ## What was changed
 
-Each line is one change, with the switch that enables it in parentheses; the launcher sets all of them. Figures are
+Each line is one change, with its switch in parentheses. The ones listed here are on by default: the emulator sets
+them itself at startup (`rpcs3/Emu/infamous2_defaults.h`) unless the variable is already in the environment, so
+`RPCS3_VK_FAST_DRAWS=0 rpcs3` turns one off, and the launcher still sets them explicitly. These switches are not
+specific to the game (only the two GPU passes check the title ID), so they are on for every title, and nothing but
+inFamous 2 was tested with them. Figures are
 from the machine above and are not additive: they were measured at different stages and scenes.
 
 ### The game's SPU rendering jobs, moved to the GPU
