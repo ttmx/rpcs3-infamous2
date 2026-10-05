@@ -36,8 +36,11 @@ checkout by itself, uses your normal RPCS3 profile (firmware, saves, controller)
 
 Requirements and limits:
 - Linux, Vulkan. Nothing was tried on Windows, macOS, the OpenGL renderer, or Nvidia and Intel drivers.
-- The exact game version above. The GPU lighting and occlusion passes recognise the game's SPU jobs by their bytes
-  and fall back to the original SPU code when they do not match; fixed guest addresses are used as well.
+- The exact game version above (European disc, BCES01143, patched to 1.04). The GPU lighting and occlusion passes
+  only switch on for that title ID, so other regional releases run the game's own SPU jobs and get only the general
+  renderer changes. The passes also rely on fixed guest addresses from that executable: the lighting job is checked
+  by its bytes and falls back to the SPU code when they differ, the occlusion pass is not, so another patch level of
+  BCES01143 is untested and may show wrong occlusion (`--set RPCS3_NATIVE_SSAO=0 --set RPCS3_NATIVE_LIGHTING=0`).
 - Keeping static geometry on the GPU needs Linux 6.7 or newer (write tracking through `userfaultfd` and
   `PAGEMAP_SCAN`); on older kernels that one change does nothing.
 - The streaming copies and the native SPU kernel are used only on CPUs with AVX-512; elsewhere the stock paths run.
