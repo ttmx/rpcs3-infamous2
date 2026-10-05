@@ -16,7 +16,8 @@ namespace vk
 	namespace native_ssao
 	{
 		u32 mode();
-		// The game has blitted a finished G-buffer image to main memory (see native_lighting::on_gbuffer)
+		// The game has blitted a finished G-buffer image to main memory; src is the render target it came from
+		// (see native_lighting::on_gbuffer)
 		void on_gbuffer(vk::command_buffer& cmd, vk::image* src, const areai& src_area, u32 dst_address);
 		vk::image_view* substitute(vk::command_buffer& cmd, vk::image_view* original, u32 texture_address);
 		// The job's half-resolution linear depth buffer (0x37b08b80, 640x360 floats). The game also samples it as a

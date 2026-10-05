@@ -34,8 +34,8 @@
       }
     },
     "ms": {
-      "exact": 2.283,
-      "fast": 0.448
+      "exact": 2.245,
+      "fast": 0.426
     }
   },
   "spot_centre": {
@@ -73,8 +73,8 @@
       }
     },
     "ms": {
-      "exact": 1.537,
-      "fast": 0.394
+      "exact": 0.897,
+      "fast": 0.41
     }
   },
   "point_and_spot": {
@@ -112,8 +112,8 @@
       }
     },
     "ms": {
-      "exact": 1.711,
-      "fast": 0.461
+      "exact": 1.181,
+      "fast": 0.368
     }
   },
   "spot_falloff": {
@@ -151,8 +151,8 @@
       }
     },
     "ms": {
-      "exact": 1.514,
-      "fast": 0.451
+      "exact": 0.906,
+      "fast": 0.43
     }
   },
   "no_lights": {
@@ -190,8 +190,8 @@
       }
     },
     "ms": {
-      "exact": 1.167,
-      "fast": 0.33
+      "exact": 0.587,
+      "fast": 0.373
     }
   },
   "gloss_extremes": {
@@ -229,8 +229,8 @@
       }
     },
     "ms": {
-      "exact": 1.374,
-      "fast": 0.417
+      "exact": 0.807,
+      "fast": 0.419
     }
   },
   "lights_x8": {
@@ -252,8 +252,86 @@
       }
     },
     "ms": {
-      "exact": 11.112,
-      "fast": 1.263
+      "exact": 13.121,
+      "fast": 0.583
+    }
+  },
+  "captured_frame_x1.3": {
+    "lights": 8,
+    "size": [
+      1664,
+      936
+    ],
+    "fast_vs_enlarged_reference": {
+      "A": {
+        "identical_bytes": 0.9849900867028271,
+        "pixels_within_1": 0.9983749640450361,
+        "pixels_within_4": 0.9992385252301118,
+        "max_error": 90,
+        "mean_error": 0.031040530232988167
+      },
+      "B": {
+        "identical_bytes": 0.9977547409188035,
+        "pixels_within_1": 0.9991730358316897,
+        "pixels_within_4": 0.999973675830046,
+        "max_error": 14,
+        "mean_error": 0.002530330580210388
+      }
+    },
+    "ms": {
+      "fast": 0.546
+    }
+  },
+  "captured_frame_x1.5": {
+    "lights": 8,
+    "size": [
+      1920,
+      1080
+    ],
+    "fast_vs_enlarged_reference": {
+      "A": {
+        "identical_bytes": 0.9843628231095679,
+        "pixels_within_1": 0.9988170331790124,
+        "pixels_within_4": 0.999936824845679,
+        "max_error": 27,
+        "mean_error": 0.016155357831790125
+      },
+      "B": {
+        "identical_bytes": 0.9976210455246913,
+        "pixels_within_1": 0.9990374228395061,
+        "pixels_within_4": 0.9999546682098766,
+        "max_error": 14,
+        "mean_error": 0.002737147955246914
+      }
+    },
+    "ms": {
+      "fast": 0.63
+    }
+  },
+  "captured_frame_x2.0": {
+    "lights": 8,
+    "size": [
+      2560,
+      1440
+    ],
+    "fast_vs_enlarged_reference": {
+      "A": {
+        "identical_bytes": 0.9858006456163194,
+        "pixels_within_1": 0.9980292426215278,
+        "pixels_within_4": 0.9985687934027778,
+        "max_error": 160,
+        "mean_error": 0.04546156141493055
+      },
+      "B": {
+        "identical_bytes": 0.9978751627604167,
+        "pixels_within_1": 0.9994121636284722,
+        "pixels_within_4": 0.9999880642361111,
+        "max_error": 9,
+        "mean_error": 0.0023169623480902776
+      }
+    },
+    "ms": {
+      "fast": 0.927
     }
   }
 }

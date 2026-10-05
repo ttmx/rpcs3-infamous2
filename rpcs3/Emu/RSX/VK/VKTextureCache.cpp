@@ -1830,7 +1830,7 @@ namespace vk
 				// inFamous 2 hands its finished G-buffer to the SPU jobs by blitting two 1280x720 images to main memory,
 				// each as a 1024 pixel wide piece followed by the remaining 256. Give the image to the GPU ambient
 				// occlusion and lighting passes when the piece that completes it arrives, whether or not the guest ever
-				// reads the memory.
+				// reads the memory. With a resolution scale the image is a render target of the scaled size.
 				const u32 piece_offset = dst.rsx_address - reply.dst_range.start;
 
 				if (vk::native_lighting::is_gbuffer(reply.dst_range.start) && dst.pitch == 1280 * 4 &&

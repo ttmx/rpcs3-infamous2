@@ -85,6 +85,10 @@ the SPUs, and uploads the results as textures. Emulated, that round trip was mos
   occlusion job used to produce, now comes from the GPU pass.
 - **Up to 256 lights per frame**: eight mask words per tile; frames with more lights, or with light records the
   passes do not know, go back to the SPU job.
+- **Resolution scale**: both passes work at the size of the game's render targets, so with RPCS3's Resolution Scale
+  above 100% the lighting and the occlusion are computed at the scaled resolution rather than at 1280x720. Set
+  `Resolution Scale` in `play-config.yml`; dock uncapped 94.9 FPS at 100%, 73.0 at 150% (1920x1080), 46.4 at 200%
+  (2560x1440), where the integrated GPU is the limit. At 150% the game's own SPU jobs gave 45 FPS there.
 - **Faster lighting passes**: five parallel compute passes with ordinary GPU arithmetic replace two that reproduced
   the SPU arithmetic bit for bit; about a third less GPU work and 2-4 W less at the 60 FPS cap, with a few pixels
   differing by a level or two.
@@ -170,6 +174,8 @@ No game data is included: no executable, savestates, saves, captured frames or d
 ## Known gaps
 
 - Tested at the swamp pier, the burning dock and one part of the city, in sessions of minutes, not hours.
+- Resolution scales other than 100% were tried at the dock only (150% and 200%, standing still and firing lightning),
+  and nothing computes a reference image above 1280x720: the check there is screenshots against the game's SPU jobs.
 - Scenes with many lights were checked against the reference offline (64 lights); in the emulator only what those
   three areas contain.
 - In frames with 20-60 lightning lights, 10-200 pixels of 921,600 differ visibly from the game's own SPU output, and

@@ -3,6 +3,7 @@
 #include "VKOverlays.h"
 #include "VKRenderPass.h"
 #include "VKHelpers.h"
+#include "VKResourceManager.h"
 #include "vkutils/image.h"
 #include "vkutils/buffer_object.h"
 #include "vkutils/device.h"
@@ -24,6 +25,10 @@ extern std::atomic<bool> g_native_ssao_gpu_active;
 //
 // Here the same five stages run as fragment passes when both blits of a frame have arrived (on_gbuffer), and the game
 // gets their output when it binds the occlusion texture or the half-resolution depth (substitute).
+//
+// The passes work at the size of the render targets the game blits from, 1280x720 times the resolution scale, and at
+// half of that. Distances the job has in pixels are scaled with the image, so the result covers the same part of the
+// picture at every scale.
 namespace vk::native_ssao
 {
 	namespace
@@ -34,7 +39,8 @@ namespace vk::native_ssao
 		constexpr u32 output_address = 0xcf800000;
 		constexpr u32 half_depth_address = 0x37b08b80;
 		constexpr u32 matrix_address = 0x00a94a20;
-		constexpr u32 full_w = 1280, full_h = 720, half_w = 640, half_h = 360;
+		// Sizes of the game's own textures
+		constexpr u32 guest_w = 1280, guest_h = 720, guest_half_w = 640, guest_half_h = 360;
 
 		const char* fs_header = R"(
 #version 440
@@ -62,7 +68,7 @@ void main()
 }
 )";
 
-		// fs0: half-resolution linear depth, fs1: normals. The constants are the job's.
+		// fs0: half-resolution linear depth, fs1: normals. The constants are the job's, for a 640 pixel wide image.
 		const char* fs_occlusion = R"(
 // Rows of the camera rotation
 layout(push_constant) uniform static_data
@@ -82,6 +88,8 @@ void main()
 	// Projection scale of the sample offsets and radius of the sample sphere
 	const float S = 5589.43, R = 15.0;
 	ivec2 p = ivec2(gl_FragCoord.xy);
+	ivec2 last = textureSize(fs0, 0) - 1;
+	float scale = float(last.x + 1) / 640.0;
 	float z = texelFetch(fs0, p, 0).r;
 	vec3 n = floor(texelFetch(fs1, p * 2, 0).rgb * 255.0 + 0.5) * (2.007843137 / 256.0) - 1.0;
 	float c0 = dot(n, m0.xyz), c1 = dot(n, m1.xyz), c2 = dot(n, m2.xyz);
@@ -92,8 +100,8 @@ void main()
 	float total = 0.0;
 	for (int i = 0; i < 12; ++i)
 	{
-		vec2 o = vec2(S * SX[i] + c0, S * SY[i] + c1) / zcl;
-		ivec2 q = clamp(ivec2(floor(vec2(p) + 0.5 + o)), ivec2(0), ivec2(639, 359));
+		vec2 o = vec2(S * SX[i] + c0, S * SY[i] + c1) / zcl * scale;
+		ivec2 q = clamp(ivec2(floor(vec2(p) + 0.5 + o)), ivec2(0), last);
 		float h = SH[i] * R * s;
 		float d = 0.5 * (texelFetch(fs0, q, 0).r - zref + h);
 		total += clamp(d, 0.0, h) + h * clamp(d * (-1.0 / 60.0) / s - 0.75 * s, 0.0, 1.0);
@@ -105,18 +113,21 @@ void main()
 )";
 
 		// fs0: occlusion, fs1: half-resolution linear depth. Binomial weights, reduced where the depth differs.
+		// The taps are one pixel apart in a 640 pixel wide image.
 		const char* fs_blur = R"(
 void main()
 {
 	const float G[5] = float[5](1.0, 6.0, 10.0, 6.0, 1.0);
 	const ivec2 dir = ivec2(%dir);
 	ivec2 p = ivec2(gl_FragCoord.xy);
+	ivec2 last = textureSize(fs0, 0) - 1;
+	float scale = float(last.x + 1) / 640.0;
 	float zc = texelFetch(fs1, p, 0).r;
 	float num = 0.0, den = 0.0;
 	for (int t = -2; t <= 2; ++t)
 	{
-		ivec2 q = p + t * dir;
-		if (q.x < 0 || q.y < 0 || q.x > 639 || q.y > 359) continue;
+		ivec2 q = p + int(round(float(t) * scale)) * dir;
+		if (q.x < 0 || q.y < 0 || q.x > last.x || q.y > last.y) continue;
 		float a = floor(texelFetch(fs0, q, 0).r * 255.0 + 0.5);
 		float w = G[t + 2] * clamp(1.0 - 30.0 * abs(texelFetch(fs1, q, 0).r - zc) / zc, 0.0, 1.0);
 		num += w * a;
@@ -141,7 +152,7 @@ void main()
 	{
 		ivec2 o = ivec2(i & 1, i >> 1);
 		float wb = (o.x == 1 ? f.x : 1.0 - f.x) * (o.y == 1 ? f.y : 1.0 - f.y);
-		ivec2 q = clamp(b + o, ivec2(0), ivec2(639, 359));
+		ivec2 q = clamp(b + o, ivec2(0), textureSize(fs0, 0) - 1);
 		float a = floor(texelFetch(fs0, q, 0).r * 255.0 + 0.5);
 		float w = wb * clamp(1.0 - 40.0 * abs(texelFetch(fs1, q, 0).r - zf) / zf, 0.0, 1.0);
 		num += w * a;
@@ -205,6 +216,7 @@ void main()
 
 			vk::image* normals = nullptr;
 			vk::image* depth = nullptr;
+			u32 width = 0, height = 0; // Of ao_full; the other four have half of it, rounded up
 			bool valid = false;
 		};
 
@@ -245,13 +257,37 @@ void main()
 				s.blur_v = std::make_unique<pass>(fmt::replace_all(fs_blur, "%dir", "0, 1"), 2, false);
 				s.upsample = std::make_unique<pass>(fs_upsample, 3, false);
 				for (auto* p : { s.downsample.get(), s.occlusion.get(), s.blur_h.get(), s.blur_v.get(), s.upsample.get() }) p->create(dev);
+				ssao_log.success("GPU ambient occlusion active (mode %u)", mode());
+			}
 
+			// First frame, or the resolution scale was changed
+			if (s.depth->width() != s.width || s.depth->height() != s.height)
+			{
+				auto& resources = *vk::get_resource_manager();
+
+				for (auto* views : { &s.output_views, &s.half_depth_views })
+				{
+					for (auto& view : *views) resources.dispose(view.second);
+					views->clear();
+				}
+
+				for (auto* image : { &s.z_half, &s.ao_raw, &s.ao_h, &s.ao_v, &s.ao_full })
+				{
+					if (*image) resources.dispose(*image);
+				}
+
+				s.width = s.depth->width();
+				s.height = s.depth->height();
+				s.half_depth_view = nullptr;
+				s.valid = false;
+
+				const u32 half_w = (s.width + 1) / 2, half_h = (s.height + 1) / 2;
 				s.z_half = make_image(dev, VK_FORMAT_R32_SFLOAT, half_w, half_h);
 				s.ao_raw = make_image(dev, VK_FORMAT_R8_UNORM, half_w, half_h);
 				s.ao_h = make_image(dev, VK_FORMAT_R8_UNORM, half_w, half_h);
 				s.ao_v = make_image(dev, VK_FORMAT_R8_UNORM, half_w, half_h);
-				s.ao_full = make_image(dev, VK_FORMAT_R8_UNORM, full_w, full_h);
-				ssao_log.success("GPU ambient occlusion active (mode %u)", mode());
+				s.ao_full = make_image(dev, VK_FORMAT_R8_UNORM, s.width, s.height);
+				ssao_log.notice("GPU ambient occlusion at %ux%u", s.width, s.height);
 			}
 
 			// Camera matrix from the job's parameter block (big-endian floats, rows as stored)
@@ -299,8 +335,8 @@ void main()
 	void on_gbuffer(vk::command_buffer& cmd, vk::image* src, const areai& src_area, u32 dst_address)
 	{
 		if (!mode() || (dst_address != normals_address && dst_address != depth_address) || Emu.GetTitleID() != "BCES01143") return;
-		if (src_area.x1 != 0 || src_area.y1 != 0 || src_area.width() != s32{ full_w } || src_area.height() != s32{ full_h } ||
-			src->width() != full_w || src->height() != full_h || src->samples() != 1)
+		if (src_area.x1 != 0 || src_area.y1 != 0 || src_area.width() != static_cast<s32>(src->width()) || src_area.height() != static_cast<s32>(src->height()) ||
+			src->width() < guest_w / 4 || src->height() < guest_h / 4 || src->samples() != 1)
 		{
 			return;
 		}
@@ -313,7 +349,11 @@ void main()
 
 		if (s.normals && s.depth)
 		{
-			run(cmd, s);
+			if (s.normals->width() == s.depth->width() && s.normals->height() == s.depth->height())
+			{
+				run(cmd, s);
+			}
+
 			s.normals = s.depth = nullptr;
 		}
 	}
@@ -336,7 +376,7 @@ void main()
 		if (texture_address == half_depth_address)
 		{
 			// The downsample pass output is what the job's first kernel stores there
-			if (!(mode() & 1) || original->format() != VK_FORMAT_R32_SFLOAT || original->image()->width() != half_w || original->image()->height() != half_h)
+			if (!(mode() & 1) || original->format() != VK_FORMAT_R32_SFLOAT || original->image()->width() != guest_half_w || original->image()->height() != guest_half_h)
 			{
 				return nullptr;
 			}
@@ -354,7 +394,7 @@ void main()
 
 		if (!(mode() & 1)) return nullptr;
 
-		if (original->format() != VK_FORMAT_R8_UNORM || original->image()->width() != full_w || original->image()->height() != full_h)
+		if (original->format() != VK_FORMAT_R8_UNORM || original->image()->width() != guest_w || original->image()->height() != guest_h)
 		{
 			if (static bool logged = false; !logged)
 			{

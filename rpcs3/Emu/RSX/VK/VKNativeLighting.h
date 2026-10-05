@@ -18,7 +18,8 @@ namespace vk
 	{
 		u32 mode();
 
-		// The game has blitted a G-buffer image (1280x720) to main memory for the job
+		// The game has blitted a G-buffer image to main memory for the job. src is the render target it came from:
+		// 1280x720 times the resolution scale
 		void on_gbuffer(vk::command_buffer& cmd, vk::image* src, const areai& area, u32 address);
 
 		// The view to sample instead of the game's texture at this address, or null

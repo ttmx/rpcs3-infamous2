@@ -1452,3 +1452,53 @@ emulator beyond what the dock and city contain.
 Packaging: `B/playable-v14` = v13 settings + binary `533f0006ab113c52ba5b38e15d786dee85538c10e9405190feccd9168afd699c`.
 State at the end: no emulator running, GPU policy auto, power profile balanced, real savedata hashes equal to
 `geom-testing/real-save-hashes-before.txt`, desktop entry unchanged (v13).
+
+## 2026-10-05 (later): GPU lighting and occlusion at any resolution scale (source only, no new package)
+
+Before: with `Resolution Scale` other than 100 neither pass switched on (dock, 150%: 3.5 minutes without a
+`NativeSSAO`/`NativeLighting` line), so the game's SPU jobs ran: 45 FPS at the dock at 150%.
+
+Cause: with a scale, RPCS3 makes the destination of the two G-buffer blits a render target of the scaled size
+(1920x1080 at 150%) instead of a 1280x720 image, and both passes required 1280x720. The image the hook in
+`texture_cache::blit` finds is the right one at every scale. The source of the depth blit is not usable in its place:
+it is a depth-stencil target (`D32_SFLOAT_S8`), and the destination holds RPCS3's conversion to the ARGB bytes the
+passes read.
+
+Changes
+- `VKNativeLighting.cpp`: input and output images have the size of the blitted image and are made again when it
+  changes; the image size, its inverse and a pixel offset go to the shaders in input words 24-29. The offset is
+  `0.5 - 0.5 * scale`, so that the centre of a scaled pixel maps to where the game's 1280x720 grid has it (the job
+  takes pixel x as x / 1280); it is 0 at 100%.
+- `VKNativeLightingShaders.hpp`: the tile grid stays 40x18, a pixel belongs to tile `x * 40 / W`, `y * 18 / H`, so tiles
+  need not be a whole number of pixels (130% gives 41.6). Bounds: one work group per fifth of a tile as before, each
+  thread now loops over its share of the block (2x2 pixels at 100%). Clear: one thread per pixel row of a tile.
+- `VKNativeSSAO.cpp`: images at the blitted size and half of it, rounded up. The sample offsets of the occlusion
+  stage and the tap distance of the blur are in pixels of a 640 wide image in the job and are multiplied by
+  `width / 640`; the clamps use the image size. The game's own two textures (1280x720 occlusion, 640x360 depth) keep
+  their size and are replaced by the larger images, which it samples with normalized coordinates.
+- No change in common code. `readback_unneeded` and the blit hook are as before.
+
+Checks
+- 1280x720 offline (`reference/lighting/fast_validate.py`): every case identical to the recorded
+  `fast-validation.json`, byte for byte in the comparison figures.
+- Scaled offline, new in `fast_validate.py`: the captured frame enlarged to 1664x936, 1920x1080 and 2560x1440 with
+  nearest pixels, against the 1280x720 reference enlarged the same way. Pixels within 4 levels: 99.92%, 99.99%, 99.86%
+  (diffuse), 99.99% and more (specular). The large byte differences (up to 160) are the shared-scale encoding: decoded
+  (colour times alpha) the largest difference is 7 levels at 1.3x; at 2x four pixels, one pixel of the 1280x720 frame
+  at a tile corner, are lit where the reference has an empty tile.
+- Emulator, dock, one boot each, uncapped (`CFG:Frame limit='Off'`, vblank 120, 3 arms of 10 s):
+  | scale | image | FPS | package W | GPU busy |
+  |---|---|---|---|---|
+  | 100% | 1280x720 | 94.9 | 55.7 | 76% |
+  | 150% | 1920x1080 | 73.0 | 57.0 | 99% |
+  | 200% | 2560x1440 | 46.4 | 49.5 | 99% |
+  100% was 95.7 in the README table (another boot). At the 60 cap, 150% holds 60.0; with both passes off at 150% the
+  title showed 44.7-46.2.
+- Screenshots at 150%, GPU passes against SPU jobs (`sessions/res150`, `res150-spu`): mean absolute difference 0.84%
+  of full scale, against 0.82% between two shots of the GPU passes seconds apart (fire and smoke move).
+- Lightning at 150% (`lightning_shots.sh`): the half-resolution depth substitution engages, effects look right.
+
+Not checked: other areas than the dock at a scale, scales below 100%, changing the scale while the game runs (the
+images are made again on a size change, but that path was not exercised), MSAA, and the look of the occlusion blur at
+scales where its taps skip pixels (200%). The window used for the screenshots is 1152 pixels wide, so they do not show
+the added detail, only that the picture is right.

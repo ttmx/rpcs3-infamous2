@@ -7,20 +7,24 @@ namespace vk::native_lighting::shaders
 {
 inline constexpr const char* common = R"GLSL(
 // Tiled deferred lighting of inFamous 2 (the game's SPU job P071), shared declarations.
-// The frame is 1280x720 in 40x18 tiles of 32x40 pixels. Up to 256 point and spot lights.
-const int W = 1280, H = 720;
-const int TILE_W = 32, TILE_H = 40, TILES_X = 40, TILES_Y = 18, TILES = TILES_X * TILES_Y;
+// The frame is 40x18 tiles, 32x40 pixels each at the game's 1280x720. The images can have any size (resolution
+// scaling), so pixel sizes come from the input words. Up to 256 point and spot lights.
+#define W int(data[24])
+#define H int(data[25])
+const int TILES_X = 40, TILES_Y = 18, TILES = TILES_X * TILES_Y;
 const uint MASK_WORDS = 8u;   // one bit per light
 const uint TILE_STRIDE = 16u; // words per tile: the light mask, then
 const uint TILE_ANY = 8u;     // not 0 if the mask has a light
 const uint TILE_LIT = 9u;     // not 0 once a pixel of the tile is inside the range of a light
 const uint SKY = 0xffffffu;   // depth of a pixel nothing was drawn to
 
-// Words 0-15: matrix from (x/1280, y/720, depth/2^24, 1) to view space, by columns. 16: light colour scale.
-// 17: light count. 22: offset of the view-to-clip matrix. From word 32: 16 words per light
+// Words 0-15: matrix from (x/1280, y/720, depth/2^24, 1) to view space, by columns, x and y being pixels of the
+// game's frame. 16: light colour scale. 17: light count. 22: offset of the view-to-clip matrix. 24, 25: image size.
+// 26, 27: 1 / image size. 28, 29: added to a pixel of the image before that division, so that its centre lands
+// where the game's pixel grid has it (0 at 1280x720). From word 32: 16 words per light
 // (position, kind, colour, inner and outer radius, cone gain, cone cosine, near distance, direction).
 layout(std430, binding=0) readonly buffer Inputs { uint data[]; };
-// Per 32x8 block of pixels: minimum and maximum view-space position
+// Per block of pixels, a fifth of a tile's height (32x8 at 1280x720): minimum and maximum view-space position
 const uint BLOCKS_PER_TILE = 5u;
 layout(std430, binding=1) buffer BlockBounds { vec4 block_bounds[]; };
 layout(std430, binding=2) buffer Tiles { uint tile_data[]; };
@@ -41,9 +45,13 @@ mat4 position_matrix() { return mat4(parameter_column(0u), parameter_column(4u),
 
 vec3 view_position(mat4 m, ivec2 pixel, uint depth)
 {
-    vec4 p = m * vec4(float(pixel.x) * (1.0 / 1280.0), float(pixel.y) * (1.0 / 720.0), float(depth) * exp2(-24.0), 1.0);
+    vec4 p = m * vec4((float(pixel.x) + parameter(28u)) * parameter(26u), (float(pixel.y) + parameter(29u)) * parameter(27u), float(depth) * exp2(-24.0), 1.0);
     return p.xyz / p.w;
 }
+
+// Pixel x is in tile x * TILES_X / W and pixel y in block y * TILES_Y * BLOCKS_PER_TILE / H: the first pixel of each
+int tile_left(int tile_x) { return (tile_x * W + TILES_X - 1) / TILES_X; }
+int block_top(int block_y) { const int blocks = TILES_Y * int(BLOCKS_PER_TILE); return (block_y * H + blocks - 1) / blocks; }
 
 // A pixel is in the range of a light when it is inside the outer radius and, for a spot light, inside the cone
 bool in_range(light_t light, vec3 to_light, float distance_squared, float inverse_distance)
@@ -97,22 +105,29 @@ void main()
 )GLSL";
 
 inline constexpr const char* bounds = R"GLSL(
-// One work group per 32x8 block of pixels (five per tile), one thread per 2x2 pixels: bounds of the
-// view-space positions in the block
+// One work group per block of pixels (five per tile), each thread a 16th of its width and a quarter of its height
+// (2x2 pixels at 1280x720): bounds of the view-space positions in the block
 layout(local_size_x=16, local_size_y=4) in;
 shared vec3 block_lo[64], block_hi[64];
 void main()
 {
     mat4 m = position_matrix();
     vec3 lo = vec3(3.402823e38), hi = vec3(-3.402823e38);
-    for (int k = 0; k < 4; k++)
+    ivec2 group = ivec2(gl_WorkGroupID.xy), thread = ivec2(gl_LocalInvocationID.xy);
+    ivec2 origin = ivec2(tile_left(group.x), block_top(group.y));
+    ivec2 size = ivec2(tile_left(group.x + 1), block_top(group.y + 1)) - origin;
+    ivec2 first = origin + thread * size / ivec2(16, 4), end = origin + (thread + 1) * size / ivec2(16, 4);
+    for (int y = first.y; y < end.y; y++)
     {
-        ivec2 pixel = ivec2(gl_GlobalInvocationID.xy) * 2 + ivec2(k & 1, k >> 1);
-        uint depth = depth24(pixel);
-        if (depth == SKY) continue;
-        vec3 position = view_position(m, pixel, depth);
-        lo = min(lo, position);
-        hi = max(hi, position);
+        for (int x = first.x; x < end.x; x++)
+        {
+            ivec2 pixel = ivec2(x, y);
+            uint depth = depth24(pixel);
+            if (depth == SKY) continue;
+            vec3 position = view_position(m, pixel, depth);
+            lo = min(lo, position);
+            hi = max(hi, position);
+        }
     }
     uint i = gl_LocalInvocationIndex;
     block_lo[i] = lo;
@@ -209,7 +224,7 @@ void main()
 {
     ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
     if (pixel.x >= W || pixel.y >= H) return;
-    uint tile = uint((pixel.y / TILE_H) * TILES_X + pixel.x / TILE_W);
+    uint tile = uint((pixel.y * TILES_Y / H) * TILES_X + pixel.x * TILES_X / W);
     if (tile_data[TILE_STRIDE * tile + TILE_ANY] == 0u) { store_empty(pixel); return; }
     uint mask[MASK_WORDS];
     for (uint i = 0u; i < MASK_WORDS; i++) mask[i] = tile_data[TILE_STRIDE * tile + i];
@@ -261,17 +276,17 @@ void main()
 )GLSL";
 
 inline constexpr const char* clear = R"GLSL(
-// One thread per tile row: the game leaves a tile empty when none of its pixels is inside the range of a
-// light, even if a light volume reaches the tile
+// One thread per pixel row of a tile: the game leaves a tile empty when none of its pixels is inside the range
+// of a light, even if a light volume reaches the tile
 layout(local_size_x=64) in;
 void main()
 {
     uint id = gl_GlobalInvocationID.x;
-    if (id >= uint(TILES * TILE_H)) return;
-    uint tile = id / uint(TILE_H);
+    if (id >= uint(TILES_X * H)) return;
+    int tile_x = int(id % uint(TILES_X)), y = int(id / uint(TILES_X));
+    uint tile = uint((y * TILES_Y / H) * TILES_X + tile_x);
     if (tile_data[TILE_STRIDE * tile + TILE_LIT] != 0u || tile_data[TILE_STRIDE * tile + TILE_ANY] == 0u) return;
-    ivec2 origin = ivec2(int(tile % uint(TILES_X)) * TILE_W, int(tile / uint(TILES_X)) * TILE_H + int(id % uint(TILE_H)));
-    for (int x = 0; x < TILE_W; x++) store(origin + ivec2(x, 0), uvec4(0u), 0u);
+    for (int x = tile_left(tile_x), end = tile_left(tile_x + 1); x < end; x++) store(ivec2(x, y), uvec4(0u), 0u);
 }
 )GLSL";
 }

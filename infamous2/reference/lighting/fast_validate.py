@@ -1,6 +1,10 @@
 """Build the lighting passes of the emulator source tree (VKNativeLightingShaders.hpp) with the offline io, run them
 and the exact shaders (gpu/) on the captured frame and the synthetic cases, compare both with the reference, and time
-them on the GPU: python fast_validate.py [iterations]"""
+them on the GPU: python fast_validate.py [iterations]
+
+The passes also run on the captured frame enlarged to other sizes, as with a resolution scale. Nothing computes a
+reference there, so those results are compared with the reference of the 1280x720 frame enlarged the same way; the
+enlarged pixels sit at slightly different places, so that comparison is close but not exact."""
 import json, os, re, subprocess, sys
 from pathlib import Path
 import numpy as np
@@ -12,10 +16,15 @@ ROOT = Path(__file__).resolve().parent
 FAST, GPU = ROOT / 'offline-io', ROOT / 'gpu'
 PIXELS = 1280 * 720
 HEADER = ROOT.parents[2] / 'rpcs3/Emu/RSX/VK/VKNativeLightingShaders.hpp'
-# Work groups per pass, as dispatched by VKNativeLighting.cpp
-PASSES = {'lights': (4, 1, 1), 'bounds': (40, 90, 1), 'cull': (12, 1, 1), 'shade': (160, 90, 1), 'clear': (450, 1, 1)}
 # Buffers after the input: block bounds, tiles, lights, output / output, positions, tiles
-FAST_BUFFERS, EXACT_BUFFERS = f'{3600 * 32},{720 * 16 * 4},{256 * 64},{PIXELS * 8}', f'{PIXELS * 8},{PIXELS * 16},{720 * 4 * 8}'
+FAST_BUFFERS, EXACT_BUFFERS = f'{3600 * 32},{720 * 16 * 4},{256 * 64}', f'{PIXELS * 8},{PIXELS * 16},{720 * 4 * 8}'
+SCALES = (1.3, 1.5, 2.0)
+
+
+def passes(width, height):
+    # Work groups per pass, as dispatched by VKNativeLighting.cpp
+    return {'lights': (4, 1, 1), 'bounds': (40, 90, 1), 'cull': (12, 1, 1), 'shade': ((width + 7) // 8, (height + 7) // 8, 1),
+            'clear': ((40 * height + 63) // 64, 1, 1)}
 
 
 def build():
@@ -24,7 +33,7 @@ def build():
     subprocess.run(['c++', '-std=c++17', '-O2', *include, str(FAST / 'runner.cpp'), '-lvulkan', '-o', str(FAST / 'runner')], check=True)
     texts = dict(re.findall(r'inline constexpr const char\* (\w+) = R"GLSL\((.*?)\)GLSL";', HEADER.read_text(), re.S))
     head = '#version 450\n' + texts['common'] + (FAST / 'io_offline.glsl').read_text()
-    for name in PASSES:
+    for name in passes(1280, 720):
         source = FAST / f'{name}.comp'
         source.write_text(head + texts[name])
         subprocess.run(['glslc', '-O', str(source), '-o', str(FAST / f'{name}.spv')], check=True)
@@ -33,11 +42,13 @@ def build():
 def run(which, A, B, params, records, iterations=1):
     (FAST / 'input.bin').write_bytes(pack_input(A, B, params, records))
     if which == 'fast':
-        passes = [f"{FAST / (name + '.spv')}:{g[0]}:{g[1]}:{g[2]}" for name, g in PASSES.items()]
+        height, width = A.shape[:2]
+        steps = [f"{FAST / (name + '.spv')}:{g[0]}:{g[1]}:{g[2]}" for name, g in passes(width, height).items()]
+        buffers, output = f'{FAST_BUFFERS},{width * height * 8}', '4'
     else:
-        passes = [f"{GPU / 'tiles.spv'}:12:1:1", f"{GPU / 'lighting.spv'}:{(PIXELS + 63) // 64}:1:1"]
-    buffers, output = (FAST_BUFFERS, '4') if which == 'fast' else (EXACT_BUFFERS, '1')
-    out = subprocess.run([str(FAST / 'runner'), str(FAST / 'input.bin'), str(FAST / 'output.bin'), str(iterations), buffers, output, *passes],
+        steps = [f"{GPU / 'tiles.spv'}:12:1:1", f"{GPU / 'lighting.spv'}:{(PIXELS + 63) // 64}:1:1"]
+        buffers, output = EXACT_BUFFERS, '1'
+    out = subprocess.run([str(FAST / 'runner'), str(FAST / 'input.bin'), str(FAST / 'output.bin'), str(iterations), buffers, output, *steps],
                          check=True, capture_output=True, text=True).stdout
     ms = next((float(l.split()[1]) for l in out.splitlines() if l.startswith('ms_per_iteration')), None)
     words = np.fromfile(FAST / 'output.bin', '<u4')
@@ -69,6 +80,13 @@ def cases():
     yield 'lights_x8', A, B, params, list(records) * 8
 
 
+def enlarge(image, scale):
+    # Nearest pixel of the 1280x720 image under the centre of each pixel of the enlarged one
+    rows = ((np.arange(round(image.shape[0] * scale)) + 0.5) / scale).astype(int)
+    columns = ((np.arange(round(image.shape[1] * scale)) + 0.5) / scale).astype(int)
+    return np.ascontiguousarray(image[rows][:, columns])
+
+
 def main():
     iterations = int(sys.argv[1]) if len(sys.argv) > 1 else 200
     build()
@@ -89,6 +107,15 @@ def main():
         entry['ms'] = {k: round(float(np.median(v)), 3) for k, v in times.items()}
         result[name] = entry
         print(name, json.dumps(entry), flush=True)
+    A, B, params, records = ours.inputs()
+    reference = ours.lighting(A, B, params, records)
+    for scale in SCALES:
+        big = enlarge(A, scale), enlarge(B, scale)
+        fast, ms = run('fast', *big, params, records, iterations)
+        entry = {'lights': len(records), 'size': [big[0].shape[1], big[0].shape[0]],
+                 'fast_vs_enlarged_reference': {c: compare(o, enlarge(r, scale)) for c, o, r in zip('AB', fast, reference)}, 'ms': {'fast': round(ms, 3)}}
+        result[f'captured_frame_x{scale}'] = entry
+        print(f'captured_frame_x{scale}', json.dumps(entry), flush=True)
     (ROOT / 'fast-validation.json').write_text(json.dumps(result, indent=2) + '\n')
 
 

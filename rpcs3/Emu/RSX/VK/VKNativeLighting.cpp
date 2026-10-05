@@ -4,6 +4,7 @@
 #include "VKCompute.h"
 #include "VKHelpers.h"
 #include "VKRenderPass.h"
+#include "VKResourceManager.h"
 #include "vkutils/image.h"
 #include "vkutils/sampler.h"
 #include "vkutils/buffer_object.h"
@@ -30,16 +31,20 @@ extern std::atomic<u64> g_native_gbuffer_skipped_bytes;
 // Here the same result is computed on the GPU: the two blits are kept as images (latch), the job's parameters and
 // light table are taken when the job starts (native_lighting_job_start, called on its SPU thread), and when the game
 // binds one of the two textures it gets the image written by five compute passes instead (substitute).
+//
+// The images have the size of the render targets the game blits from, which is 1280x720 times the resolution scale,
+// so the frame is lit at the resolution it is drawn at.
 namespace vk::native_lighting
 {
 	namespace
 	{
 		// Guest memory of the two images: normals in, diffuse light out / depth in, specular light out
 		constexpr u32 normals_address = 0x37400b80, depth_address = 0x37784b80;
-		constexpr u32 width = 1280, height = 720;
+		constexpr u32 guest_width = 1280, guest_height = 720;
 
-		// Shader limits (VKNativeLightingShaders.hpp): MASK_WORDS * 32 lights, 720 tiles, 3600 blocks of 32x8 pixels
-		constexpr u32 max_lights = 256, tile_count = 720, block_count = 3600;
+		// Shader limits (VKNativeLightingShaders.hpp): MASK_WORDS * 32 lights, 40x18 tiles, five blocks of pixels per tile
+		constexpr u32 max_lights = 256, tiles_x = 40, tiles_y = 18, tile_count = tiles_x * tiles_y, blocks_per_tile = 5;
+		constexpr u32 block_count = tile_count * blocks_per_tile;
 
 		// Job parameter block (256 bytes, big-endian) and light records (48 bytes each)
 		constexpr u32 parameter_bytes = 256, light_bytes = 48;
@@ -197,6 +202,7 @@ namespace vk::native_lighting
 
 			// Index 0: normals in, diffuse light out. Index 1: depth in, specular light out.
 			std::array<std::unique_ptr<vk::viewable_image>, 2> input, output;
+			u32 width = 0, height = 0; // Of those four
 
 			// Views of the output with the component mapping of the game's own texture views
 			std::array<std::unordered_map<u32, std::unique_ptr<vk::image_view>>, 2> views;
@@ -212,7 +218,7 @@ namespace vk::native_lighting
 
 		std::unique_ptr<state_t> g_state;
 
-		std::unique_ptr<vk::viewable_image> make_image(const vk::render_device& dev, VkFormat format, VkImageUsageFlags usage)
+		std::unique_ptr<vk::viewable_image> make_image(const vk::render_device& dev, VkFormat format, u32 width, u32 height, VkImageUsageFlags usage)
 		{
 			return std::make_unique<vk::viewable_image>(dev, dev.get_memory_mapping().device_local, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
 				VK_IMAGE_TYPE_2D, format, width, height, 1, 1, 1, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_TILING_OPTIMAL,
@@ -256,12 +262,31 @@ namespace vk::native_lighting
 			s.tiles = make_buffer(dev, tile_count * 64, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
 			s.lights = make_buffer(dev, max_lights * 64, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
 
-			for (auto& image : s.output)
+			lighting_log.success("GPU lighting active (mode %u)", mode());
+		}
+
+		// The G-buffer has another size than the images held (first frame, or the resolution scale was changed)
+		void resize(state_t& s, u32 width, u32 height)
+		{
+			auto& resources = *vk::get_resource_manager();
+
+			for (u32 i = 0; i < 2; i++)
 			{
-				image = make_image(dev, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+				for (auto& view : s.views[i])
+				{
+					resources.dispose(view.second);
+				}
+
+				s.views[i].clear();
+				if (s.input[i]) resources.dispose(s.input[i]);
+				if (s.output[i]) resources.dispose(s.output[i]);
 			}
 
-			lighting_log.success("GPU lighting active (mode %u)", mode());
+			s.width = width;
+			s.height = height;
+			s.latched = 0;
+			s.inputs = s.computed = s.supported = false;
+			lighting_log.notice("GPU lighting at %ux%u", width, height);
 		}
 
 		// The game may draw over the G-buffer again before it samples the lighting result, so the two images are kept
@@ -276,9 +301,14 @@ namespace vk::native_lighting
 			auto& s = *g_state;
 			const u32 i = address == normals_address ? 0 : 1;
 
+			if (src->width() != s.width || src->height() != s.height)
+			{
+				resize(s, src->width(), src->height());
+			}
+
 			if (!s.input[i])
 			{
-				s.input[i] = make_image(cmd.get_command_pool().get_owner(), VK_FORMAT_B8G8R8A8_UNORM, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+				s.input[i] = make_image(cmd.get_command_pool().get_owner(), VK_FORMAT_B8G8R8A8_UNORM, s.width, s.height, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
 			}
 
 			if (vk::is_renderpass_open(cmd))
@@ -288,7 +318,7 @@ namespace vk::native_lighting
 
 			VkImageCopy copy{};
 			copy.srcSubresource = copy.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-			copy.extent = { width, height, 1 };
+			copy.extent = { s.width, s.height, 1 };
 
 			src->push_layout(cmd, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
 			s.input[i]->change_layout(cmd, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
@@ -346,6 +376,27 @@ namespace vk::native_lighting
 				create_resources(cmd.get_command_pool().get_owner(), s);
 			}
 
+			for (auto& image : s.output)
+			{
+				if (!image)
+				{
+					image = make_image(cmd.get_command_pool().get_owner(), VK_FORMAT_R8G8B8A8_UNORM, s.width, s.height,
+						VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+				}
+			}
+
+			// Image size, its inverse, and the offset that puts the centre of an image pixel where the game's 1280x720
+			// grid has it: the job takes pixel x of that grid as x / 1280
+			const f32 size[2] = { static_cast<f32>(s.width), static_cast<f32>(s.height) };
+			const f32 guest_size[2] = { static_cast<f32>(guest_width), static_cast<f32>(guest_height) };
+
+			for (u32 i = 0; i < 2; i++)
+			{
+				words[24 + i] = i ? s.height : s.width;
+				words[26 + i] = std::bit_cast<u32>(1.f / size[i]);
+				words[28 + i] = std::bit_cast<u32>(0.5f - 0.5f * size[i] / guest_size[i]);
+			}
+
 			if (vk::is_renderpass_open(cmd))
 			{
 				vk::end_renderpass(cmd);
@@ -365,14 +416,14 @@ namespace vk::native_lighting
 				image->change_layout(cmd, VK_IMAGE_LAYOUT_GENERAL);
 			}
 
-			// Work groups of lights (64 lights), bounds (32x8 pixels), cull (64 tiles), shade (8x8 pixels), clear (64 tile rows)
-			constexpr u32 groups[state_t::pass_count][2] =
+			// Work groups of lights (64 lights), bounds (one block), cull (64 tiles), shade (8x8 pixels), clear (64 pixel rows of a tile)
+			const u32 groups[state_t::pass_count][2] =
 			{
 				{ max_lights / 64, 1 },
-				{ width / 32, height / 8 },
+				{ tiles_x, tiles_y * blocks_per_tile },
 				{ (tile_count + 63) / 64, 1 },
-				{ width / 8, height / 8 },
-				{ tile_count * 40 / 64, 1 },
+				{ (s.width + 7) / 8, (s.height + 7) / 8 },
+				{ (tiles_x * s.height + 63) / 64, 1 },
 			};
 
 			for (u32 i = 0; i < state_t::pass_count; i++)
@@ -433,8 +484,8 @@ namespace vk::native_lighting
 			return;
 		}
 
-		if (area.x1 || area.y1 || area.width() != static_cast<int>(width) || area.height() != static_cast<int>(height) ||
-			src->width() != width || src->height() != height || src->samples() != 1 ||
+		if (area.x1 || area.y1 || area.width() != static_cast<int>(src->width()) || area.height() != static_cast<int>(src->height()) ||
+			src->width() < guest_width / 4 || src->height() < guest_height / 4 || src->samples() != 1 ||
 			src->format() != VK_FORMAT_B8G8R8A8_UNORM || !rsx::get_current_renderer()->is_current_thread())
 		{
 			return;
@@ -457,7 +508,8 @@ namespace vk::native_lighting
 			return nullptr;
 		}
 
-		if (original->format() != VK_FORMAT_B8G8R8A8_UNORM || original->image()->width() != width || original->image()->height() != height)
+		// The size is the game's when the texture comes from guest memory and scaled when it is still the blitted copy
+		if (original->format() != VK_FORMAT_B8G8R8A8_UNORM)
 		{
 			if (static bool logged = false; !logged)
 			{

@@ -13,8 +13,9 @@ MAX_LIGHTS = 256  # MASK_WORDS*32 in gpu/common.glsl
 
 
 def pack_input(A, B, params, records):
-    if A.shape != (720, 1280, 4) or B.shape != A.shape or A.dtype != np.uint8 or B.dtype != np.uint8:
-        raise ValueError('Prototype requires 1280x720 byte G-buffers')
+    # The exact shaders in gpu/ need 1280x720; the emulator's passes (fast_validate.py) take any size
+    if A.ndim != 3 or A.shape[2] != 4 or B.shape != A.shape or A.dtype != np.uint8 or B.dtype != np.uint8:
+        raise ValueError('Byte G-buffers of one size expected')
     if len(params) != 256 or any(len(r) != 48 for r in records):
         raise ValueError('Malformed parameter block or light record')
     if len(records) > MAX_LIGHTS:
@@ -46,6 +47,11 @@ def pack_input(A, B, params, records):
     header[22] = len(header) + len(lut) + len(coords)
     clip = np.frombuffer(params[80:144],'>u4').astype(np.uint32)
     header[18] = header[22] + len(clip)
+    # Image size, its inverse and the pixel offset, as VKNativeLighting.cpp sets them
+    size = np.array([A.shape[1], A.shape[0]], 'f4')
+    header[24:26] = A.shape[1], A.shape[0]
+    header[26:28] = (np.float32(1) / size).view(np.uint32)
+    header[28:30] = (np.float32(0.5) - np.float32(0.5) * size / np.array([1280, 720], 'f4')).view(np.uint32)
     header[19] = header[18] + A.shape[0]*A.shape[1]
     words = np.concatenate([header, lut, coords, clip, np.frombuffer(A.tobytes(), '>u4'), np.frombuffer(B.tobytes(), '>u4')])
     return words.astype('<u4').tobytes()
