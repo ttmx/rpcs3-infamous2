@@ -36,8 +36,9 @@ FLAGS = {
     'RPCS3_NATIVE_SSAO': '5',
     # Deferred lighting computed on the GPU instead of by the game's SPU job (1 = use GPU images, 4 = idle the SPU
     # job's pixel work, 8 = drop its writes of the two light images, 16 = neither SPU job loads the G-buffer images,
-    # which then are not read back from the GPU). '0' is the game's own SPU version.
-    'RPCS3_NATIVE_LIGHTING': '29',
+    # which then are not read back from the GPU, 32 = the game's two blits of those images are skipped as well and
+    # the GPU passes read the render targets). '0' is the game's own SPU version.
+    'RPCS3_NATIVE_LIGHTING': '61',
     # Static geometry kept on the GPU across frames (1 = on, 2 = on with a content check of every reuse, slow).
     'RPCS3_VK_GEOMETRY_CACHE': '1',
     # Repeat draws taken straight from the command stream (6 = on, 4 = on with every texture change checked against a

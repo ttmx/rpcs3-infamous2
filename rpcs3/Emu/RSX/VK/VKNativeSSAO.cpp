@@ -4,6 +4,7 @@
 #include "VKRenderPass.h"
 #include "VKHelpers.h"
 #include "VKResourceManager.h"
+#include "VKGpuPassProfile.hpp"
 #include "vkutils/image.h"
 #include "vkutils/buffer_object.h"
 #include "vkutils/device.h"
@@ -303,6 +304,7 @@ void main()
 			}
 
 			if (vk::is_renderpass_open(cmd)) vk::end_renderpass(cmd);
+			vk::gpu_pass_profile::mark(cmd, vk::gpu_pass_profile::label_occlusion);
 
 			s.depth->push_layout(cmd, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 			s.normals->push_layout(cmd, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
@@ -317,6 +319,7 @@ void main()
 
 			s.normals->pop_layout(cmd);
 			s.depth->pop_layout(cmd);
+			vk::gpu_pass_profile::mark(cmd, vk::gpu_pass_profile::label_occlusion_user);
 
 			s.valid = true;
 		}

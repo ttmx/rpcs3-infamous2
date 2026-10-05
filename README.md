@@ -76,11 +76,16 @@ the SPUs, and uploads the results as textures. Emulated, that round trip was mos
 
 - **Ambient occlusion on the GPU** (`RPCS3_NATIVE_SSAO=5`): the game's five-stage occlusion job is replaced by five
   full-screen passes written from a reverse-engineered reference; dock 44 to 56 FPS.
-- **Deferred lighting on the GPU** (`RPCS3_NATIVE_LIGHTING`, bits 1, 4 and 8): the tiled lighting job (point and spot
+- **Deferred lighting on the GPU** (`RPCS3_NATIVE_LIGHTING`, bits 1, 4 and 8; the launcher sets 61): the tiled lighting job (point and spot
   lights, diffuse and specular) runs as compute passes and the SPU job skips its pixel work; about +15% at the dock.
 - **No G-buffer readback** (`RPCS3_NATIVE_LIGHTING` bit 16): with both jobs on the GPU their image transfers are
   skipped, so the two 1280x720 images are no longer copied from the GPU to guest memory and back each frame; dock 73
   to 85 FPS uncapped.
+- **No G-buffer blit** (`RPCS3_NATIVE_LIGHTING` bit 32): while both jobs are on the GPU, the game's two blits of the
+  G-buffer to main memory are skipped too and the passes read the render targets, with one small pass that writes
+  the depth target as the bytes the blit would have given. Matters with a resolution scale: dock uncapped 50.4 to
+  53.9 FPS at 200%, 78.6 to 80.7 at 150%, no difference at 100%. A frame that turns out to need the SPU job after its
+  blits were skipped is lit from old copies for that one frame; no such frame has been seen since the 256 light limit.
 - **Half-resolution depth from the GPU pass**: the depth texture the game samples for particle effects, which the
   occlusion job used to produce, now comes from the GPU pass.
 - **Up to 256 lights per frame**: eight mask words per tile; frames with more lights, or with light records the

@@ -2,6 +2,7 @@
 #include "Emu/RSX/VK/VKGSRenderTypes.hpp"
 #include "VKNativeSSAO.h"
 #include "VKNativeLighting.h"
+#include "VKGpuPassProfile.hpp"
 #include "VKTextureCache.h"
 #include "VKGSRender.h"
 #include "VKCompute.h"
@@ -1820,7 +1821,37 @@ namespace vk
 
 	bool texture_cache::blit(const rsx::blit_src_info& src, const rsx::blit_dst_info& dst, bool interpolate, vk::surface_cache& m_rtts, vk::command_buffer& cmd)
 	{
+		// inFamous 2 with both SPU jobs on the GPU (RPCS3_NATIVE_LIGHTING bit 32): the two G-buffer images the game
+		// blits to main memory, a 1024 pixel wide piece and the remaining 256 each, are used by the GPU passes only.
+		// Hand the render target to the passes when the last piece comes and leave the copies out.
+		if (dst.pitch == 1280 * 4 && src.pitch == dst.pitch && vk::native_lighting::blits_unneeded()) [[unlikely]]
+		{
+			if (const u32 gbuffer = vk::native_lighting::gbuffer_containing(dst.rsx_address))
+			{
+				const u32 piece_offset = dst.rsx_address - gbuffer;
+				const auto surface = m_rtts.get_surface_at(src.rsx_address - piece_offset);
+
+				if (surface && surface->get_surface_width<rsx::surface_metrics::pixels>() == 1280 && surface->get_surface_height<rsx::surface_metrics::pixels>() == 720 &&
+					src.width == dst.clip_width && src.height == dst.clip_height && dst.scale_x == 1.f && dst.scale_y == 1.f)
+				{
+					if ((piece_offset % dst.pitch) / 4 + dst.clip_width == 1280 && piece_offset / dst.pitch + dst.clip_height == 720)
+					{
+						surface->memory_barrier(cmd, rsx::surface_access::transfer_read);
+
+						if (const auto image = vk::native_lighting::on_gbuffer_target(cmd, surface->get_surface(rsx::surface_access::transfer_read), gbuffer))
+						{
+							const areai area{ 0, 0, static_cast<s32>(image->width()), static_cast<s32>(image->height()) };
+							vk::native_ssao::on_gbuffer(cmd, image, area, gbuffer);
+						}
+					}
+
+					return true;
+				}
+			}
+		}
+
 		blitter helper;
+		vk::gpu_pass_profile::mark(cmd, dst.rsx_address - 0x37400b80u < 0x384000u ? vk::gpu_pass_profile::label_normals_blit : dst.rsx_address - 0x37784b80u < 0x384000u ? vk::gpu_pass_profile::label_depth_blit : vk::gpu_pass_profile::label_blit);
 		auto reply = upload_scaled_image(src, dst, interpolate, cmd, m_rtts, helper);
 
 		if (reply.succeeded)

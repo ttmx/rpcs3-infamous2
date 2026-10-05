@@ -1502,3 +1502,80 @@ Not checked: other areas than the dock at a scale, scales below 100%, changing t
 images are made again on a size change, but that path was not exercised), MSAA, and the look of the occlusion blur at
 scales where its taps skip pixels (200%). The window used for the screenshots is 1152 pixels wide, so they do not show
 the added detail, only that the picture is right.
+
+## 2026-10-05 (night): where the GPU time goes with a resolution scale (profiler added, nothing made faster)
+
+New diagnostic, `RPCS3_VK_GPU_PASS_PROFILE=1` (`VKGpuPassProfile.hpp`): every 30th frame gets a GPU timestamp
+wherever the work changes (render target pair of a draw, a blit, each stage of the two native passes), and the time
+between two timestamps goes to the earlier label. Only meaningful while the GPU is the limit (it counts waits for the
+next submission); presentation is not included.
+
+Dock, uncapped, 200% (2560x1440, 50 FPS, 19.1 ms of GPU per frame), with 100% (97 FPS, 9.8 ms) for the native parts:
+
+| part | 200% | 100% |
+|---|---|---|
+| G-buffer fill (`c11c0000/c0010000`, 2,980 draws) | 2.75 ms | |
+| the game's draw that binds the lighting images, after the passes ran (its deferred composite) | 2.26 | 0.69 |
+| `c0734000/c0010000` (56 draws) | 2.09 | |
+| `c0ab8000/c0010000` (262 draws) | 2.05 | |
+| blit of the depth G-buffer image to main memory | 1.51 | 0.40 |
+| `c0b9e000/cf770000` (1,160 draws, 512x288 guest) | 1.15 | |
+| five targets of full-screen passes, together | 3.1 | |
+| GPU occlusion, five stages | 0.80 | 0.23 |
+| lighting latch (copy of the two blitted images) | 0.63 | 0.16 |
+| blit of the normals G-buffer image | 0.50 | 0.13 |
+| GPU lighting: shade 0.45, bounds 0.40, buffer update and image clears 0.36, lights, cull, clear 0.02 | 1.25 | 0.30 |
+
+City spawn view at 150% (58.6 FPS, 16.2 ms): `c0ab8000/c0010000` 3.8 ms (2,248 draws), G-buffer fill 2.0, shadow maps
+(`00000000/cf2f0000`, 5,728 draws) 2.0, composite draw 1.6, G-buffer blits 1.3, occlusion 0.5, lighting 0.5, latch 0.3.
+
+Reading: the two native passes are 2 ms of 19 at 200% and not the hotspot. What they need around them is larger: the
+depth blit (RPCS3 converts the D32S8 target to ARGB bytes through a buffer, per piece), the normals blit and the latch
+are 2.6 ms, 14% of the frame, and with both SPU jobs idle nothing else reads those copies. The rest is the game's own
+rendering, which grows with the pixel count.
+
+Tried and reverted: binding the four pass-produced textures from cached descriptors without asking the texture cache
+(the half-resolution depth already works that way). The suspicion was that the composite draw's 2.26 ms hid copies of
+the scaled blit targets; the profile did not change (2.27 ms, 50.5 FPS), so that time is the draw itself.
+
+Not done, candidate: let the passes read the depth-stencil and normals targets at blit time (one small conversion pass
+of our own for depth) and skip the three copies while no SPU job loads them. Needs a way back for the frames that are
+left to the SPU job, which is decided after the blit.
+
+## 2026-10-05 (night): G-buffer blits skipped while both jobs run on the GPU (`RPCS3_NATIVE_LIGHTING` bit 32, source only)
+
+Follows the profile above: the two blits and the latch were 2.6 ms of 19.1 at 200%.
+
+- `texture_cache::blit` (VK): while `g_native_gbuffer_unread` holds (both SPU jobs stubbed and leaving the copies
+  alone, decided at each lighting job start) and bit 32 is set, a blit piece into one of the two G-buffer copies is not
+  done. On the piece that completes an image the render target the game blits from is found in the surface cache
+  (source address minus the piece offset; it must be 1280x720 guest pixels and the piece an unscaled copy) and given
+  to `native_lighting::on_gbuffer_target`.
+- `VKNativeLighting.cpp`: `latch` takes a colour target (copied, as before) or a depth-stencil target, which a new
+  fragment pass writes into the kept image as the blit would have: `uint(depth * 16777215)` in A, R, G, RPCS3's own
+  `f32_to_d24`; the stencil byte in B, which no pass reads, is 0. The kept images are what the occlusion pass now gets.
+- Fallback, as agreed with the user: the decision follows the job start of the frame before. If a frame is then left
+  to the SPU job (more than 256 lights, unknown light kind, bad values), its job loads old copies for that frame and
+  the blits are real again from the next. Logs on disk: 11 boots, about 102,600 frames, 0 left to the SPU since the 256
+  limit (with 64 it was 10-11 of 1,800 while firing). Start-up runs on real blits until the flag is first set.
+- Launcher and `bench/city.sh` now set 61.
+
+GPU profile, dock 200%: total 19.1 to 17.6 ms; both blits gone, latch 0.63 to 0.51 ms (one copy and the depth pass).
+
+Dock and city spawn view, uncapped, 3 arms of 10 s, one boot per row (mode 29 against 61):
+| scene, scale | 29 | 61 |
+|---|---|---|
+| dock 100% | 95.2 FPS | 96.0 |
+| dock 150% | 78.6 | 80.7 |
+| dock 200% | 50.4 | 53.9 |
+| city 150% | 59.2 | 60.8 |
+The GPU ran at up to 2.7 GHz in these boots against 2.25 in the afternoon's (dock 150% was 73.0 then), so only the pairs
+compare. The power column of `ab3.sh` read a constant 54.00 W in all of them and is not used.
+
+Checks: dock 200% screenshot against mode 29 differs by 0.63% mean absolute, under the 0.86% between two mode 29 boots;
+lightning at 150% and 100% (half-resolution depth substitution engages, picture right); city spawn view at 150% looks
+the same in both modes. Summary lines: 0 frames left to the SPU, 4 readbacks at start-up as before.
+Not checked: a frame that actually falls back (never produced), long sessions, other areas, D24 depth targets (the
+780M uses D32S8), and what the texture cache holds at the two addresses after a long time without a blit (the game's
+bindings of them are replaced, and stayed B8G8R8A8 in these runs).
+Also here: `RPCS3_VK_GPU_PASS_PROFILE` labels the two blits separately.

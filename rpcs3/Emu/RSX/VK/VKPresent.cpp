@@ -3,6 +3,7 @@
 #include "stdafx.h"
 #include "VKGSRender.h"
 #include "VKPassTiming.hpp"
+#include "VKGpuPassProfile.hpp"
 #include "VKFrameIntervalTrace.hpp"
 #include "vkutils/buffer_object.h"
 #include "vkutils/memory.h"
@@ -596,6 +597,7 @@ vk::viewable_image* VKGSRender::get_present_source(/* inout */ vk::present_surfa
 void VKGSRender::flip(const rsx::display_flip_info_t& info)
 {
 	vk_frame_interval_trace::Scope interval_trace(info.emu_flip, info.skip_frame, info.buffer);
+	vk::gpu_pass_profile::frame(*m_current_command_buffer);
 	// Check swapchain condition/status
 	if (!m_swapchain->supports_automatic_wm_reports())
 	{

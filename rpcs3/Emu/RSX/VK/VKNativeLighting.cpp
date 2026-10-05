@@ -2,9 +2,11 @@
 #include "VKNativeLighting.h"
 #include "VKNativeLightingShaders.hpp"
 #include "VKCompute.h"
+#include "VKOverlays.h"
 #include "VKHelpers.h"
 #include "VKRenderPass.h"
 #include "VKResourceManager.h"
+#include "VKGpuPassProfile.hpp"
 #include "vkutils/image.h"
 #include "vkutils/sampler.h"
 #include "vkutils/buffer_object.h"
@@ -192,8 +194,39 @@ namespace vk::native_lighting
 			}
 		};
 
+		// Writes a depth render target as the bytes the game's blit of it gives: 24-bit depth in the A, R and G channels
+		struct depth_bytes_pass : vk::overlay_pass
+		{
+			depth_bytes_pass()
+			{
+				vs_src =
+				#include "../Program/GLSLSnippets/GenericVSPassthrough.glsl"
+				;
+				fs_src = R"(
+#version 440
+layout(set=0, binding=0) uniform sampler2D fs0;
+layout(location=0) out vec4 ocol;
+
+void main()
+{
+	uint depth = uint(texelFetch(fs0, ivec2(gl_FragCoord.xy), 0).r * 16777215.0);
+	ocol = vec4(float((depth >> 8u) & 255u), float(depth & 255u), 0.0, float(depth >> 16u)) * (1.0 / 255.0);
+}
+)";
+				renderpass_config.set_depth_mask(false);
+				renderpass_config.set_color_mask(0, true, true, true, true);
+				renderpass_config.set_attachment_count(1);
+
+				m_num_usable_samplers = 1;
+				m_num_uniform_buffers = 0;
+				m_sampler_filter = VK_FILTER_NEAREST;
+			}
+		};
+
 		struct state_t
 		{
+			std::unique_ptr<depth_bytes_pass> depth_bytes;
+
 			// In the order they run, with their work group counts
 			static constexpr u32 pass_count = 5;
 			std::array<std::unique_ptr<pass>, pass_count> passes;
@@ -290,8 +323,8 @@ namespace vk::native_lighting
 		}
 
 		// The game may draw over the G-buffer again before it samples the lighting result, so the two images are kept
-		// as they were blitted for the job
-		void latch(vk::command_buffer& cmd, vk::image* src, u32 address)
+		// as they were blitted for the job. src is a blitted image, or the render target itself (colour, depth-stencil).
+		vk::image* latch(vk::command_buffer& cmd, vk::image* src, u32 address)
 		{
 			if (!g_state)
 			{
@@ -308,7 +341,8 @@ namespace vk::native_lighting
 
 			if (!s.input[i])
 			{
-				s.input[i] = make_image(cmd.get_command_pool().get_owner(), VK_FORMAT_B8G8R8A8_UNORM, s.width, s.height, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+				s.input[i] = make_image(cmd.get_command_pool().get_owner(), VK_FORMAT_B8G8R8A8_UNORM, s.width, s.height,
+					VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
 			}
 
 			if (vk::is_renderpass_open(cmd))
@@ -316,21 +350,47 @@ namespace vk::native_lighting
 				vk::end_renderpass(cmd);
 			}
 
-			VkImageCopy copy{};
-			copy.srcSubresource = copy.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-			copy.extent = { s.width, s.height, 1 };
+			vk::gpu_pass_profile::mark(cmd, vk::gpu_pass_profile::label_lighting_latch);
 
-			src->push_layout(cmd, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-			s.input[i]->change_layout(cmd, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-			vkCmdCopyImage(cmd, src->value, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, s.input[i]->value, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
-			s.input[i]->change_layout(cmd, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-			src->pop_layout(cmd);
+			if (src->aspect() & VK_IMAGE_ASPECT_DEPTH_BIT)
+			{
+				auto& dev = cmd.get_command_pool().get_owner();
+
+				if (!s.depth_bytes)
+				{
+					s.depth_bytes = std::make_unique<depth_bytes_pass>();
+					s.depth_bytes->create(dev);
+				}
+
+				auto target = s.input[i].get();
+				const auto depth_view = static_cast<vk::viewable_image*>(src)->get_view(rsx::default_remap_vector.with_encoding(VK_REMAP_IDENTITY), VK_IMAGE_ASPECT_DEPTH_BIT);
+
+				src->push_layout(cmd, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+				target->change_layout(cmd, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+				const auto renderpass = vk::get_renderpass(dev, vk::get_renderpass_key(std::vector<vk::image*>{ target }));
+				s.depth_bytes->run(cmd, areau{ 0, 0, s.width, s.height }, target, std::vector<vk::image_view*>{ depth_view }, renderpass);
+				vk::end_renderpass(cmd);
+				target->change_layout(cmd, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+				src->pop_layout(cmd);
+			}
+			else
+			{
+				VkImageCopy copy{};
+				copy.srcSubresource = copy.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+				copy.extent = { s.width, s.height, 1 };
+
+				src->push_layout(cmd, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+				s.input[i]->change_layout(cmd, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+				vkCmdCopyImage(cmd, src->value, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, s.input[i]->value, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+				s.input[i]->change_layout(cmd, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+				src->pop_layout(cmd);
+			}
 
 			s.latched |= 1u << i;
 
 			if (s.latched != 3)
 			{
-				return;
+				return s.input[i].get();
 			}
 
 			s.latched = 0;
@@ -343,6 +403,8 @@ namespace vk::native_lighting
 				lighting_log.notice("GPU lighting: %u frames, %u without a new job start, %u left to the SPU, %u G-buffer readbacks, %u MB of SPU transfers skipped",
 					s.frames, s.stale, s.rejected, g_readbacks.load(), g_native_gbuffer_skipped_bytes.load() >> 20);
 			}
+
+			return s.input[i].get();
 		}
 
 		// Light the latched frame with the parameters of the most recent job
@@ -402,6 +464,8 @@ namespace vk::native_lighting
 				vk::end_renderpass(cmd);
 			}
 
+			vk::gpu_pass_profile::mark(cmd, vk::gpu_pass_profile::label_lighting_setup);
+
 			// The data is copied into the command buffer, so one buffer serves every frame in flight
 			vkCmdUpdateBuffer(cmd, s.input_buffer->value, 0, input_words * 4, words.data());
 			memory_barrier(cmd, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
@@ -433,6 +497,7 @@ namespace vk::native_lighting
 				pass.inputs = { view_of(s.input[0].get()), view_of(s.input[1].get()) };
 				pass.outputs = { view_of(s.output[0].get()), view_of(s.output[1].get()) };
 				pass.sampler = s.sampler.get();
+				vk::gpu_pass_profile::mark(cmd, vk::gpu_pass_profile::label_lighting_pass + i);
 				pass.run(cmd, groups[i][0], groups[i][1], 1);
 
 				// Each pass reads what the one before it wrote
@@ -443,6 +508,8 @@ namespace vk::native_lighting
 			{
 				image->change_layout(cmd, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 			}
+
+			vk::gpu_pass_profile::mark(cmd, vk::gpu_pass_profile::label_lighting_user);
 
 			s.supported = true;
 		}
@@ -462,6 +529,31 @@ namespace vk::native_lighting
 	bool is_gbuffer(u32 address)
 	{
 		return address == normals_address || address == depth_address;
+	}
+
+	u32 gbuffer_containing(u32 address)
+	{
+		constexpr u32 bytes = guest_width * guest_height * 4;
+		return address - normals_address < bytes ? normals_address : address - depth_address < bytes ? depth_address : 0;
+	}
+
+	bool blits_unneeded()
+	{
+		return (mode() & 32) && g_native_gbuffer_unread.load(std::memory_order_relaxed);
+	}
+
+	vk::image* on_gbuffer_target(vk::command_buffer& cmd, vk::image* src, u32 address)
+	{
+		const bool depth = address == depth_address;
+
+		if (!is_gbuffer(address) || src->width() < guest_width / 4 || src->height() < guest_height / 4 || src->samples() != 1 ||
+			(depth ? !(src->aspect() & VK_IMAGE_ASPECT_DEPTH_BIT) : src->format() != VK_FORMAT_B8G8R8A8_UNORM) ||
+			!rsx::get_current_renderer()->is_current_thread())
+		{
+			return nullptr;
+		}
+
+		return latch(cmd, src, address);
 	}
 
 	bool readback_unneeded(u32 address)

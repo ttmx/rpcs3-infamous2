@@ -8,6 +8,7 @@
 #include "VKNativeLighting.h"
 #include "VKGSRender.h"
 #include "VKPassTiming.hpp"
+#include "VKGpuPassProfile.hpp"
 #include "VKLiveCtl.hpp"
 #include "vkutils/buffer_object.h"
 #include "vkutils/chip_class.h"
@@ -1526,6 +1527,11 @@ void VKGSRender::end()
 		vk::pass_timing::draw(m_surface_info[0].address, m_depth_surface_info.address);
 	}
 
+	if (vk::gpu_pass_profile::enabled())
+	{
+		vk::gpu_pass_profile::mark(*m_current_command_buffer, (u64{ m_surface_info[0].address } << 32) | m_depth_surface_info.address, m_framebuffer_layout.width, m_framebuffer_layout.height);
+	}
+
 	// Check for frame resource status here because it is possible for an async flip to happen between begin/end
 	if (m_current_frame->flags & frame_context_state::dirty) [[unlikely]]
 	{
@@ -2255,6 +2261,11 @@ void VKGSRender::fast_draw_batch()
 		if (vk::pass_timing::enabled())
 		{
 			vk::pass_timing::draw(m_surface_info[0].address, m_depth_surface_info.address);
+		}
+
+		if (vk::gpu_pass_profile::enabled())
+		{
+			vk::gpu_pass_profile::mark(*m_current_command_buffer, (u64{ m_surface_info[0].address } << 32) | m_depth_surface_info.address, m_framebuffer_layout.width, m_framebuffer_layout.height);
 		}
 
 		// The draw is consumed from here on; set the clause up as BEGIN, DRAW_INDEX_ARRAY and END do
