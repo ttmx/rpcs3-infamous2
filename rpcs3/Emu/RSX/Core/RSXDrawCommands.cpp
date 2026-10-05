@@ -711,9 +711,10 @@ namespace rsx
 		const auto window_origin = REGS(m_ctx)->shader_window_origin();
 		const u32 window_height = REGS(m_ctx)->shader_window_height();
 		const auto pixel_center = REGS(m_ctx)->pixel_center();
-		const f32 resolution_scale = (window_height <= RSX(m_ctx)->resolution_scaling_config.min_scalable_dimension)
+		const auto scaling_config = RSX(m_ctx)->framebuffer_scaling_config();
+		const f32 resolution_scale = (window_height <= scaling_config.min_scalable_dimension)
 			? 1.f
-			: RSX(m_ctx)->resolution_scaling_config.scale_factor();
+			: scaling_config.scale_factor();
 
 		payload.wpos_scale = (window_origin == rsx::window_origin::top) ? (1.f / resolution_scale) : (-1.f / resolution_scale);
 		payload.wpos_bias[0] = 0.f;

@@ -591,6 +591,7 @@ settings_dialog::settings_dialog(std::shared_ptr<gui_settings> gui_settings, std
 	// Checkboxes: main options
 	EnhanceCheckBox(emu_settings_type::WriteColorBuffers, ui->dumpColor, tooltips.settings.dump_color);
 	EnhanceCheckBox(emu_settings_type::StretchToDisplayArea, ui->stretchToDisplayArea, tooltips.settings.stretch_to_display_area);
+	EnhanceCheckBox(emu_settings_type::Infamous2FullResParticles, ui->infamous2FullResParticles, tooltips.settings.infamous2_full_res_particles);
 	EnhanceCheckBox(emu_settings_type::MultithreadedRSX, ui->multithreadedRSX, tooltips.settings.multithreaded_rsx);
 	EnhanceCheckBox(emu_settings_type::StrictRenderingMode, ui->strictModeRendering, tooltips.settings.strict_rendering_mode);
 	const auto on_strict_rendering_mode = [this](bool checked)

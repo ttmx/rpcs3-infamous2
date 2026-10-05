@@ -113,6 +113,7 @@ Video:
   Consecutive Frames To Draw: '1'
   Consecutive Frames To Skip: '1'
   Resolution Scale: '100'
+  inFamous 2 Full Resolution Particles: true
   Anisotropic Filter Override: '0'
   Texture LOD Bias Addend: '0'
   Minimum Scalable Dimension: '16'

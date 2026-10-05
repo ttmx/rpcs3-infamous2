@@ -152,6 +152,19 @@ the SPUs, and uploads the results as textures. Emulated, that round trip was mos
   InstCombine on; `--config infamous2/bench/cfg-nostrict-compat.yml --set RPCS3_EXPERIMENT_SPU_INSTCOMBINE=0 --set
   RPCS3_SPU_NATIVE_RWV=0` makes them work, and states made that way load under the normal settings.
 
+### Picture
+
+- **Full resolution particles** (setting `inFamous 2 Full Resolution Particles`, not an environment switch): the game
+  draws fire, smoke, sparks and lightning into a 512x288 target and enlarges it over the 1280x720 picture, which
+  looks blocky. With the setting on, that target and its depth buffer are made 2.5 times larger (and follow the
+  Resolution Scale on top), so particles have the resolution of everything else. Off by default in the emulator, on
+  in the launcher's `play-config.yml`. It can be switched while the game runs: PS button (or Shift+F10), Settings,
+  Video, "inFamous 2: Full Resolution Particles"; with the RPCS3 window, the checkbox of the same name is in the GPU
+  tab of the game's configuration. Cost at the dock (burning debris on screen): 97 to 93 FPS uncapped, and at the 60
+  FPS cap 42.3 to 43.0 W with the GPU clock going from 1025 to 1110 MHz. BCES01143 and Vulkan only.
+
+  ![Fire at the dock, as the game draws it above and with the setting below](infamous2/docs/images/particles-before-after.jpg)
+
 ### Configuration
 
 - **Strict Rendering Mode off**: on stock paths it nearly doubles the dock (14.6 to 27.6 FPS) and does nothing at

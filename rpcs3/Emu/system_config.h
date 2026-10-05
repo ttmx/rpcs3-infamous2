@@ -165,6 +165,7 @@ struct cfg_root : cfg::node
 		cfg::_int<1, 8> consecutive_frames_to_draw{ this, "Consecutive Frames To Draw", 1, true};
 		cfg::_int<1, 8> consecutive_frames_to_skip{ this, "Consecutive Frames To Skip", 1, true};
 		cfg::uint<25, 800> resolution_scale_percent{ this, "Resolution Scale", 100, true };
+		cfg::_bool infamous2_full_res_particles{ this, "inFamous 2 Full Resolution Particles", false, true };
 		cfg::uint<0, 16> anisotropic_level_override{ this, "Anisotropic Filter Override", 0, true };
 		cfg::_float<-32, 32> texture_lod_bias{ this, "Texture LOD Bias Addend", 0, true };
 		cfg::uint<1, 1024> min_scalable_dimension{ this, "Minimum Scalable Dimension", 16, true };

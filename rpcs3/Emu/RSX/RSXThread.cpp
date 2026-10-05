@@ -2117,8 +2117,8 @@ namespace rsx
 			m_graphics_state.set(rsx::rtt_config_valid);
 		}
 
-		std::tie(region.x1, region.y1) = rsx::apply_resolution_scale<false>(resolution_scaling_config, x1, y1, m_framebuffer_layout.width, m_framebuffer_layout.height);
-		std::tie(region.x2, region.y2) = rsx::apply_resolution_scale<true>(resolution_scaling_config, x2, y2, m_framebuffer_layout.width, m_framebuffer_layout.height);
+		std::tie(region.x1, region.y1) = rsx::apply_resolution_scale<false>(framebuffer_scaling_config(), x1, y1, m_framebuffer_layout.width, m_framebuffer_layout.height);
+		std::tie(region.x2, region.y2) = rsx::apply_resolution_scale<true>(framebuffer_scaling_config(), x2, y2, m_framebuffer_layout.width, m_framebuffer_layout.height);
 
 		return true;
 	}

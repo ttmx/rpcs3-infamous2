@@ -78,6 +78,7 @@ const std::map<emu_settings_type, cfg_location> settings_location =
 	{ emu_settings_type::RenderdocCompatibility,     get_cfg_location(local_cfg.video.renderdoc_compatiblity) },
 	{ emu_settings_type::GPUTextureScaling,          get_cfg_location(local_cfg.video.use_gpu_texture_scaling) },
 	{ emu_settings_type::StretchToDisplayArea,       get_cfg_location(local_cfg.video.stretch_to_display_area) },
+	{ emu_settings_type::Infamous2FullResParticles,  get_cfg_location(local_cfg.video.infamous2_full_res_particles) },
 	{ emu_settings_type::ForceHighpZ,                get_cfg_location(local_cfg.video.force_high_precision_z_buffer) },
 	{ emu_settings_type::StrictRenderingMode,        get_cfg_location(local_cfg.video.strict_rendering_mode) },
 	{ emu_settings_type::FramebufferAliasingBias,    get_cfg_location(local_cfg.video.fb_aliasing_bias) },

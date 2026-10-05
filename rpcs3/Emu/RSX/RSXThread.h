@@ -225,6 +225,17 @@ namespace rsx
 
 		surface_scaling_config_t resolution_scaling_config{};
 
+		// Extra scale of the bound framebuffer, on top of resolution_scaling_config (100 = none). A backend may raise
+		// it for single render targets; everything sized after the bound framebuffer uses framebuffer_scaling_config().
+		u16 framebuffer_scale_multiplier_percent = 100;
+
+		surface_scaling_config_t framebuffer_scaling_config() const
+		{
+			surface_scaling_config_t config = resolution_scaling_config;
+			config.scale_percent = static_cast<u16>(config.scale_percent * framebuffer_scale_multiplier_percent / 100);
+			return config;
+		}
+
 		void capture_frame(const std::string& name) const;
 		const backend_configuration& get_backend_config() const { return backend_config; }
 

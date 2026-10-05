@@ -1579,3 +1579,53 @@ Not checked: a frame that actually falls back (never produced), long sessions, o
 780M uses D32S8), and what the texture cache holds at the two addresses after a long time without a blit (the game's
 bindings of them are replaced, and stayed B8G8R8A8 in these runs).
 Also here: `RPCS3_VK_GPU_PASS_PROFILE` labels the two blits separately.
+
+## 2026-10-05 (late): full resolution particles (setting `inFamous 2 Full Resolution Particles`)
+
+Request: fire and other particles look low resolution; a mod for it, with a toggle somewhere friendly.
+
+Finding: the game draws its particles into a 512x288 colour target (0xc0b9e000 at the dock) with a 512x288 depth
+buffer (0xcf770000, filled by 37 depth-only draws per frame), about 1,160 draws per frame at the dock, and enlarges
+the result over the 1280x720 picture.
+
+Change
+- `rsx::thread` has `framebuffer_scale_multiplier_percent` and `framebuffer_scaling_config()` (the resolution scale
+  times that multiplier). Everything sized after the bound framebuffer uses it: the render target request, the
+  framebuffer object, viewport, scissor, the window position scale of fragment programs, point size and line width.
+  Surfaces already carry their own scaling configuration, so sampling and copies needed nothing.
+- `VKGSRender::prepare_rtts`: the multiplier is 250 while the layout is 512x288, the title is BCES01143 and
+  `g_cfg.video.infamous2_full_res_particles` is set, otherwise 100. A change of it forces the framebuffer to be made
+  again and marks the fragment and vertex state dirty.
+- The setting is dynamic. It has a checkbox in the home menu (Settings, Video; shown for this title only) and in the
+  GPU tab of the Qt settings dialog. Default off; `play-config.yml` and `play-config-strict.yml` set it to true.
+- OpenGL is untouched (its multiplier stays 100).
+
+Checks (dock state, `sessions/pt-*`)
+- Screenshots off and on: fire and sparks are sharp, smoke looks the same, particles are still hidden correctly
+  behind the pillars and posts; lightning while firing looks right. Same at Resolution Scale 150% (60 FPS at the cap).
+- Switched in the home menu while running: takes effect on leaving the menu, both ways.
+- Uncapped, one boot each: 96.7-98.1 FPS off, 92.9-93.1 on.
+- At the 60 cap, switched live, 10 s arms (on, off, on, off): 43.1, 42.3, 42.8, 42.3 W; GPU clock 1095, 1024, 1127,
+  1026 MHz; 60.0 FPS in all.
+- City spawn view (no fire), uncapped, switched live: 70.7, 67.7, 69.7, 69.8 FPS (no difference); 51.8, 50.3, 51.0,
+  49.9 W; GPU clock about 1525 against 1340 MHz.
+
+Not checked: the Qt checkbox (compiles, never opened), scenes with much more smoke or explosions on screen, where the
+cost is larger (6.25 times the pixels of every particle), other areas, MSAA, and anything else the game may draw into
+a 512x288 target. The home menu's Save writes the per-title custom configuration, which the launcher does not read
+(it passes `--config`): through the launcher the value comes from `play-config.yml` at every start.
+
+## 2026-10-05 (night): depth of field at native size, tried and not adopted
+
+Question: can the depth of field be rendered at native size, as it is said to look bad at high resolutions.
+
+- Aiming (L1) in the city blurs the distance; that is the test scene. After the particle composite the game shrinks
+  the picture to 320x180 (0xc0e3c000, 0xc0f22000), blurs it there and blends it back by depth. The same buffers feed
+  the bloom chain (160x90 down to 20x11).
+- A temporary switch gave 320x180 layouts four times the scale (the mechanism of the particle setting). At 100%, two
+  boots: the same blur strength, smoother edges in the blurred areas, same overall brightness (`sessions/dof-a`,
+  `dof-b`). At 200%, switched inside one boot with 2560x1440 captures (`sessions/dof-200b`): no visible difference; a
+  static blurred patch differs by 1.2-2.3 grey levels between the modes against 0.9-1.9 between two captures of one
+  mode. Whether the switch was active in that run was not confirmed by a log line.
+- Not adopted; the probe was removed. No cost figures: the machine was on a low battery and throttled.
+- Open: what the reported artefact is. Cutscenes were not tested (no savestate in one).

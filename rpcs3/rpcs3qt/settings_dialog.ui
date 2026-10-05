@@ -976,6 +976,13 @@
                    </widget>
                   </item>
                   <item>
+                   <widget class="QCheckBox" name="infamous2FullResParticles">
+                    <property name="text">
+                     <string>inFamous 2: Full Resolution Particles</string>
+                    </property>
+                   </widget>
+                  </item>
+                  <item>
                    <widget class="QCheckBox" name="multithreadedRSX">
                     <property name="text">
                      <string>Multithreaded RSX</string>

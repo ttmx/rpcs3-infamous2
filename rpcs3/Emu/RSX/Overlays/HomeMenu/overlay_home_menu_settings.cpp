@@ -1,6 +1,7 @@
 #include "stdafx.h"
 #include "overlay_home_menu_settings.h"
 #include "Emu/system_config.h"
+#include "Emu/System.h"
 
 namespace rsx
 {
@@ -164,6 +165,11 @@ namespace rsx
 			add_unsigned_slider(&g_cfg.video.rcas_sharpening_intensity, localized_string_id::HOME_MENU_SETTINGS_VIDEO_RCAS_SHARPENING, " %", 1);
 
 			add_checkbox(&g_cfg.video.stretch_to_display_area, localized_string_id::HOME_MENU_SETTINGS_VIDEO_STRETCH_TO_DISPLAY);
+
+			if (Emu.GetTitleID() == "BCES01143")
+			{
+				add_checkbox(&g_cfg.video.infamous2_full_res_particles, localized_string_id::HOME_MENU_SETTINGS_VIDEO_INFAMOUS2_FULL_RES_PARTICLES);
+			}
 
 			if (g_cfg.video.stereo_enabled)
 			{

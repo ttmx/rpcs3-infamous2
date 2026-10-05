@@ -1514,7 +1514,7 @@ void VKGSRender::check_present_status()
 void VKGSRender::set_viewport()
 {
 	const auto [clip_width, clip_height] = rsx::apply_resolution_scale<true>(
-		resolution_scaling_config,
+		framebuffer_scaling_config(),
 		rsx::method_registers.surface_clip_width(), rsx::method_registers.surface_clip_height());
 
 	const auto zclip_near = rsx::method_registers.clip_min();
@@ -2492,7 +2492,7 @@ void VKGSRender::load_program_env()
 		m_draw_processor.fill_scale_offset_data(buf, false);
 		m_draw_processor.fill_user_clip_data(buf + 64);
 		*(reinterpret_cast<u32*>(buf + 68)) = ctx->transform_branch_bits();
-		*(reinterpret_cast<f32*>(buf + 72)) = ctx->point_size() * resolution_scaling_config.scale_factor();
+		*(reinterpret_cast<f32*>(buf + 72)) = ctx->point_size() * framebuffer_scaling_config().scale_factor();
 		*(reinterpret_cast<f32*>(buf + 76)) = ctx->clip_min();
 		*(reinterpret_cast<f32*>(buf + 80)) = ctx->clip_max();
 
@@ -2976,6 +2976,20 @@ void VKGSRender::prepare_rtts(rsx::framebuffer_creation_context context)
 		return;
 	}
 
+	// inFamous 2 draws its particles (fire, smoke, sparks) into a 512x288 target and enlarges that over the 1280x720
+	// picture. On request that target and its depth buffer get 2.5 times the scale, the size of the main picture.
+	const u16 scale_multiplier = (g_cfg.video.infamous2_full_res_particles &&
+		m_framebuffer_layout.width == 512 && m_framebuffer_layout.height == 288 && Emu.GetTitleID() == "BCES01143") ? 250 : 100;
+
+	if (scale_multiplier != framebuffer_scale_multiplier_percent)
+	{
+		framebuffer_scale_multiplier_percent = scale_multiplier;
+		m_framebuffer_layout.ignore_change = false;
+
+		// The window position scale and the point size follow the framebuffer's scale
+		m_graphics_state |= rsx::pipeline_state::fragment_state_dirty | rsx::pipeline_state::vertex_state_dirty;
+	}
+
 	if (m_draw_fbo && m_framebuffer_layout.ignore_change)
 	{
 		// Nothing has changed, we're still using the same framebuffer
@@ -2990,7 +3004,7 @@ void VKGSRender::prepare_rtts(rsx::framebuffer_creation_context context)
 		m_framebuffer_layout.target, m_framebuffer_layout.aa_mode, m_framebuffer_layout.raster_type,
 		m_framebuffer_layout.color_addresses, m_framebuffer_layout.zeta_address,
 		m_framebuffer_layout.actual_color_pitch, m_framebuffer_layout.actual_zeta_pitch,
-		resolution_scaling_config);
+		framebuffer_scaling_config());
 
 	// Reset framebuffer information
 	const auto color_bpp = get_format_block_size_in_bytes(m_framebuffer_layout.color_format);
@@ -3161,7 +3175,7 @@ void VKGSRender::prepare_rtts(rsx::framebuffer_creation_context context)
 	m_cached_renderpass = vk::get_renderpass(*m_device, m_current_renderpass_key);
 
 	// Search old framebuffers for this same configuration
-	const auto [fbo_width, fbo_height] = rsx::apply_resolution_scale<true>(resolution_scaling_config, m_framebuffer_layout.width, m_framebuffer_layout.height);
+	const auto [fbo_width, fbo_height] = rsx::apply_resolution_scale<true>(framebuffer_scaling_config(), m_framebuffer_layout.width, m_framebuffer_layout.height);
 
 	if (m_draw_fbo)
 	{
