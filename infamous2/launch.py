@@ -54,7 +54,7 @@ FLAGS = {
 
 
 def find_binary(given=None):
-    candidates = [given, os.environ.get('RPCS3_BIN'), repo / 'build/bin/rpcs3', repo / 'bin/rpcs3']
+    candidates = [given, os.environ.get('RPCS3_BIN'), repo / 'build/bin/rpcs3', repo / 'bin/rpcs3', repo / 'bin/rpcs3.exe']
     for candidate in candidates:
         if candidate and pathlib.Path(candidate).is_file():
             return pathlib.Path(candidate).resolve()
@@ -77,7 +77,8 @@ def base_env(flags=FLAGS, cache=None, profile=None):
     if profile:
         env['XDG_CONFIG_HOME'] = str(pathlib.Path(profile).resolve())
     # Tested with the RPCS3 window under X11 / XWayland.
-    env.setdefault('QT_QPA_PLATFORM', 'xcb')
+    if sys.platform.startswith('linux'):
+        env.setdefault('QT_QPA_PLATFORM', 'xcb')
     return env
 
 

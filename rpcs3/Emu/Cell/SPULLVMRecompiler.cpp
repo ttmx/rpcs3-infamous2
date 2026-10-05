@@ -22,7 +22,11 @@
 #include "Whole890CallbackPairCapture.hpp"
 #include "WholeTileCallbackPairCapture.hpp"
 #endif
-#ifdef ARCH_X64
+// The hand-written kernels use GCC/Clang vector types and per-function target attributes
+#if defined(ARCH_X64) && (defined(__clang__) || defined(__GNUC__))
+#define SPU_NATIVE_KERNELS
+#endif
+#ifdef SPU_NATIVE_KERNELS
 #include "SPUNativeRWV.hpp"
 #include "SPUNativeSXE.hpp"
 #include "SPUNative07170.hpp"
@@ -416,7 +420,7 @@ namespace
 		return value && std::string_view(value) == "1";
 	}();
 
-#ifdef ARCH_X64
+#ifdef SPU_NATIVE_KERNELS
 	// No atomics or logging on the clean timing path. Summaries are bounded to
 	// powers of two through 65536 attempts (at most 17 per kernel per process).
 	struct spu_native_counts
@@ -452,7 +456,7 @@ namespace
 	// Mirrors the stock LLVM check_state cold path. SIMD locals remain live in
 	// the native frame while check_state pauses and returns. g_escape abandons
 	// the frame using the emulator's existing escape protocol; no RAII is live.
-	[[gnu::noinline]] void spu_native_check_state(spu_thread* spu, u32 pc, bool unsafe, unsigned kernel)
+	NEVER_INLINE void spu_native_check_state(spu_thread* spu, u32 pc, bool unsafe, unsigned kernel)
 	{
 #ifdef __linux__
 		if(kernel==2 && g_spu_07170_contribution_trace) kernel_07170_trace::pause_begin();
@@ -3112,7 +3116,7 @@ public:
 		m_engine->updateGlobalMapping("spu_dispatcher", reinterpret_cast<u64>(spu_runtime::tr_all));
 		dispatcher->setCallingConv(main_func->getCallingConv());
 
-#ifdef ARCH_X64
+#ifdef SPU_NATIVE_KERNELS
 		// Context GPRs are coherent here: state/code verification passed and no
 		// entry-chunk SSA registers have been loaded. Hash + size + entry bounds
 		// identify exactly the independently lifted complete guest function.

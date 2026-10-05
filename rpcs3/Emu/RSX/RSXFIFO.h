@@ -3,6 +3,7 @@
 #include <cstring>
 
 #include "util/types.hpp"
+#include "util/endian.hpp"
 #include "Emu/RSX/gcm_enums.h"
 
 #include <span>
@@ -171,7 +172,7 @@ namespace rsx
 					// FIFO words are big-endian
 					u32 raw;
 					std::memcpy(&raw, reinterpret_cast<const u8*>(m_cache) + (addr - m_cache_addr), 4);
-					value = __builtin_bswap32(raw);
+					value = stx::se_storage<u32>::swap(raw);
 					return true;
 				}
 

@@ -4,11 +4,13 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <chrono>
+#ifdef __linux__
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
-#include <time.h>
 #include <unistd.h>
+#endif
 
 namespace spu_dma_list_trace
 {
@@ -60,8 +62,7 @@ static_assert(std::atomic_ref<uint64_t>::is_always_lock_free);
 inline File* mapping = nullptr;
 inline uint64_t now_ns() noexcept
 {
-    timespec t{}; clock_gettime(CLOCK_MONOTONIC, &t);
-    return uint64_t(t.tv_sec) * 1000000000ull + uint64_t(t.tv_nsec);
+    return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
 }
 inline uint64_t read(uint64_t& x, std::memory_order order = std::memory_order_acquire) noexcept
 { return std::atomic_ref<uint64_t>(x).load(order); }
@@ -70,6 +71,7 @@ inline void publish(uint64_t& x, uint64_t value) noexcept
 inline bool initialize(const char* path) noexcept
 {
     if (!path || !*path || mapping) return false;
+#ifdef __linux__
     const int fd = open(path, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
     if (fd < 0) return false;
     if (ftruncate(fd, sizeof(File))) { close(fd); return false; }
@@ -85,6 +87,9 @@ inline bool initialize(const char* path) noexcept
     f->header.snapshot_capacity = snapshot_capacity; f->header.snapshot_bytes = sizeof(Snapshot);
     publish(f->header.init_flags, 1); mapping = f;
     return true;
+#else
+    return false; // The trace file is a shared mapping read by a Linux tool
+#endif
 }
 inline void bootstrap_from_environment() noexcept
 {
@@ -117,7 +122,13 @@ inline Record* enter(void* context, uint32_t id, uint32_t index, uint32_t pc,
     {
         thread.attempted = true;
         const auto i = std::atomic_ref<uint64_t>(mapping->header.next_slot).fetch_add(1, std::memory_order_relaxed);
-        if (i < slots) { thread.slot = &mapping->threads[i]; thread.slot->os_tid = uint64_t(syscall(SYS_gettid)); }
+        if (i < slots)
+        {
+            thread.slot = &mapping->threads[i];
+#ifdef __linux__
+            thread.slot->os_tid = uint64_t(syscall(SYS_gettid));
+#endif
+        }
     }
     uint64_t epoch, begin, end;
     if (!window(epoch, begin, end)) return nullptr;

@@ -3387,7 +3387,7 @@ static bool native_gbuffer_list_skip(spu_thread& spu, const spu_mfc_cmd& args)
 	return true;
 }
 
-[[gnu::noinline]] static bool do_list_transfer_diagnostic(spu_thread& self, spu_mfc_cmd& args, spu_dma_list_trace::Record* dma_trace)
+NEVER_INLINE static bool do_list_transfer_diagnostic(spu_thread& self, spu_mfc_cmd& args, spu_dma_list_trace::Record* dma_trace)
 {
 	perf_meter<"MFC_LIST"_u64> perf0;
 
@@ -4160,7 +4160,7 @@ bool spu_thread::do_list_transfer(spu_mfc_cmd& args)
 					{
 						for (u64 offset = 0; offset < prefetch_bytes; offset += 64)
 						{
-							__builtin_prefetch(base + next_ea + offset, 0, 3);
+							utils::prefetch_read(base + next_ea + offset);
 						}
 					}
 				}

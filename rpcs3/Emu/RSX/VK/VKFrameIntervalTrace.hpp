@@ -4,12 +4,15 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#ifdef __linux__
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
+#endif
 namespace vk_frame_interval_trace {
+#ifdef __linux__
 constexpr uint32_t capacity=65536;
 struct alignas(64) Header {
  char magic[8]; uint32_t version,row_size,capacity_rows,pid;
@@ -45,4 +48,10 @@ struct Scope {
 };
 struct PresentBinding {uint64_t old=present_flip;PresentBinding(){present_flip=current_flip;}~PresentBinding(){present_flip=old;}};
 inline void record_present(int32_t result,uint32_t image){if(auto* w=writer();w&&w->owned())w->append(present,present_flip,current_flags,image,uint64_t(int64_t(result)));}
+#else
+// The trace file is a shared mapping read by a Linux tool
+struct Scope {Scope(bool,bool,uint32_t){} void complete(bool,uint64_t){}};
+struct PresentBinding {PresentBinding(){}};
+inline void record_present(int32_t,uint32_t){}
+#endif
 }

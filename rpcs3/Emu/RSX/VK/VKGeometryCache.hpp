@@ -16,6 +16,7 @@
 #include "vkutils/buffer_object.h"
 #include "vkutils/device.h"
 #include "../Common/write_watch.h"
+#include "util/asm.hpp"
 
 #include <memory>
 
@@ -235,8 +236,8 @@ namespace vk
 
 				if (count + distance < previous_count)
 				{
-					__builtin_prefetch(previous[(count + distance) * 2]);
-					__builtin_prefetch(previous[(count + distance) * 2 + 1]);
+					utils::prefetch_read(previous[(count + distance) * 2]);
+					utils::prefetch_read(previous[(count + distance) * 2 + 1]);
 				}
 
 				if (count < capacity)

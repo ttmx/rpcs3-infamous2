@@ -78,6 +78,12 @@ namespace vk::readback_copy
             std::memcpy(dst, src, length);
         _mm256_zeroupper();
     }
+#else
+    // Compilers without per-function targets: an ordinary copy
+    inline void stream(void* destination, const void* source, std::size_t length)
+    {
+        std::memcpy(destination, source, length);
+    }
 #endif
 
     // false means untouched: the original memcpy must execute. Flags are the

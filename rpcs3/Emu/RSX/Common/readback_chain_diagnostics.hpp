@@ -2,6 +2,7 @@
 
 // Bounded observational trace only. No resource pointer is retained/dereferenced.
 #include "Utilities/Thread.h"
+#include "util/asm.hpp"
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -91,7 +92,7 @@ inline std::uint64_t register_scope()
 inline void publish(const row& r,bool include)
 {
  auto& out=storage();std::lock_guard lock(out.mutex);
- if(!out.inflight)__builtin_trap();--out.inflight;
+ if(!out.inflight)utils::trap();--out.inflight;
  if(!include)++out.filtered;
  else
  {

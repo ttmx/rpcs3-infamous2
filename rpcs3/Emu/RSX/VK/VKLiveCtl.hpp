@@ -4,6 +4,8 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "util/asm.hpp"
+
 // Live-tunable experiment values, re-read about once a second from the file named by
 // RPCS3_VK_LIVE_CTL (space separated integers). Index meanings:
 //  0: periodic submit interval in us (0 = off)
@@ -39,7 +41,7 @@ namespace vk::live_ctl
 		const std::size_t end = length < cap ? length : cap;
 		for (std::size_t offset = 0; offset < end; offset += 64)
 		{
-			__builtin_prefetch(p + offset, 0, 2);
+			utils::prefetch_exec(p + offset);
 		}
 	}
 }

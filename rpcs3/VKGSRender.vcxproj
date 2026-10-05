@@ -40,6 +40,8 @@
     <ClInclude Include="Emu\RSX\VK\VKShaderInterpreter.h" />
     <ClInclude Include="Emu\RSX\VK\VKCommonPipelineLayout.h" />
     <ClInclude Include="Emu\RSX\VK\VKTextureCache.h" />
+    <ClInclude Include="Emu\RSX\VK\VKNativeLighting.h" />
+    <ClInclude Include="Emu\RSX\VK\VKNativeSSAO.h" />
     <ClInclude Include="Emu\RSX\VK\vkutils\buffer_object.h" />
     <ClInclude Include="Emu\RSX\VK\vkutils\chip_class.h" />
     <ClInclude Include="Emu\RSX\VK\vkutils\commands.h" />
@@ -89,6 +91,8 @@
     <ClCompile Include="Emu\RSX\VK\VKOverlays.cpp" />
     <ClCompile Include="Emu\RSX\VK\VKPipelineCompiler.cpp" />
     <ClCompile Include="Emu\RSX\VK\VKPresent.cpp" />
+    <ClCompile Include="Emu\RSX\VK\VKNativeLighting.cpp" />
+    <ClCompile Include="Emu\RSX\VK\VKNativeSSAO.cpp" />
     <ClCompile Include="Emu\RSX\VK\VKProgramPipeline.cpp" />
     <ClCompile Include="Emu\RSX\VK\VKQueryPool.cpp" />
     <ClCompile Include="Emu\RSX\VK\VKRenderPass.cpp" />
