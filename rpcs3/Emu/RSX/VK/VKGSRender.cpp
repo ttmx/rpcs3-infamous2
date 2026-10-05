@@ -1,13 +1,19 @@
 #include "Emu/RSX/VK/vkutils/descriptors.h"
 #include "stdafx.h"
+#include "../Common/readback_chain_diagnostics.hpp"
 #include "../Overlays/overlay_compile_notification.h"
 #include "../Overlays/Shaders/shader_loading_dialog_native.h"
 
+#include "VKLiveCtl.hpp"
 #include "VKAsyncScheduler.h"
 #include "VKCommandStream.h"
 #include "VKCommonPipelineLayout.h"
 #include "VKCompute.h"
+#include "VKNativeSSAO.h"
+#include "VKNativeLighting.h"
 #include "VKGSRender.h"
+#include "../Common/RSXTailDemandTrace.hpp"
+#include "VKTimestampDiagnostics.hpp"
 #include "VKHelpers.h"
 #include "VKRenderPass.h"
 #include "VKResourceManager.h"
@@ -406,6 +412,49 @@ u64 VKGSRender::get_cycles()
 
 VKGSRender::VKGSRender(utils::serial* ar) noexcept : GSRender(ar)
 {
+	if (const char* enabled = std::getenv("RPCS3_VK_DRAW_PREFIX_SUBMIT"))
+	{
+		m_draw_prefix_submit_enabled = std::string_view(enabled) == "1";
+	}
+
+	if (const char* length = std::getenv("RPCS3_VK_STREAM_DMA_LOAD_MIN"))
+	{
+		vk::live_ctl::values[1] = std::strtoull(length, nullptr, 10);
+	}
+
+	if (const char* mode = std::getenv("RPCS3_VK_FAST_DRAWS"))
+	{
+		vk::live_ctl::values[9] = std::strtoull(mode, nullptr, 10);
+	}
+	if (const char* mode = std::getenv("RPCS3_VK_MATERIAL_BINDINGS"))
+	{
+		vk::live_ctl::values[10] = std::strtoull(mode, nullptr, 10);
+	}
+	if (const char* mode = std::getenv("RPCS3_VK_DESCRIPTOR_REUSE"))
+	{
+		vk::live_ctl::values[12] = std::strtoull(mode, nullptr, 10);
+	}
+	if (const char* mode = std::getenv("RPCS3_VK_PIPELINE_REUSE"))
+	{
+		vk::live_ctl::values[11] = std::strtoull(mode, nullptr, 10);
+	}
+
+	if (const char* mode = std::getenv("RPCS3_VK_GEOMETRY_CACHE"))
+	{
+		vk::live_ctl::values[8] = std::strtoull(mode, nullptr, 10);
+	}
+
+	if (const char* interval = std::getenv("RPCS3_VK_PERIODIC_SUBMIT_US"))
+	{
+		m_periodic_submit_us = std::strtoull(interval, nullptr, 10);
+		vk::live_ctl::values[0] = m_periodic_submit_us;
+	}
+
+	if (const char* enabled = std::getenv("RPCS3_VK_B_DRAW_ATTRIBUTION"))
+	{
+		m_draw_attribution_enabled = std::string_view(enabled) == "1";
+	}
+
 	// Initialize dependencies
 	g_fxo->need<rsx::dma_manager>();
 	g_fxo->need<vk::driver_manager_thread>();
@@ -480,11 +529,17 @@ VKGSRender::VKGSRender(utils::serial* ar) noexcept : GSRender(ar)
 		swapchain_unavailable = true;
 	}
 
+	if (const char* enabled = std::getenv("RPCS3_VK_GPU_TIMESTAMPS"); enabled && std::string_view(enabled) == "1")
+	{
+		m_gpu_timestamp_diagnostics = std::make_unique<vk::timestamp_diagnostics>(*m_device);
+	}
+
 	// create command buffer...
 	m_command_buffer_pool.create((*m_device), m_device->get_graphics_queue_family());
 	m_primary_cb_list.create(m_command_buffer_pool, vk::command_buffer::access_type_hint::flush_only);
 	m_current_command_buffer = m_primary_cb_list.get();
 	m_current_command_buffer->begin();
+	diagnostic_command_begin();
 
 	// Create secondary command_buffer for parallel operations
 	m_secondary_command_buffer_pool.create((*m_device), m_device->get_graphics_queue_family());
@@ -695,6 +750,12 @@ VKGSRender::VKGSRender(utils::serial* ar) noexcept : GSRender(ar)
 		}
 	}
 
+	const bool force_passthrough_dma = []
+	{
+		const char* option = std::getenv("RPCS3_VK_FORCE_PASSTHROUGH_DMA");
+		return option && option[0] == '1' && !option[1];
+	}();
+
 	// Sanity checks
 	switch (vk::get_driver_vendor())
 	{
@@ -723,7 +784,9 @@ VKGSRender::VKGSRender(utils::serial* ar) noexcept : GSRender(ar)
 		// Intel chipsets would fail on BSD in most cases and DRM_IOCTL_i915_GEM_USERPTR unimplemented
 	case vk::driver_vendor::ANV:
 #endif
-		if (backend_config.supports_passthrough_dma)
+		// The AMDGPU kernel driver accepts shm-backed user pointers; only libdrm's ANONONLY flag refuses them.
+		// With a preload shim clearing that flag, passthrough can be requested explicitly.
+		if (backend_config.supports_passthrough_dma && !force_passthrough_dma)
 		{
 			rsx_log.error("AMDGPU kernel driver on Linux and INTEL driver on some platforms cannot support passthrough DMA buffers.");
 			backend_config.supports_passthrough_dma = false;
@@ -784,12 +847,14 @@ VKGSRender::VKGSRender(utils::serial* ar) noexcept : GSRender(ar)
 	}
 
 	if (!backend_config.supports_host_gpu_labels &&
-		!backend_config.supports_asynchronous_compute)
+		!backend_config.supports_asynchronous_compute && !force_passthrough_dma)
 	{
 		// Disable passthrough DMA unless we enable a feature that requires it.
 		// I'm avoiding an explicit checkbox for this until I figure out why host labels don't fix all problems with passthrough.
 		backend_config.supports_passthrough_dma = false;
 	}
+
+	rsx_log.notice("Passthrough DMA: %s", backend_config.supports_passthrough_dma ? "enabled" : "disabled");
 }
 
 VKGSRender::~VKGSRender()
@@ -811,12 +876,20 @@ VKGSRender::~VKGSRender()
 
 	//Wait for device to finish up with resources
 	vkDeviceWaitIdle(*m_device);
+	if (m_gpu_timestamp_diagnostics)
+	{
+		m_gpu_timestamp_diagnostics->finish_after_device_idle();
+		m_gpu_timestamp_diagnostics.reset();
+	}
 
 	// Globals. TODO: Refactor lifetime management
 	if (auto async_scheduler = g_fxo->try_get<vk::AsyncTaskScheduler>())
 	{
 		async_scheduler->destroy();
 	}
+
+	vk::native_ssao::destroy();
+	vk::native_lighting::destroy();
 
 	// GC cleanup
 	vk::get_resource_manager()->flush();
@@ -839,6 +912,7 @@ VKGSRender::~VKGSRender()
 
 	m_persistent_attribute_storage.reset();
 	m_volatile_attribute_storage.reset();
+	m_geometry_cache.destroy();
 
 	// Upscaler (references some global resources)
 	m_upscaler.reset();
@@ -887,6 +961,7 @@ VKGSRender::~VKGSRender()
 	vk::descriptors::flush();
 
 	// Global resources
+	m_material_bindings.reset();
 	vk::destroy_global_resources();
 
 	// Device handles/contexts
@@ -901,6 +976,7 @@ VKGSRender::~VKGSRender()
 
 bool VKGSRender::on_access_violation(u32 address, bool is_writing)
 {
+	rsx::tail_demand_trace::fault_scope tail_fault(address, is_writing);
 	rsx::mm_flush(address);
 
 	vk::texture_cache::thrashed_set result;
@@ -922,6 +998,7 @@ bool VKGSRender::on_access_violation(u32 address, bool is_writing)
 
 	if (result.num_flushable > 0)
 	{
+		std::unique_lock readback_admission(m_foreign_readback_admission_mutex, std::defer_lock);
 		if (g_fxo->get<rsx::dma_manager>().is_current_thread())
 		{
 			// The offloader thread cannot handle flush requests
@@ -952,6 +1029,19 @@ bool VKGSRender::on_access_violation(u32 address, bool is_writing)
 			// Always submit primary cb to ensure state consistency (flush pending changes such as image transitions)
 			vm::temporary_unlock();
 
+			static const bool serialize_foreign_readbacks = []()
+			{
+				const char* enabled = std::getenv("RPCS3_VK_READBACK_ADMISSION");
+				return enabled && std::string_view(enabled) == "1";
+			}();
+			if (serialize_foreign_readbacks)
+			{
+				// Keep producers waiting for an earlier GPU flush outside the RSX
+				// queue cohort. The cache mutex and VM lock are not held here.
+				// flush_all retains its cache-tag revalidation and completion waits.
+				readback_admission.lock();
+			}
+
 			std::lock_guard lock(m_flush_queue_mutex);
 
 			m_flush_requests.post(false);
@@ -966,13 +1056,14 @@ bool VKGSRender::on_access_violation(u32 address, bool is_writing)
 			}
 
 			// Flush primary cb queue to sync pending changes (e.g image transitions!)
-			flush_command_queue();
+			flush_command_queue(false, false, "access_violation_current_thread");
 		}
 
 		if (has_queue_ref)
 		{
 			// Wait for the RSX thread to process request if it hasn't already
-			m_flush_requests.producer_wait();
+			{rsx::readback_chain_trace::scope chain_producer("foreign_producer_wait");chain_producer.range(address,0);chain_producer.auxiliary(is_writing,0);
+			 m_flush_requests.producer_wait();}
 
 			data_transfer_completed_callback = [&]()
 			{
@@ -1022,6 +1113,247 @@ void VKGSRender::on_semaphore_acquire_wait()
 		(m_queue_status & flush_queue_state::deadlock))
 	{
 		do_local_task(rsx::FIFO::state::lock_wait);
+		return;
+	}
+
+	static const bool semaphore_pipeline_prefetch = []()
+	{
+		const char* enabled = std::getenv("RPCS3_VK_SEMAPHORE_PIPELINE_PREFETCH");
+		return enabled && std::string_view(enabled) == "1";
+	}();
+
+	// Submit already-recorded rendering while the guest producer is still
+	// computing its semaphore value. Submission uses the normal DMA/heap,
+	// async-queue and resource-lifetime synchronization; the wait itself is
+	// unchanged. The new command buffer has no open pass, so subsequent
+	// polls in this same wait cannot issue redundant empty submissions.
+	if (!semaphore_pipeline_prefetch || in_begin_end || m_occlusion_query_active ||
+		vk::is_uninterruptible() || !m_current_command_buffer ||
+		!m_current_command_buffer->is_recording() ||
+		!vk::is_renderpass_open(*m_current_command_buffer) ||
+		(m_current_command_buffer->flags &
+			(vk::command_buffer::cb_has_open_query | vk::command_buffer::cb_has_conditional_render)) ||
+		(m_queue_status & flush_queue_state::flushing) ||
+		(m_queue_status & flush_queue_state::deadlock))
+	{
+		return;
+	}
+
+	std::unique_lock flush_lock(m_flush_queue_mutex, std::try_to_lock);
+	if (!flush_lock.owns_lock() || m_flush_requests.pending())
+	{
+		return;
+	}
+
+	if (m_gpu_timestamp_diagnostics)
+	{
+		const auto span = m_gpu_timestamp_diagnostics->begin_cpu_span();
+		flush_command_queue(false, false, "semaphore_pipeline_prefetch");
+		m_gpu_timestamp_diagnostics->end_cpu_span(span, "semaphore_pipeline_prefetch_submit");
+	}
+	else
+	{
+		flush_command_queue(false, false, "semaphore_pipeline_prefetch");
+		static bool activation_logged = false;
+		if (!activation_logged)
+		{
+			activation_logged = true;
+			rsx_log.notice("Semaphore pipeline prefetch activated: submitted recorded rendering during a guest semaphore wait");
+		}
+	}
+	diagnostic_begin_native_late_phase();
+	// Only a completed existing wait-prefetch opens this narrow draw phase.
+	if (m_draw_prefix_submit_enabled && !m_draw_prefix_submitted)
+	{
+		m_draw_prefix_armed = true;
+		m_draw_prefix_begin_us = 0;
+		m_draw_prefix_draws = 0;
+	}
+}
+
+void VKGSRender::diagnostic_begin_native_late_phase()
+{
+	if (!rsx::profiling_timer::native_phase_diagnostics_enabled() || m_native_late_counters_armed || !m_profiler.enabled || !m_native_stats_generation)
+		return;
+	m_native_late_counter_initial = native_late_counters::values::read(m_frame_stats);
+	if (!m_native_late_counter_initial.nonnegative())
+		return;
+	if (auto* texture = diagnostic_texture_values())
+		m_native_texture_initial = *texture;
+	m_native_late_counter_generation = m_native_stats_generation;
+	m_native_late_counter_begin_ns = rsx::readback_chain_trace::now();
+	m_native_late_counters_armed = true;
+}
+
+void VKGSRender::on_frame_end(u32 buffer, bool forced)
+{
+	// Guest logical-frame boundary: original stats are still intact here.
+	// The later presentation callback observes the next frame's reset stats.
+	diagnostic_finish_native_late_phase();
+	rsx::thread::on_frame_end(buffer, forced);
+}
+
+void VKGSRender::diagnostic_finish_native_late_phase()
+{
+	if (!rsx::profiling_timer::native_phase_diagnostics_enabled() || !m_native_late_counters_armed)
+		return;
+	m_native_late_counters_armed = false;
+	const auto whole = native_late_counters::values::read(m_frame_stats);
+	native_late_counters::values late;
+	const bool valid = m_profiler.enabled && m_native_late_counter_generation == m_native_stats_generation &&
+		whole.difference(m_native_late_counter_initial, late) && late.draw_calls;
+	rsx::readback_chain_trace::scope metadata(valid ? "native_late_counter_meta" : "native_late_counter_reject", true);
+	if (!metadata)
+		return;
+	metadata.command(*m_current_command_buffer);
+	metadata.range(m_native_late_counter_begin_ns, rsx::readback_chain_trace::now());
+	metadata.auxiliary(m_native_stats_generation, valid ? late.draw_calls : 0);
+	metadata.event(whole.draw_calls, nullptr); // Scalar whole-frame count, not a GPU event identity.
+	if (!valid)
+		return;
+	{
+		rsx::readback_chain_trace::scope counters("native_late_counters_us");
+		counters.range(late.setup_us, late.vertex_us);
+		counters.auxiliary(late.texture_us, late.draw_us);
+	}
+	{
+		rsx::readback_chain_trace::scope counters("native_whole_counters_us");
+		counters.range(whole.setup_us, whole.vertex_us);
+		counters.auxiliary(whole.texture_us, whole.draw_us);
+	}
+ if (auto* texture = diagnostic_texture_values())
+ {
+  native_texture_counters::values delta;
+  const bool texture_valid = texture->difference(m_native_texture_initial, delta) &&
+   delta.load_us <= static_cast<u64>(late.texture_us) && delta.bind_us == static_cast<u64>(late.texture_us) - delta.load_us;
+  rsx::readback_chain_trace::scope stages(texture_valid ? "native_late_texture_stages_us" : "native_late_texture_reject");
+  if (texture_valid)
+  {
+   stages.range(delta.load_us, delta.bind_us);
+   stages.auxiliary(delta.counters[native_texture_counters::load_calls], delta.counters[native_texture_counters::bind_blocks]);
+   const char* labels[] = {"native_late_texture_counts_0", "native_late_texture_counts_1", "native_late_texture_counts_2", "native_late_texture_counts_3"};
+   for (std::size_t group = 0; group < 4; ++group)
+   {
+    rsx::readback_chain_trace::scope counts(labels[group]);
+    auto value = [&](std::size_t offset) { const auto index = group * 4 + offset; return index < native_texture_counters::count ? delta.counters[index] : 0; };
+    counts.range(value(0), value(1)); counts.auxiliary(value(2), value(3));
+   }
+   const char* domain_labels[] = {"native_image_upload_domains_0", "native_image_upload_domains_1", "native_image_upload_domains_2", "native_image_upload_domains_3"};
+   for (std::size_t group = 0; group < 4; ++group)
+   {
+    rsx::readback_chain_trace::scope domain_row(domain_labels[group]);
+    auto domain_value = [&](std::size_t offset) { const auto index = group * 4 + offset; return index < native_texture_counters::domain_count ? delta.domains[index] : 0; };
+    domain_row.range(domain_value(0), domain_value(1));
+    domain_row.auxiliary(domain_value(2), domain_value(3));
+   }
+  }
+ }
+	static bool activation_logged = false;
+	if (!activation_logged)
+	{
+		activation_logged = true;
+		rsx_log.notice("Native late-phase counter diagnostics active: original profiler clock hooks, microsecond units; overlay unchanged");
+	}
+}
+
+void VKGSRender::maybe_periodic_submit()
+{
+	// Called after a draw clause has completed. Mid-frame flushes of this kind already
+	// happen in stock code (zcull hints, flush requests); this only makes them regular.
+	// Reading the clock on every draw is measurable with thousands of draws per frame.
+	if (++m_periodic_submit_draws & 7)
+	{
+		return;
+	}
+
+	const auto now = get_system_time();
+	if (now - m_last_submit_us < m_periodic_submit_us)
+	{
+		return;
+	}
+
+	if (in_begin_end || capture_current_frame || swapchain_unavailable ||
+		(async_flip_requested & flip_request::emu_requested) ||
+		cond_render_ctrl.hw_cond_active ||
+		m_flush_requests.pending() || vk::is_uninterruptible() ||
+		!m_current_command_buffer || !m_current_command_buffer->is_recording() ||
+		!vk::is_renderpass_open(*m_current_command_buffer) ||
+		(m_current_command_buffer->flags & vk::command_buffer::cb_has_conditional_render) ||
+		(m_queue_status & flush_queue_state::flushing) ||
+		(m_queue_status & flush_queue_state::deadlock))
+	{
+		return;
+	}
+
+	std::unique_lock flush_lock(m_flush_queue_mutex, std::try_to_lock);
+	if (!flush_lock.owns_lock() || m_flush_requests.pending())
+	{
+		return;
+	}
+
+	flush_command_queue(false, false, "periodic_submit");
+
+	if (!m_periodic_submit_count++)
+	{
+		rsx_log.notice("Periodic submit activated: interval %uus", m_periodic_submit_us);
+	}
+}
+
+void VKGSRender::maybe_submit_draw_prefix()
+{
+	// Called only after a real draw clause has completed its guest cleanup.
+	// A stock intervening flush disarms this phase; a swap starts a new budget.
+	if (!m_draw_prefix_armed || m_draw_prefix_submitted ||
+		!m_current_draw.subdraw_id || in_begin_end || capture_current_frame ||
+		swapchain_unavailable || (async_flip_requested & flip_request::emu_requested) ||
+		m_occlusion_query_active || cond_render_ctrl.hw_cond_active ||
+		m_flush_requests.pending() || vk::is_uninterruptible() ||
+		!m_current_command_buffer || !m_current_command_buffer->is_recording() ||
+		!vk::is_renderpass_open(*m_current_command_buffer) ||
+		(m_current_command_buffer->flags &
+			(vk::command_buffer::cb_has_open_query | vk::command_buffer::cb_has_conditional_render)) ||
+		(m_queue_status & flush_queue_state::flushing) ||
+		(m_queue_status & flush_queue_state::deadlock))
+	{
+		return;
+	}
+
+	const auto now = get_system_time();
+	if (!m_draw_prefix_begin_us)
+	{
+		m_draw_prefix_begin_us = now;
+		m_draw_prefix_draws = 1;
+		return;
+	}
+
+	if (m_draw_prefix_draws < 2)
+		++m_draw_prefix_draws;
+	if (m_draw_prefix_draws < 2 || now - m_draw_prefix_begin_us < 500)
+		return;
+
+	std::unique_lock flush_lock(m_flush_queue_mutex, std::try_to_lock);
+	if (!flush_lock.owns_lock() || m_flush_requests.pending())
+		return;
+
+	// Mark before the original MM/DMA sync path can invoke event callbacks.
+	// Preserve every original heap upload, query guard, async ordering and GC.
+	m_draw_prefix_submitted = true;
+	m_draw_prefix_armed = false;
+	flush_command_queue(false, false, "late_draw_prefix_submit");
+
+	// Queue submission order alone is not a memory dependency. Preserve the
+	// continued attachment load/read/write order across this new CB boundary.
+	vk::insert_global_memory_barrier(*m_current_command_buffer,
+		VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+		VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+		VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+		VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_INPUT_ATTACHMENT_READ_BIT | VK_ACCESS_SHADER_READ_BIT);
+
+	static bool activation_logged = false;
+	if (!activation_logged)
+	{
+		activation_logged = true;
+		rsx_log.notice("Late draw prefix submit activated: one extra submission per flip, >=2 completed draw clauses and >=500us prefix recording");
 	}
 }
 
@@ -1034,7 +1366,7 @@ bool VKGSRender::on_vram_exhausted(rsx::problem_severity severity)
 	{
 		// Hard sync before trying to evict anything. This guarantees no UAF crashes in the driver.
 		// As a bonus, we also get a free gc pass
-		flush_command_queue(true, true);
+		flush_command_queue(true, true, "vram_exhausted_fatal");
 		g_fxo->get<vk::driver_manager_thread>().drain();
 
 		if (m_texture_cache.is_overallocated())
@@ -1127,7 +1459,7 @@ bool VKGSRender::on_vram_exhausted(rsx::problem_severity severity)
 	}
 
 	// Imminent crash, full GPU sync is the least of our problems
-	flush_command_queue(true, true);
+	flush_command_queue(true, true, "vram_exhausted_recovery");
 
 	return any_cache_relieved;
 }
@@ -1142,7 +1474,7 @@ void VKGSRender::on_descriptor_pool_fragmentation(bool is_fatal)
 	}
 
 	// Just flush everything. Unless the hardware is very deficient, this should happen very rarely.
-	flush_command_queue(true, true);
+	flush_command_queue(true, true, "descriptor_pool_fragmentation");
 }
 
 void VKGSRender::notify_tile_unbound(u32 tile)
@@ -1537,9 +1869,94 @@ void VKGSRender::clear_surface(u32 mask)
 	}
 }
 
-void VKGSRender::flush_command_queue(bool hard_sync, bool do_not_switch)
+
+void VKGSRender::diagnostic_readback_begin(const vk::command_buffer& cmd, u32 address, u32 length,
+    u32 width, u32 height, u32 pitch, u64 cookie, const vk::image* image, bool armed)
 {
-	close_and_submit_command_buffer();
+    // Reject foreign/auxiliary callers before observing renderer-owned CB state.
+    if (!is_current_thread() || !m_gpu_timestamp_diagnostics || !m_current_command_buffer || !image) return;
+    if (&cmd != static_cast<vk::command_buffer*>(m_current_command_buffer) ||
+        cmd.access_hint != vk::command_buffer::flush_only) return;
+    m_gpu_timestamp_diagnostics->readback(*m_current_command_buffer, address, length, width, height,
+        pitch, cookie, rsx::readback_chain_trace::handle_key(image->value), armed);
+}
+
+u32 VKGSRender::diagnostic_draw_begin(u32 vertices, u32 subdraw, bool indexed, u32 primitive, u32 passes)
+{
+    if (!m_gpu_timestamp_diagnostics || !m_gpu_timestamp_diagnostics->draw_selected(*m_current_command_buffer)) return ~0u;
+    if (!m_program || !m_vertex_prog || !m_fragment_prog || m_shader_interpreter.is_interpreter(m_program) ||
+        (m_current_command_buffer->flags & vk::command_buffer::cb_has_conditional_render))
+    {
+        m_gpu_timestamp_diagnostics->draw_unsupported();
+        return ~0u;
+    }
+    vk::bounded_draw_attribution::tag tag;
+    tag.pipeline = rsx::readback_chain_trace::handle_key(m_program->value());
+    // These hashes read existing owned translated-host GLSL strings, not VM ucode.
+    tag.vertex_source_hash = vk::bounded_draw_attribution::host_source_hash(m_vertex_prog->shader.get_source());
+    tag.fragment_source_hash = vk::bounded_draw_attribution::host_source_hash(m_fragment_prog->shader.get_source());
+    tag.vertex_module = rsx::readback_chain_trace::handle_key(m_vertex_prog->handle);
+    tag.fragment_module = rsx::readback_chain_trace::handle_key(m_fragment_prog->handle);
+    for (u32 i = 0; i < 4; ++i)
+    {
+        const auto& binding = m_rtts.m_bound_render_targets[i];
+        tag.color_address[i] = binding.first;
+        if (binding.second)
+        {
+            tag.color_image[i] = rsx::readback_chain_trace::handle_key(binding.second->value);
+            tag.color_pitch[i] = binding.second->rsx_pitch;
+            tag.color_width[i] = binding.second->width();
+            tag.color_height[i] = binding.second->height();
+            tag.color_vk_format[i] = static_cast<u32>(binding.second->format());
+            tag.color_samples[i] = static_cast<u32>(binding.second->samples());
+        }
+    }
+    const auto& depth = m_rtts.m_bound_depth_stencil;
+    tag.depth_address = depth.first;
+    if (depth.second)
+    {
+        tag.depth_image = rsx::readback_chain_trace::handle_key(depth.second->value);
+        tag.depth_pitch = depth.second->rsx_pitch;
+    }
+    tag.width = m_draw_fbo->width(); tag.height = m_draw_fbo->height();
+    tag.guest_width = m_framebuffer_layout.width; tag.guest_height = m_framebuffer_layout.height;
+    tag.color_format = static_cast<u32>(m_framebuffer_layout.color_format);
+    tag.depth_format = static_cast<u32>(m_framebuffer_layout.depth_format);
+    tag.aa = static_cast<u32>(m_framebuffer_layout.aa_mode);
+    tag.flags = m_current_command_buffer->flags;
+    tag.vertices = vertices; tag.subdraw = subdraw; tag.indexed = indexed;
+    tag.primitive = primitive; tag.passes = passes;
+    return m_gpu_timestamp_diagnostics->draw_begin(*m_current_command_buffer, tag,
+        m_vertex_prog->shader.get_source(), m_fragment_prog->shader.get_source());
+}
+
+void VKGSRender::diagnostic_draw_end(u32 token)
+{
+    if (m_gpu_timestamp_diagnostics && token != ~0u)
+        m_gpu_timestamp_diagnostics->draw_end(*m_current_command_buffer, token);
+}
+
+void VKGSRender::diagnostic_command_begin()
+{
+	if (m_gpu_timestamp_diagnostics)
+		m_gpu_timestamp_diagnostics->begin(*m_current_command_buffer);
+}
+
+void VKGSRender::diagnostic_frame_end()
+{
+	if (m_gpu_timestamp_diagnostics)
+		m_gpu_timestamp_diagnostics->frame_end();
+}
+
+void VKGSRender::flush_command_queue(bool hard_sync, bool do_not_switch, const char* diagnostic_reason)
+{
+	if (m_periodic_submit_us)
+		m_last_submit_us = get_system_time();
+
+	if (m_draw_prefix_submit_enabled)
+		m_draw_prefix_armed = false;
+
+	close_and_submit_command_buffer(nullptr, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, diagnostic_reason);
 
 	if (hard_sync)
 	{
@@ -1580,6 +1997,7 @@ void VKGSRender::flush_command_queue(bool hard_sync, bool do_not_switch)
 	}
 
 	m_current_command_buffer->begin();
+	diagnostic_command_begin();
 }
 
 std::pair<volatile vk::host_data_t*, VkBuffer> VKGSRender::map_host_object_data() const
@@ -1623,7 +2041,7 @@ bool VKGSRender::release_GCM_label(u32 type, u32 address, u32 args)
 	if (host_ctx->has_unflushed_texture_loads())
 	{
 		vkCmdUpdateBuffer(*m_current_command_buffer, mapping.second->value, mapping.first, 4, &write_data);
-		flush_command_queue();
+		flush_command_queue(false, false, "release_gcm_label_texture_loads");
 	}
 	else
 	{
@@ -1719,7 +2137,7 @@ void VKGSRender::sync_hint(rsx::FIFO::interrupt_hint hint, rsx::reports::sync_hi
 		// Unavoidable hard sync coming up, flush immediately
 		// This heavyweight hint should be used with caution
 		std::lock_guard lock(m_flush_queue_mutex);
-		flush_command_queue();
+		flush_command_queue(false, false, "zcull_sync_hint");
 
 		if (m_flush_requests.pending())
 		{
@@ -1754,10 +2172,19 @@ void VKGSRender::do_local_task(rsx::FIFO::state state)
 		{
 			// TODO: Determine if a hard sync is necessary
 			// Pipeline barriers later may do a better job synchronizing than wholly stalling the pipeline
-			flush_command_queue();
+			flush_command_queue(false, false, "local_task_flush_request");
 
 			m_flush_requests.clear_pending_flag();
-			m_flush_requests.consumer_wait();
+			if (m_gpu_timestamp_diagnostics)
+			{
+				const auto span = m_gpu_timestamp_diagnostics->begin_cpu_span();
+				m_flush_requests.consumer_wait();
+				m_gpu_timestamp_diagnostics->end_cpu_span(span, "rsx_consumer_wait");
+			}
+			else
+			{
+				m_flush_requests.consumer_wait();
+			}
 			m_flush_queue_mutex.unlock();
 		}
 	}
@@ -1793,7 +2220,7 @@ void VKGSRender::do_local_task(rsx::FIFO::state state)
 		const auto should_ignore = in_begin_end && state != rsx::FIFO::state::empty;
 		if ((async_flip_requested & flip_request::native_ui) && !should_ignore && !is_stopped())
 		{
-			flush_command_queue(true);
+			flush_command_queue(true, false, "local_task_native_ui_flip");
 			rsx::display_flip_info_t info{};
 			info.buffer = current_display_buffer;
 			flip(info);
@@ -1804,9 +2231,20 @@ void VKGSRender::do_local_task(rsx::FIFO::state state)
 bool VKGSRender::load_program()
 {
 	const auto shadermode = g_cfg.video.shadermode.get();
+	const auto pipeline_mode = vk::live_ctl::get(11);
+	const bool shaders_invalidated = !!(m_graphics_state & rsx::pipeline_state::invalidate_pipeline_bits);
 
 	// TODO: EXT_dynamic_state should get rid of this sillyness soon (kd)
 	const auto vertex_state = vk::decode_vertex_input_assembly_state();
+	const auto decode_pipeline = [&]()
+	{
+		auto properties = vk::decode_rsx_state(
+			m_ctx, vertex_state, m_rtts.m_bound_depth_stencil.second, backend_config,
+			static_cast<u8>(m_draw_buffers.size()), u8((m_current_renderpass_key >> 16) & 0xF),
+			m_device->get_depth_bounds_support(), !!(current_fragment_program.ctrl & RSX_SHADER_CONTROL_PROGRAMMABLE_BLENDING));
+		properties.renderpass_key = m_current_renderpass_key;
+		return properties;
+	};
 
 	if (m_graphics_state & rsx::pipeline_state::invalidate_pipeline_bits)
 	{
@@ -1824,7 +2262,13 @@ bool VKGSRender::load_program()
 	{
 		if (!m_shader_interpreter.is_interpreter(m_program)) [[ likely ]]
 		{
-			return true;
+			if (pipeline_mode != 2) return true;
+			m_pipeline_reuse_checked++;
+			if (decode_pipeline() == m_pipeline_properties) return true;
+			if (m_pipeline_reuse_mismatches++ < 8)
+				rsx_log.error("Pipeline reuse check differs from a fresh RSX state decode");
+			// Diagnostic mismatch: use the complete path for this draw.
+			m_graphics_state |= rsx::pipeline_state::pipeline_config_dirty;
 		}
 
 		if (shadermode == shader_mode::interpreter_only)
@@ -1852,23 +2296,19 @@ bool VKGSRender::load_program()
 
 	if (m_graphics_state & rsx::pipeline_state::pipeline_config_dirty)
 	{
-		vk::pipeline_props properties = vk::decode_rsx_state(
-			m_ctx,
-			vertex_state,
-			m_rtts.m_bound_depth_stencil.second,
-			backend_config,
-			static_cast<u8>(m_draw_buffers.size()),
-			u8((m_current_renderpass_key >> 16) & 0xF),
-			m_device->get_depth_bounds_support(),
-			!!(current_fragment_program.ctrl & RSX_SHADER_CONTROL_PROGRAMMABLE_BLENDING)
-		);
-
-		properties.renderpass_key = m_current_renderpass_key;
+		auto properties = decode_pipeline();
 		if (m_program &&
 			!m_shader_interpreter.is_interpreter(m_program) &&
 			m_pipeline_properties == properties)
 		{
 			// Nothing changed
+			if (pipeline_mode && !shaders_invalidated)
+			{
+				// These properties have been checked in full. Future writes still set the normal dirty signals;
+				// keeping this bit set would decode the same state on every following complete-path draw.
+				m_graphics_state.clear(rsx::pipeline_state::pipeline_config_dirty);
+				m_pipeline_reuse_clears++;
+			}
 			return true;
 		}
 
@@ -1977,6 +2417,45 @@ bool VKGSRender::load_program()
 	return m_program != nullptr;
 }
 
+void VKGSRender::update_fragment_texture_params_buffer()
+{
+	const auto& gpu_limits = m_device->gpu().get_limits();
+
+	m_texture_parameters_dynamic_offset = m_fragment_texture_params_ring_info.static_alloc<256, 768>();
+	auto buf = m_fragment_texture_params_ring_info.map(m_texture_parameters_dynamic_offset, 768);
+
+	current_fragment_program.texture_params.write_to(buf, current_fp_metadata.referenced_textures_mask);
+	m_fragment_texture_params_ring_info.unmap();
+
+	m_fragment_texture_params_buffer_info = m_fragment_texture_params_ring_info.window<768>(m_texture_parameters_dynamic_offset, 768, gpu_limits.maxUniformBufferRange);
+	m_texture_parameters_dynamic_offset -= m_fragment_texture_params_buffer_info.offset;
+}
+
+void VKGSRender::update_transform_constants_buffer()
+{
+	const auto& gpu_limits = m_device->gpu().get_limits();
+
+	// Transform constants
+	usz mem_offset = 0;
+	auto alloc_storage = [&](usz size) -> std::pair<void*, usz>
+	{
+		mem_offset = m_transform_constants_allocator->alloc_bytes(size);
+		return std::make_pair(m_transform_constants_ring_info.map(mem_offset, size), size);
+	};
+
+	auto io_buf = rsx::io_buffer(alloc_storage);
+	upload_transform_constants(io_buf);
+
+	if (!io_buf.empty())
+	{
+		m_transform_constants_ring_info.unmap();
+		m_xform_constants_dynamic_offset = mem_offset;
+
+		m_vertex_constants_buffer_info = m_transform_constants_ring_info.window<16>(m_xform_constants_dynamic_offset, io_buf.size(), gpu_limits.maxUniformBufferRange);
+		m_xform_constants_dynamic_offset -= m_vertex_constants_buffer_info.offset;
+	}
+}
+
 void VKGSRender::load_program_env()
 {
 	if (!m_program)
@@ -2048,25 +2527,7 @@ void VKGSRender::load_program_env()
 	}
 	else if (update_transform_constants)
 	{
-		// Transform constants
-		usz mem_offset = 0;
-		auto alloc_storage = [&](usz size) -> std::pair<void*, usz>
-		{
-			mem_offset = m_transform_constants_allocator->alloc_bytes(size);
-			return std::make_pair(m_transform_constants_ring_info.map(mem_offset, size), size);
-		};
-
-		auto io_buf = rsx::io_buffer(alloc_storage);
-		upload_transform_constants(io_buf);
-
-		if (!io_buf.empty())
-		{
-			m_transform_constants_ring_info.unmap();
-			m_xform_constants_dynamic_offset = mem_offset;
-
-			m_vertex_constants_buffer_info = m_transform_constants_ring_info.window<16>(m_xform_constants_dynamic_offset, io_buf.size(), gpu_limits.maxUniformBufferRange);
-			m_xform_constants_dynamic_offset -= m_vertex_constants_buffer_info.offset;
-		}
+		update_transform_constants_buffer();
 	}
 
 	if (update_fragment_constants && !m_shader_interpreter.is_interpreter(m_program))
@@ -2101,14 +2562,7 @@ void VKGSRender::load_program_env()
 
 	if (update_fragment_texture_env)
 	{
-		m_texture_parameters_dynamic_offset = m_fragment_texture_params_ring_info.static_alloc<256, 768>();
-		auto buf = m_fragment_texture_params_ring_info.map(m_texture_parameters_dynamic_offset, 768);
-
-		current_fragment_program.texture_params.write_to(buf, current_fp_metadata.referenced_textures_mask);
-		m_fragment_texture_params_ring_info.unmap();
-
-		m_fragment_texture_params_buffer_info = m_fragment_texture_params_ring_info.window<768>(m_texture_parameters_dynamic_offset, 768, gpu_limits.maxUniformBufferRange);
-		m_texture_parameters_dynamic_offset -= m_fragment_texture_params_buffer_info.offset;
+		update_fragment_texture_params_buffer();
 	}
 
 	if (update_raster_env)
@@ -2382,7 +2836,7 @@ void VKGSRender::init_buffers(rsx::framebuffer_creation_context context, bool)
 	prepare_rtts(context);
 }
 
-void VKGSRender::close_and_submit_command_buffer(vk::fence* pFence, VkSemaphore wait_semaphore, VkSemaphore signal_semaphore, VkPipelineStageFlags pipeline_stage_flags)
+void VKGSRender::close_and_submit_command_buffer(vk::fence* pFence, VkSemaphore wait_semaphore, VkSemaphore signal_semaphore, VkPipelineStageFlags pipeline_stage_flags, const char* diagnostic_reason)
 {
 	ensure(!m_queue_status.test_and_set(flush_queue_state::flushing));
 
@@ -2449,6 +2903,9 @@ void VKGSRender::close_and_submit_command_buffer(vk::fence* pFence, VkSemaphore 
 		m_host_dma_ctrl->host_ctx()->on_label_release();
 	}
 
+	if (m_gpu_timestamp_diagnostics)
+		m_gpu_timestamp_diagnostics->end(*m_current_command_buffer, diagnostic_reason);
+
 	m_current_command_buffer->end();
 	m_current_command_buffer->tag();
 
@@ -2483,7 +2940,11 @@ void VKGSRender::close_and_submit_command_buffer(vk::fence* pFence, VkSemaphore 
 		primary_submit_info.queue_signal(signal_semaphore);
 	}
 
+	if (m_gpu_timestamp_diagnostics)
+		m_gpu_timestamp_diagnostics->submit_begin(*m_current_command_buffer);
 	m_current_command_buffer->submit(primary_submit_info, force_flush);
+	if (m_gpu_timestamp_diagnostics)
+		m_gpu_timestamp_diagnostics->submitted(*m_current_command_buffer, pFence != nullptr);
 
 	m_queue_status.clear(flush_queue_state::flushing);
 }
@@ -2601,7 +3062,7 @@ void VKGSRender::prepare_rtts(rsx::framebuffer_creation_context context)
 	// Before messing with memory properties, flush command queue if there are dma transfers queued up
 	if (m_current_command_buffer->flags & vk::command_buffer::cb_has_dma_transfer)
 	{
-		flush_command_queue();
+		flush_command_queue(false, false, "prepare_rtts_dma");
 	}
 
 	if (!m_rtts.superseded_surfaces.empty())
@@ -2744,7 +3205,7 @@ bool VKGSRender::scaled_image_from_memory(const rsx::blit_src_info& src, const r
 		{
 			// A dma transfer has been queued onto this cb
 			// This likely means that we're done with the tranfers to the target (writes_likely_completed=1)
-			flush_command_queue();
+			flush_command_queue(false, false, "scaled_image_dma");
 		}
 		return true;
 	}
@@ -2818,7 +3279,7 @@ void VKGSRender::get_occlusion_query_result(rsx::reports::occlusion_query_info* 
 		if (data.is_current(m_current_command_buffer))
 		{
 			std::lock_guard lock(m_flush_queue_mutex);
-			flush_command_queue();
+			flush_command_queue(false, false, "occlusion_query_result");
 
 			if (m_flush_requests.pending())
 			{

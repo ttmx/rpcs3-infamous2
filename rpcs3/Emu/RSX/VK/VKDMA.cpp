@@ -1,6 +1,14 @@
 #include "stdafx.h"
 #include "VKResourceManager.h"
 #include "VKDMA.h"
+#include "VKLiveCtl.hpp"
+#include "VKReadbackCopy.hpp"
+#include "VKReadbackOOPControl.hpp"
+#include "../Common/readback_chain_diagnostics.hpp"
+#include "VKHelpers.h"
+#include "VKUploadDiagnostics.hpp"
+#include "VKRTTLoadDiagnostics.hpp"
+#include "VKRTTBackgroundProbe.hpp"
 #include "vkutils/device.h"
 
 #include "Emu/Memory/vm.h"
@@ -9,6 +17,11 @@
 
 #include "util/asm.hpp"
 #include <unordered_map>
+#include <mutex>
+#include <memory>
+#include <cstdlib>
+#include <cstring>
+#include <atomic>
 
 namespace vk
 {
@@ -20,6 +33,16 @@ namespace vk
 
 	// Validation
 	atomic_t<u64> s_allocated_dma_pool_size{ 0 };
+
+	static bool compare_dma_enabled()
+	{
+		static const bool enabled = []
+		{
+			const char* value = std::getenv("RPCS3_EXPERIMENT_COMPARE_DMA");
+			return value && std::strcmp(value, "1") == 0;
+		}();
+		return enabled;
+	}
 
 	dma_block::~dma_block()
 	{
@@ -67,7 +90,8 @@ namespace vk
 
 		allocated_memory = std::make_unique<vk::buffer>(dev, size,
 			dev.get_memory_mapping().host_visible_coherent, VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-			VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, 0,
+			VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+				(readback_oop_enabled() ? VK_BUFFER_USAGE_STORAGE_BUFFER_BIT : 0), 0,
 			VMM_ALLOCATION_POOL_UNDEFINED);
 
 		// Initialize memory contents. This isn't something that happens often.
@@ -142,18 +166,63 @@ namespace vk
 		inheritance_info.block_offset = (addr - parent->base_address);
 	}
 
-	void dma_block::flush(const utils::address_range32& range)
+	void dma_block::flush(const utils::address_range32& range, const dma_source_observer* observer)
 	{
 		if (inheritance_info.parent)
 		{
 			// Parent may be a different type of block
-			inheritance_info.parent->flush(range);
+			inheritance_info.parent->flush(range, observer);
 			return;
 		}
 
+		rsx::readback_chain_trace::scope chain_copy("readback_dma_cpu_copy");
+		chain_copy.range(range.start,range.length());
+		if(chain_copy)
+		{
+		 const auto type=allocated_memory->memory->diagnostic_memory_type();
+		 const auto flags=type<VK_MAX_MEMORY_TYPES?g_render_device->gpu().get_memory_properties().memoryTypes[type].propertyFlags:0;
+		 chain_copy.image(allocated_memory.get());chain_copy.auxiliary(type,flags);
+		}
 		auto src = map_range(range);
+		if (observer && observer->observe)
+			observer->observe(observer->context, src, allocated_memory.get(), range.start - base_address, range.start, range.length());
 		auto dst = vm::get_super_ptr(range.start);
-		std::memcpy(dst, src, range.length());
+		bool copied = false;
+		if (readback_copy::enabled())
+		{
+			static std::atomic<bool> disabled{false};
+			const auto type = allocated_memory->memory->diagnostic_memory_type();
+			const auto flags = type < VK_MAX_MEMORY_TYPES ?
+				g_render_device->gpu().get_memory_properties().memoryTypes[type].propertyFlags : 0;
+			if (!disabled.load(std::memory_order_relaxed))
+				copied = readback_copy::copy(dst, src, range.length(), flags, utils::has_avx512());
+			if (copied)
+			{
+				static std::atomic<bool> announced{false};
+				if (!announced.load(std::memory_order_relaxed) && !announced.exchange(true, std::memory_order_relaxed))
+					rsx_log.notice("Readback streaming copy activated: address=0x%x bytes=%u memory_type=%u flags=0x%x", range.start, range.length(), type, flags);
+				if (readback_copy::validation_enabled())
+				{
+					// Diagnostic only: sample real completed staging bytes under the
+					// original cache/DMA locks before the original VM unprotect.
+					static std::atomic<u32> checks{0};
+					const u32 check = checks.fetch_add(1, std::memory_order_relaxed);
+					if (check < 32)
+					{
+						if (std::memcmp(dst, src, range.length()) != 0)
+						{
+							disabled.store(true, std::memory_order_relaxed);
+							copied = false;
+							rsx_log.error("Readback streaming validation mismatch: check=%u address=0x%x bytes=%u; reverting to stock memcpy", check + 1, range.start, range.length());
+						}
+						else
+							rsx_log.notice("Readback streaming validation matched real bytes: check=%u address=0x%x bytes=%u", check + 1, range.start, range.length());
+					}
+				}
+			}
+		}
+		if (!copied)
+			std::memcpy(dst, src, range.length());
 
 		// NOTE: Do not unmap. This can be extremely slow on some platforms.
 	}
@@ -169,7 +238,108 @@ namespace vk
 
 		auto src = vm::get_super_ptr(range.start);
 		auto dst = map_range(range);
-		std::memcpy(dst, src, range.length());
+		if (upload_diagnostics::active())
+		{
+			const auto type = allocated_memory->memory->diagnostic_memory_type();
+			const auto flags = type < VK_MAX_MEMORY_TYPES ? g_render_device->gpu().get_memory_properties().memoryTypes[type].propertyFlags : 0;
+			std::ostringstream out;
+			out << "dma_load," << upload_diagnostics::now_ns() << ',' << vk::get_current_frame_id() << ",0,0," << range.start
+				<< ',' << range.length() << ",0,0,0,," << allocated_memory->uid() << ',' << type << ',' << flags
+				<< ",0,0,0," << range.length() << ",0,0,0,0,0,0,0\n";
+			upload_diagnostics::writer().write(out.str(), 1);
+		}
+
+		if (compare_dma_enabled() && !m_gpu_written && range.length() >= 65536)
+		{
+			// Avoid reading an uncached host upload allocation. All eligible allocator
+			// types must be CPU-cached; the stock upload heap can fall back to uncached.
+			const auto& dev = *g_render_device;
+			const auto& properties = dev.gpu().get_memory_properties();
+			bool cached = true;
+			for (const auto type : dev.get_memory_mapping().host_visible_coherent)
+			{
+				constexpr VkMemoryPropertyFlags required = VK_MEMORY_PROPERTY_HOST_CACHED_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+				cached &= (properties.memoryTypes[type].propertyFlags & required) == required;
+			}
+			if (cached)
+			{
+				// No hashes or dirty-tag assumptions: elide writes only after exact equality.
+				const bool unchanged = std::memcmp(dst, src, range.length()) == 0;
+				struct compare_stats
+				{
+					u64 calls = 0;
+					u64 unchanged_calls = 0;
+					u64 checked_bytes = 0;
+					u64 elided_bytes = 0;
+				};
+				thread_local compare_stats stats;
+				++stats.calls;
+				stats.checked_bytes += range.length();
+				if (unchanged)
+				{
+					++stats.unchanged_calls;
+					stats.elided_bytes += range.length();
+				}
+				if (stats.calls == 1 || !(stats.calls % 128))
+				{
+					rsx_log.notice("DMA comparison: %llu/%llu unchanged loads, %llu/%llu bytes elided",
+						stats.unchanged_calls, stats.calls, stats.elided_bytes, stats.checked_bytes);
+				}
+				if (unchanged)
+				{
+					return;
+				}
+			}
+		}
+		if (const u64 stream_min = live_ctl::get(1); stream_min && range.length() >= stream_min && utils::has_avx512())
+		{
+			// Large loads overwrite the whole destination; skip the read-for-ownership and keep the cache clean.
+			if (live_ctl::get(3) & 4)
+			{
+				constexpr u32 chunk = 0x8000;
+				const auto* from = static_cast<const u8*>(static_cast<const void*>(src));
+				auto* to = static_cast<u8*>(dst);
+				live_ctl::prefetch_range(from, range.length(), chunk);
+				for (u32 offset = 0; offset < range.length(); offset += chunk)
+				{
+					const u32 remaining = range.length() - offset;
+					if (remaining > chunk)
+					{
+						live_ctl::prefetch_range(from + offset + chunk, remaining - chunk, chunk);
+					}
+					readback_copy::stream(to + offset, from + offset, std::min(remaining, chunk));
+				}
+			}
+			else
+			{
+				readback_copy::stream(dst, src, range.length());
+			}
+		}
+		else
+		{
+			std::memcpy(dst, src, range.length());
+		}
+		if (rtt_background_probe::enabled())
+		{
+			// Metadata comes from the existing armed RTT scope. No extra map/VM read.
+			const auto* context = rtt_load_diagnostics::current_context;
+			if (context)
+			{
+				const auto& v = context->values;
+				using namespace rtt_load_diagnostics;
+				if (v[blit_active] && v[discard_allowed] && !v[integrity_reload] &&
+					!v[tiled] && !v[swizzled] && v[spp] == 1 && v[scale] == 100 &&
+					!v[old_contents] && v[address] == range.start && v[length] == range.length())
+				{
+					const auto type = allocated_memory->memory->diagnostic_memory_type();
+					const auto flags = type < VK_MAX_MEMORY_TYPES ? g_render_device->gpu().get_memory_properties().memoryTypes[type].propertyFlags : 0;
+					const rtt_background_probe::key identity{ v[image_uid], v[address], v[width], v[height], v[pitch], v[gcm_format], v[host_format], v[aspect], v[x1], v[y1], v[x2], v[y2] };
+					// Existing DMA reader lock/map remain held. GPU writer quiescence is
+					// not proven; samples establish observed byte stability only.
+					rtt_background_probe::observe(identity, dst, context->frame, flags);
+				}
+			}
+		}
 
 		// NOTE: Do not unmap. This can be extremely slow on some platforms.
 	}
@@ -274,7 +444,7 @@ namespace vk
 		// NOP
 	}
 
-	void dma_block_EXT::flush(const utils::address_range32&)
+	void dma_block_EXT::flush(const utils::address_range32&, const dma_source_observer*)
 	{
 		// NOP
 	}
@@ -443,7 +613,7 @@ namespace vk
 	}
 
 	template<bool load>
-	void sync_dma_impl(u32 local_address, u32 length)
+	void sync_dma_impl(u32 local_address, u32 length, const dma_source_observer* observer = nullptr)
 	{
 		reader_lock lock(g_dma_mutex);
 
@@ -462,7 +632,7 @@ namespace vk
 				}
 				else
 				{
-					found->second->flush(range);
+					found->second->flush(range, observer);
 				}
 
 				if (sync_end < limit) [[unlikely]]
@@ -487,14 +657,163 @@ namespace vk
 		}
 	}
 
+	void dma_block::mark_gpu_written()
+	{
+		head()->m_gpu_written = true;
+	}
+
+	void mark_dma_gpu_written(u32 local_address, u32 length)
+	{
+		if (!compare_dma_enabled())
+		{
+			return;
+		}
+		std::lock_guard lock(g_dma_mutex);
+		while (length)
+		{
+			auto found = g_dma_pool.find(local_address & s_dma_block_mask);
+			ensure(found != g_dma_pool.end());
+			auto block = found->second->head();
+			block->mark_gpu_written();
+			const u32 step = std::min(length, block->end() - local_address + 1u);
+			local_address += step;
+			length -= step;
+		}
+	}
+
+	// Diagnostic only (RPCS3_VK_ROUNDTRIP_DIAG=1): for full 1280x720x4 buffers, remember the bytes the GPU
+	// read back into guest memory and report how much of them the guest changed before they are uploaded again.
+	namespace roundtrip_diag
+	{
+		static bool enabled()
+		{
+			static const bool value = []
+			{
+				const char* option = std::getenv("RPCS3_VK_ROUNDTRIP_DIAG");
+				return option && option[0] == '1' && !option[1];
+			}();
+			return value;
+		}
+
+		constexpr u32 tracked_length = 1280 * 720 * 4;
+		static std::mutex s_mutex;
+		static std::unordered_map<u32, std::unique_ptr<u8[]>> s_shadow;
+		static std::unordered_map<u32, u64> s_loads;
+		static std::unordered_map<u32, u64> s_flushes;
+
+		static void on_flush(u32 address, u32 length)
+		{
+			if (length != tracked_length) return;
+			std::lock_guard lock(s_mutex);
+			auto& shadow = s_shadow[address];
+			if (!shadow) shadow = std::make_unique<u8[]>(tracked_length);
+			std::memcpy(shadow.get(), vm::get_super_ptr<u8>(address), tracked_length);
+			s_flushes[address]++;
+		}
+
+		static void on_load(u32 address, u32 length)
+		{
+			if (length != tracked_length) return;
+			std::lock_guard lock(s_mutex);
+			const auto found = s_shadow.find(address);
+			if (found == s_shadow.end()) return;
+			if (s_loads[address] == 240)
+			{
+				if (const char* dir = std::getenv("RPCS3_VK_ROUNDTRIP_DUMP_DIR"))
+				{
+					for (int pass = 0; pass < 2; pass++)
+					{
+						const std::string path = fmt::format("%s/rt-%08x-%s.raw", dir, address, pass ? "after" : "before");
+						if (FILE* f = std::fopen(path.c_str(), "wb"))
+						{
+							std::fwrite(pass ? vm::get_super_ptr<u8>(address) : found->second.get(), 1, tracked_length, f);
+							std::fclose(f);
+						}
+					}
+				}
+			}
+
+			if (s_loads[address]++ % 60) return;
+
+			const u8* now = vm::get_super_ptr<u8>(address);
+			const u8* old = found->second.get();
+			u32 rows = 0, first_row = 720, last_row = 0, min_col = 1280, max_col = 0;
+			for (u32 y = 0; y < 720; y++)
+			{
+				const u8* a = now + y * 5120;
+				const u8* b = old + y * 5120;
+				if (!std::memcmp(a, b, 5120)) continue;
+				rows++;
+				first_row = std::min(first_row, y);
+				last_row = y;
+				for (u32 x = 0; x < 1280; x++)
+				{
+					if (std::memcmp(a + x * 4, b + x * 4, 4))
+					{
+						min_col = std::min(min_col, x);
+						break;
+					}
+				}
+				for (u32 x = 1280; x-- > 0;)
+				{
+					if (std::memcmp(a + x * 4, b + x * 4, 4))
+					{
+						max_col = std::max(max_col, x);
+						break;
+					}
+				}
+			}
+			rsx_log.notice("Roundtrip diag 0x%x: %u/720 rows changed since readback (rows %u..%u, columns %u..%u), loads=%u flushes=%u",
+				address, rows, first_row, last_row, min_col, max_col, s_loads[address], s_flushes[address]);
+		}
+	}
+
 	void load_dma(u32 local_address, u32 length)
 	{
+		if (roundtrip_diag::enabled())
+		{
+			// Also dump any other large per-frame upload once (its 240th load)
+			if (length >= 0x40000 && length != roundtrip_diag::tracked_length)
+			{
+				static std::mutex mutex;
+				static std::unordered_map<u64, u32> seen;
+				std::lock_guard lock(mutex);
+				if (++seen[(u64{local_address} << 32) | length] == 240)
+				{
+					if (const char* dir = std::getenv("RPCS3_VK_ROUNDTRIP_DUMP_DIR"))
+					{
+						if (local_address == 0xcf800000)
+						{
+							// SSAO intermediates and both G-buffers as they are when the AO image is uploaded
+							const std::pair<u32, u32> extra[]{{0x37b08000, 0x11a480}, {0x37400b80, 0x384000}, {0x37784b80, 0x384000}};
+							for (const auto& [ea, size] : extra)
+							{
+								if (FILE* g = std::fopen(fmt::format("%s/mem-%08x-%u.raw", dir, ea, size).c_str(), "wb"))
+								{
+									std::fwrite(vm::get_super_ptr<u8>(ea), 1, size, g);
+									std::fclose(g);
+								}
+							}
+						}
+						const std::string path = fmt::format("%s/load-%08x-%u.raw", dir, local_address, length);
+						if (FILE* f = std::fopen(path.c_str(), "wb"))
+						{
+							std::fwrite(vm::get_super_ptr<u8>(local_address), 1, length, f);
+							std::fclose(f);
+						}
+					}
+				}
+			}
+		}
+
+		if (roundtrip_diag::enabled()) roundtrip_diag::on_load(local_address, length);
 		sync_dma_impl<true>(local_address, length);
 	}
 
-	void flush_dma(u32 local_address, u32 length)
+	void flush_dma(u32 local_address, u32 length, const dma_source_observer* observer)
 	{
-		sync_dma_impl<false>(local_address, length);
+		sync_dma_impl<false>(local_address, length, observer);
+		if (roundtrip_diag::enabled()) roundtrip_diag::on_flush(local_address, length);
 	}
 
 	void clear_dma_resources()

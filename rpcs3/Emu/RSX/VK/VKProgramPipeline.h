@@ -160,6 +160,33 @@ namespace vk
 			std::vector<bool> m_descriptors_dirty;
 			bool m_any_descriptors_dirty = false;
 
+			// Sets already written with a given content of all slots (live control 12)
+			struct reuse_entry_t
+			{
+				u64 hash = 0;
+				u64 handle_classes = 0; // descriptor_reuse::handle_bit of every view and sampler in the set
+				VkDescriptorSet set = VK_NULL_HANDLE;
+				std::vector<u64> key;
+			};
+
+			static constexpr u32 reuse_entry_count = 256;
+			std::unique_ptr<reuse_entry_t[]> m_reuse_entries;
+			std::vector<u64> m_reuse_key;
+			u64 m_reuse_retire_tag = 0;
+			u32 m_reuse_commits = 0;
+
+			// The reused sets come from a pool of their own, which is only replaced as a whole. It starts small and
+			// doubles each time it is used up, so only tables with many different contents get a large one.
+			static constexpr u32 reuse_pool_min_sets = 128, reuse_pool_max_sets = 2048;
+			u32 m_reuse_pool_sets = reuse_pool_min_sets;
+			VkDescriptorPool m_reuse_pool = VK_NULL_HANDLE;
+			u32 m_reuse_pool_used = 0;
+			rsx::simple_array<VkDescriptorSet> m_reuse_free_sets;
+
+			bool make_reuse_key(u64& hash, u64& handle_classes);
+			VkDescriptorSet allocate_reusable_set();
+			void retire_reuse_pool();
+
 			void init(VkDevice dev);
 			void destroy();
 

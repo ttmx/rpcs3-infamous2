@@ -4,9 +4,12 @@
 #include "image.h"
 #include "image_helpers.h"
 #include "sampler.h"
+#include "descriptor_reuse.h"
 
 #include "../VKResourceManager.h"
 #include <memory>
+#include <cstdlib>
+#include <cstring>
 
 namespace vk
 {
@@ -386,6 +389,8 @@ namespace vk
 
 	image_view::~image_view()
 	{
+		descriptor_reuse::retire_handle(reinterpret_cast<u64>(value));
+		descriptor_reuse::retired_views++;
 		vkDestroyImageView(m_device, value, nullptr);
 	}
 
@@ -469,12 +474,23 @@ namespace vk
 		result->value = this->value;
 		result->memory = std::move(this->memory);
 		result->views = std::move(this->views);
+		this->m_last_view = nullptr;
 		this->value = VK_NULL_HANDLE;
 		return result;
 	}
 
 	image_view* viewable_image::get_view(const rsx::texture_channel_remap_t& remap, VkImageAspectFlags mask)
 	{
+		static const bool use_last_view_cache = []
+		{
+			const char* value = std::getenv("RPCS3_EXPERIMENT_LAST_IMAGE_VIEW");
+			const bool enabled = value && std::strcmp(value, "1") == 0;
+			if (enabled)
+			{
+				rsx_log.notice("Last image view cache experiment enabled");
+			}
+			return enabled;
+		}();
 		u32 remap_encoding = remap.encoded;
 		if (remap_encoding == VK_REMAP_IDENTITY)
 		{
@@ -488,10 +504,21 @@ namespace vk
 		}
 
 		const u64 storage_key = remap_encoding | (static_cast<u64>(mask) << 32);
+		// Canonicalize the existing key first: native_component_map can be assigned directly.
+		if (use_last_view_cache && m_last_view && m_last_view_key == storage_key)
+		{
+			ensure(m_last_view->info.subresourceRange.aspectMask & mask);
+			return m_last_view;
+		}
 		auto found = views.find(storage_key);
 		if (found != views.end())
 		{
 			ensure(found->second->info.subresourceRange.aspectMask & mask);
+			if (use_last_view_cache)
+			{
+				m_last_view_key = storage_key;
+				m_last_view = found->second.get();
+			}
 			return found->second.get();
 		}
 
@@ -519,7 +546,26 @@ namespace vk
 		auto view = std::make_unique<vk::image_view>(*g_render_device, this, format(), VK_IMAGE_VIEW_TYPE_MAX_ENUM, real_mapping, range);
 		auto result = view.get();
 		views.emplace(storage_key, std::move(view));
+		if (use_last_view_cache)
+		{
+			m_last_view_key = storage_key;
+			m_last_view = result;
+		}
 		return result;
+	}
+
+	image_view* viewable_image::find_existing_view(const rsx::texture_channel_remap_t& remap, VkImageAspectFlags mask) const
+	{
+		u32 encoding = remap.encoded;
+		if (encoding == VK_REMAP_IDENTITY &&
+			native_component_map.a == VK_COMPONENT_SWIZZLE_A &&
+			native_component_map.r == VK_COMPONENT_SWIZZLE_R &&
+			native_component_map.g == VK_COMPONENT_SWIZZLE_G &&
+			native_component_map.b == VK_COMPONENT_SWIZZLE_B)
+			encoding = RSX_TEXTURE_REMAP_IDENTITY;
+		const u64 key = encoding | (static_cast<u64>(mask) << 32);
+		const auto found = views.find(key);
+		return found == views.end() ? nullptr : found->second.get();
 	}
 
 	void viewable_image::set_native_component_layout(VkComponentMapping new_layout)
@@ -531,6 +577,7 @@ namespace vk
 		{
 			native_component_map = new_layout;
 
+			m_last_view = nullptr;
 			// Safely discard existing views
 			auto gc = vk::get_resource_manager();
 			for (auto& p : views)

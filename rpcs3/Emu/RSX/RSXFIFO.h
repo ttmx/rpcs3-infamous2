@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstring>
+
 #include "util/types.hpp"
 #include "Emu/RSX/gcm_enums.h"
 
@@ -157,6 +159,26 @@ namespace rsx
 			void invalidate_cache() { m_cache_size = 0; }
 
 			u32 get_pos() const { return m_fifo_pos; }
+
+			// For a consumer that parsed complete packets itself (through fetch_u32): position on the last word it used
+			void fast_forward(u32 last_consumed_word) { m_fifo_pos = last_consumed_word; }
+
+			// fetch_u32 with the cached case inline
+			bool peek(u32 addr, u32& value)
+			{
+				if (addr - m_cache_addr < m_cache_size) [[likely]]
+				{
+					// FIFO words are big-endian
+					u32 raw;
+					std::memcpy(&raw, reinterpret_cast<const u8*>(m_cache) + (addr - m_cache_addr), 4);
+					value = __builtin_bswap32(raw);
+					return true;
+				}
+
+				const auto [ok, fetched] = fetch_u32(addr);
+				value = fetched;
+				return ok;
+			}
 			u32 last_cmd() const { return m_cmd; }
 			void sync_get() const;
 			std::span<const u32> get_current_arg_ptr(u32 length_in_words) const;

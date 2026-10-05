@@ -1,4 +1,8 @@
 #pragma once
+#include "VKVertexBatchReuse.hpp"
+#include <unordered_map>
+#include "NativeLateCounterValues.hpp"
+#include "NativeTextureCounterValues.hpp"
 
 #include "upscalers/upscaling.h"
 
@@ -18,11 +22,14 @@
 #include "VKFramebuffer.h"
 #include "VKShaderInterpreter.h"
 #include "VKQueryPool.h"
+#include "VKGeometryCache.hpp"
+#include "VKMaterialBindings.hpp"
 
 #include "Emu/RSX/GSRender.h"
 #include "Emu/RSX/Host/RSXDMAWriter.h"
 #include <functional>
 #include <initializer_list>
+#include <mutex>
 
 using namespace vk::vmm_allocation_pool_; // clang workaround.
 using namespace vk::upscaling_flags_;     // ditto
@@ -33,6 +40,7 @@ using fs_binding_table_t = decltype(VKFragmentProgram::binding_table);
 namespace vk
 {
 	using host_data_t = rsx::host_gpu_context_t;
+	class timestamp_diagnostics;
 }
 
 class VKGSRender : public GSRender, public ::rsx::reports::ZCULL_control
@@ -77,6 +85,8 @@ private:
 	std::unique_ptr<vk::sampler> m_stencil_mirror_sampler;
 	std::array<vk::sampler*, rsx::limits::fragment_textures_count> fs_sampler_handles{};
 	std::array<vk::sampler*, rsx::limits::vertex_textures_count> vs_sampler_handles{};
+	vk::material_bindings m_material_bindings;
+	u64 m_pipeline_reuse_checked = 0, m_pipeline_reuse_mismatches = 0, m_pipeline_reuse_clears = 0;
 
 	std::unique_ptr<vk::buffer_view> m_persistent_attribute_storage;
 	std::unique_ptr<vk::buffer_view> m_volatile_attribute_storage;
@@ -99,6 +109,12 @@ private:
 	vk::render_device *m_device;
 
 	//Vulkan internals
+	std::unique_ptr<vk::timestamp_diagnostics> m_gpu_timestamp_diagnostics;
+	bool m_draw_attribution_enabled = false;
+	void diagnostic_command_begin();
+	void diagnostic_frame_end();
+	u32 diagnostic_draw_begin(u32 vertices, u32 subdraw, bool indexed, u32 primitive, u32 passes);
+	void diagnostic_draw_end(u32 token);
 	std::unique_ptr<vk::query_pool_manager> m_occlusion_query_manager;
 	bool m_occlusion_query_active = false;
 	rsx::reports::occlusion_query_info *m_active_query_info = nullptr;
@@ -179,10 +195,199 @@ private:
 
 	std::vector<u8> m_draw_buffers;
 
+	// Optional foreign-fault admission. Never acquired by the RSX or DMA offloader.
+	std::mutex m_foreign_readback_admission_mutex;
 	shared_mutex m_flush_queue_mutex;
 	vk::flush_request_task m_flush_requests;
 
 	ullong m_last_cond_render_eval_hint = 0;
+
+	// Default-off bounded submission of a completed late draw prefix. RSX-thread only.
+	bool m_draw_prefix_submit_enabled = false;
+	bool m_draw_prefix_armed = false;
+	bool m_draw_prefix_submitted = false;
+	u64 m_draw_prefix_begin_us = 0;
+	u32 m_draw_prefix_draws = 0;
+
+	// Default-off periodic submission of completed draws so the GPU can start on a frame
+	// while it is still being recorded. RSX-thread only. 0 = disabled.
+	u64 m_periodic_submit_us = 0;
+	u64 m_last_submit_us = 0;
+	u64 m_periodic_submit_count = 0;
+	u32 m_periodic_submit_draws = 0;
+
+	// Same-frame vertex upload reuse for multi-block layouts. Purged with the stock vertex cache.
+	struct multiblock_vertex_cache_t
+	{
+		static constexpr u32 slot_count = 8192;
+		static constexpr u32 max_entries = 6144;
+
+		struct slot_t
+		{
+			u64 h1 = 0;
+			u64 h2 = 0;
+			u32 generation = 0;
+			u32 offset = 0;
+		};
+
+		std::unique_ptr<slot_t[]> table;
+		u32 generation = 1;
+		u32 entries = 0;
+
+		// Per-frame hit statistics. Fingerprinting every draw only pays when enough draws repeat.
+		u32 lookups = 0;
+		u32 hits = 0;
+		u32 disabled_frames = 0;
+
+		// Returns the slot holding the fingerprint (found = true) or the free slot to fill, or null when full.
+		slot_t* probe(u64 h1, u64 h2, bool& found)
+		{
+			found = false;
+			if (!table) table = std::make_unique<slot_t[]>(slot_count);
+
+			for (u32 index = static_cast<u32>(h1) & (slot_count - 1), checked = 0; checked < 64; checked++, index = (index + 1) & (slot_count - 1))
+			{
+				auto& slot = table[index];
+				if (slot.generation != generation)
+				{
+					return entries < max_entries ? &slot : nullptr;
+				}
+
+				if (slot.h1 == h1 && slot.h2 == h2)
+				{
+					found = true;
+					return &slot;
+				}
+			}
+
+			return nullptr;
+		}
+
+		void clear()
+		{
+			generation++;
+			entries = 0;
+		}
+
+		// Experiment only (live control 2 == 3): keep entries across frames with no change detection,
+		// to measure the upper bound of a cross-frame cache. Animated geometry will be stale.
+		u64 last_offset = 0;
+
+		// Called once per frame
+		void end_frame(bool keep_entries = false)
+		{
+			if (keep_entries)
+			{
+				lookups = hits = 0;
+				disabled_frames = 0;
+				if (entries >= max_entries) clear();
+				return;
+			}
+
+			if (disabled_frames)
+			{
+				disabled_frames--;
+			}
+			else if (lookups >= 256 && hits * 2 < lookups)
+			{
+				// Fewer than half of the draws repeated: skip the cache for a while, then sample again
+				disabled_frames = 120;
+			}
+
+			lookups = hits = 0;
+
+			if (entries)
+			{
+				clear();
+			}
+		}
+	} m_multiblock_vertex_cache;
+
+	// Static vertex/index data kept across frames (live control 8)
+	vk::geometry_cache m_geometry_cache;
+
+	// Repeat draws consumed straight from the FIFO (live control 9)
+	struct fast_draw_t
+	{
+		bool in_batch = false;
+
+		// Statistics since the last report
+		u64 draws = 0;
+		u64 batches = 0;
+		u64 fallbacks = 0;
+		u64 texture_rebinds = 0;
+		u64 texture_program_changes = 0;
+		u64 texture_checks = 0;
+		u64 texture_check_mismatches = 0;
+		u64 depth_bias_updates = 0;
+		u64 semaphores = 0;
+		u64 flow_commands = 0;
+		u64 not_armed[16]{};
+		u64 stops[12]{};
+		u32 report_frame = 0;
+		mutable u32 blocking_state_bits = 0;
+	} m_fast_draw;
+
+	// Diagnostic (live control 9 == 3): state before a draw that the fast path would have taken
+	struct fast_draw_verify_t
+	{
+		bool previous_draw_completed = false;
+		bool candidate = false;
+		const void* program = nullptr;
+		const void* command_buffer = nullptr;
+		const void* framebuffer = nullptr;
+		VkRenderPass render_pass = VK_NULL_HANDLE;
+		vk::pipeline_props pipeline;
+		u64 offsets[5]{};
+		VkBuffer buffers[6]{};
+		const void* views[16]{};
+		u32 state = 0;
+		u64 checked = 0;
+		u64 mismatches[8]{};
+	} m_fast_draw_verify;
+
+	void fast_draw_verify_begin();
+	void fast_draw_verify_end();
+
+	// Diagnostic: which method ended a run of fast draws (per register)
+	std::unique_ptr<u32[]> m_fast_draw_stop_methods;
+
+	u32 fast_draw_blocker(u32 handled_state = 0) const;
+	u32 fast_draw_run_blocker() const;
+	bool fast_draw_textures_plain() const;
+	bool fast_draw_rebind_textures();
+	void fast_draw_batch();
+	void update_transform_constants_buffer();
+	void update_fragment_texture_params_buffer();
+	void set_depth_bias_state();
+
+	// Live control 9: 2 = on, 4 = on with the program of every texture change checked against a full lookup,
+	// 5 = on without texture and polygon offset changes inside a run (for comparisons)
+	static bool fast_draw_enabled() { const auto mode = vk::live_ctl::get(9); return mode == 2 || mode == 4 || mode == 5 || mode == 6; }
+	bool m_static_vertices_bound = false;
+	bool m_native_late_counters_armed = false;
+	u64 m_native_late_counter_generation = 0;
+	u64 m_native_late_counter_begin_ns = 0;
+	native_late_counters::values m_native_late_counter_initial{};
+	void diagnostic_begin_native_late_phase();
+	void diagnostic_finish_native_late_phase();
+	u64 m_native_texture_generation = 0;
+	native_texture_counters::values m_native_texture_counters{};
+	native_texture_counters::values m_native_texture_initial{};
+	std::array<std::array<u32, 18>, 16> m_native_texture_image_inputs{};
+	std::array<bool, 16> m_native_texture_image_inputs_valid{};
+	native_texture_counters::values* diagnostic_texture_values()
+	{
+		if (!native_texture_counters::enabled() || !rsx::profiling_timer::native_phase_diagnostics_enabled())
+			return nullptr;
+		if (m_native_texture_generation != m_native_stats_generation)
+		{
+			m_native_texture_generation = m_native_stats_generation;
+			m_native_texture_counters = {};
+		}
+		return &m_native_texture_counters;
+	}
+	void on_frame_end(u32 buffer, bool forced = false) override;
 
 	// Offloader thread deadlock recovery
 	rsx::atomic_bitmask_t<flush_queue_state> m_queue_status;
@@ -220,10 +425,13 @@ private:
 		vk::fence* fence = nullptr,
 		VkSemaphore wait_semaphore = VK_NULL_HANDLE,
 		VkSemaphore signal_semaphore = VK_NULL_HANDLE,
-		VkPipelineStageFlags pipeline_stage_flags = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+		VkPipelineStageFlags pipeline_stage_flags = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+		const char* diagnostic_reason = "direct_unspecified");
 
-	void flush_command_queue(bool hard_sync = false, bool do_not_switch = false);
+	void flush_command_queue(bool hard_sync = false, bool do_not_switch = false, const char* diagnostic_reason = "flush_unspecified");
 	void queue_swap_request();
+	void maybe_submit_draw_prefix();
+	void maybe_periodic_submit();
 	void frame_context_cleanup(vk::frame_context_t *ctx);
 	void advance_queued_frames();
 	void present(vk::frame_context_t *ctx);
@@ -284,6 +492,8 @@ public:
 	// Host sync object
 	std::pair<volatile vk::host_data_t*, VkBuffer> map_host_object_data() const;
 	void on_guest_texture_read(const vk::command_buffer& cmd);
+	void diagnostic_readback_begin(const vk::command_buffer& cmd, u32 address, u32 length,
+		u32 width, u32 height, u32 pitch, u64 cookie, const vk::image* image, bool armed);
 
 	// GRAPH backend
 	void patch_transform_constants(rsx::context* ctx, u32 index, u32 count) override;

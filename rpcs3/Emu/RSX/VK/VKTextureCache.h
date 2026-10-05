@@ -4,6 +4,8 @@
 #include "VKRenderTargets.h"
 #include "VKResourceManager.h"
 #include "VKRenderPass.h"
+#include "VKReadbackPhaseDiagnostics.hpp"
+#include "VKFusedReadbackShadow.hpp"
 #include "vkutils/image_helpers.h"
 
 #include "../Common/texture_cache.h"
@@ -40,6 +42,9 @@ namespace vk
 
 		// DMA relevant data
 		std::unique_ptr<vk::event> dma_fence;
+		std::unique_ptr<vk::readback_phase_sample> m_readback_phase;
+		std::unique_ptr<vk::readback_oop_shadow> m_readback_shadow;
+		u64 m_chain_transfer_cookie = 0;
 		vk::render_device* m_device = nullptr;
 		vk::viewable_image* vram_texture = nullptr;
 
@@ -122,6 +127,8 @@ namespace vk
 
 		void release_dma_resources()
 		{
+			if (m_readback_phase) vk::get_resource_manager()->dispose(m_readback_phase);
+			if (m_readback_shadow) vk::get_resource_manager()->dispose(m_readback_shadow);
 			if (dma_fence)
 			{
 				auto gc = vk::get_resource_manager();
@@ -137,6 +144,8 @@ namespace vk
 			ensure(!flushed);
 			ensure(dma_fence);
 			vk::get_resource_manager()->dispose(dma_fence);
+			if (m_readback_phase) vk::get_resource_manager()->dispose(m_readback_phase);
+			if (m_readback_shadow) vk::get_resource_manager()->dispose(m_readback_shadow);
 		}
 
 		void destroy()
@@ -178,6 +187,12 @@ namespace vk
 		vk::viewable_image* get_raw_texture()
 		{
 			return managed_texture.get();
+		}
+
+		// The image this section reads back from, managed or not
+		vk::image* get_readback_source()
+		{
+			return vram_texture;
 		}
 
 		std::unique_ptr<vk::viewable_image>& get_texture()
@@ -296,12 +311,56 @@ namespace vk
 		/**
 		 * Flush
 		 */
+		vk::image_view* get_existing_readback_window_view(const rsx::texture_channel_remap_t& remap) const
+		{
+			// Derived render targets can reinterpret remaps in virtual get_view().
+			if (!vram_texture || dynamic_cast<const vk::render_target*>(vram_texture))
+				return nullptr;
+			return vram_texture->find_existing_view(remap);
+		}
+
+		rsx::frozen_resource_identity readback_window_resource_identity() const
+		{
+			if(!vram_texture || vram_texture->width()!=width || vram_texture->height()!=height)return {};
+			// Fail closed unless the actual readback source is exactly vram_texture.
+			// No resolve or typeless helper image can be selected in this domain.
+			if(context==rsx::texture_upload_context::framebuffer_storage)
+			{
+				const auto* surface=vk::as_rtt(vram_texture);
+				if(surface->samples()!=1||surface->samples_x!=1||surface->samples_y!=1)return {};
+			}
+			return {vram_texture,vram_texture->memory.get(),rsx::frozen_handle_key(vram_texture->value)};
+		}
+
+		bool can_wait_for_gpu_readback() const
+		{
+			return synchronized && !flushed && dma_fence != nullptr;
+		}
+
+		void wait_for_gpu_readback()
+		{
+			AUDIT(synchronized);
+			rsx::cache_wait_trace::probe wait_trace("readback_event", true, get_confirmed_range().start, get_confirmed_range().length());
+			rsx::readback_chain_trace::scope chain_event("readback_event_wait");
+			chain_event.event(m_chain_transfer_cookie,dma_fence.get());
+			chain_event.range(get_confirmed_range().start,get_confirmed_range().length());
+			vk::wait_for_event(dma_fence.get(), GENERAL_WAIT_TIMEOUT);
+			if (m_readback_phase) m_readback_phase->collect_after_original_wait(dma_fence.get());
+		}
+
 		void imp_flush() override
 		{
 			AUDIT(synchronized);
 
 			// Synchronize, reset dma_fence after waiting
-			vk::wait_for_event(dma_fence.get(), GENERAL_WAIT_TIMEOUT);
+			{
+				rsx::cache_wait_trace::probe wait_trace("readback_event", true, get_confirmed_range().start, get_confirmed_range().length());
+			rsx::readback_chain_trace::scope chain_event("readback_event_wait");
+			chain_event.event(m_chain_transfer_cookie,dma_fence.get());
+			chain_event.range(get_confirmed_range().start,get_confirmed_range().length());
+				vk::wait_for_event(dma_fence.get(), GENERAL_WAIT_TIMEOUT);
+			if (m_readback_phase) m_readback_phase->collect_after_original_wait(dma_fence.get());
+			}
 
 			// Calculate smallest range to flush - for framebuffers, the raster region is enough
 			const auto range = (context == rsx::texture_upload_context::framebuffer_storage) ? get_section_range() : get_confirmed_range();
@@ -315,7 +374,20 @@ namespace vk
 				flush_length = std::min(max_content_size, available_tile_size);
 			}
 
-			vk::flush_dma(range.start, flush_length);
+			{
+				rsx::readback_chain_trace::scope chain_cpu("readback_cpu_flush",true);
+				chain_cpu.event(m_chain_transfer_cookie,dma_fence.get());chain_cpu.range(range.start,flush_length);
+				if (m_readback_shadow)
+				{
+					auto binding = m_readback_shadow->bind_observer(dma_fence.get());
+					const auto observer = binding.observer();
+					vk::flush_dma(range.start, flush_length, &observer);
+				}
+				else
+				{
+					vk::flush_dma(range.start, flush_length);
+				}
+			}
 
 #if DEBUG_DMA_TILING
 			// Are we a tiled region?
@@ -541,6 +613,13 @@ namespace vk
 		bool handle_memory_pressure(rsx::problem_severity severity) override;
 
 		u64 get_temporary_memory_in_use() const;
+
+		// Destruction can retire a material that is no longer in one of the current sampler slots.
+		atomic_t<u64> material_release_tag{0};
+		std::array<u64, 2> material_cache_generation() const
+		{
+			return {m_cache_update_tag.load(), material_release_tag.load()};
+		}
 
 		bool is_overallocated() const;
 	};

@@ -2,6 +2,7 @@
 
 #include "simple_array.hpp"
 #include "TextureUtils.h"
+#include "readback_shared_window.hpp"
 #include "Emu/RSX/RSXThread.h"
 #include "../Utils/rsx_utils.h"
 
@@ -769,6 +770,7 @@ namespace rsx
 					const coord3u dst_rect = { 0, 0, 0, attr2.width, attr2.height, 1 };
 					const coord3u src_rect = { scaled_offset.x, scaled_offset.y, 0, attr2.width, attr2.height, 1 };
 
+					rsx::readback_fallback_trace("stock_fallback_transfer_read_barrier", attr.address, attr.pitch * attr.height);
 					texptr->memory_barrier(cmd, rsx::surface_access::transfer_read);
 					return
 					{
@@ -781,6 +783,8 @@ namespace rsx
 					};
 				}
 
+				rsx::readback_fallback_trace(access_type == rsx::surface_access::shader_read
+					? "stock_fallback_shader_read_barrier" : "stock_fallback_resolve_read_barrier", attr.address, attr.pitch * attr.height);
 				texptr->memory_barrier(cmd, access_type);
 				auto viewed_surface = texptr->get_surface(access_type);
 				sampled_image_descriptor result =
@@ -803,6 +807,7 @@ namespace rsx
 				return result;
 			}
 
+			rsx::readback_fallback_trace("stock_fallback_unwrap_transfer_barrier", attr.address, attr.pitch * attr.height);
 			texptr->memory_barrier(cmd, rsx::surface_access::transfer_read);
 			auto format_class = rsx::classify_format(attr2.gcm_format);
 

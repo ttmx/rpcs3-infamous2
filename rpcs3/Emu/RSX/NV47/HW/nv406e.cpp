@@ -1,8 +1,10 @@
 #include "stdafx.h"
+#include "Emu/RSX/Common/geometry_sync.h"
 #include "nv406e.h"
 #include "nv47_sync.hpp"
 
 #include "Emu/RSX/RSXThread.h"
+#include "Emu/RSX/RSXSemaphoreTrace.hpp"
 #include "Emu/system_config.h"
 
 #include "context_accessors.define.h"
@@ -25,6 +27,7 @@ namespace rsx
 		{
 			RSX(ctx)->sync_point_request.release(true);
 			const u32 addr = get_address(REGS(ctx)->semaphore_offset_406e(), REGS(ctx)->semaphore_context_dma_406e());
+			rsx::geometry_sync::point(rsx::geometry_sync::semaphore);
 
 			// Syncronization point, may be associated with memory changes without actually changing addresses
 			RSX(ctx)->m_graphics_state |= rsx::pipeline_state::fragment_program_needs_rehash;
@@ -55,12 +58,15 @@ namespace rsx
 			}
 
 			u64 start = get_system_time();
+			{
+			FIFO::semaphore_wait_span trace(FIFO::semaphore_trace_enabled, addr, arg, *RSX(ctx)->fifo_ctrl, *RSX(ctx)->ctrl);
 			u64 last_check_val = start;
 
 			while (sema != arg)
 			{
 				if (RSX(ctx)->test_stopped())
 				{
+					trace.stopped();
 					RSX(ctx)->state += cpu_flag::again;
 					return;
 				}
@@ -83,6 +89,7 @@ namespace rsx
 					{
 						// If longer than driver timeout force exit
 						rsx_log.error("nv406e::semaphore_acquire has timed out. semaphore_address=0x%X", addr);
+						trace.timed_out();
 						break;
 					}
 				}
@@ -100,8 +107,13 @@ namespace rsx
 				utils::spin_on_cacheline_once(atomic_sema, sema, 100);
 			}
 
+			} // Diagnostic semaphore wait span; existing wake delay remains outside.
+
 			RSX(ctx)->fifo_wake_delay();
 			RSX(ctx)->performance_counters.idle_time += (get_system_time() - start);
+
+			// The guest may have written geometry while this thread waited
+			rsx::geometry_sync::point(rsx::geometry_sync::semaphore);
 		}
 
 		void semaphore_release(context* ctx, u32 reg, u32 arg)

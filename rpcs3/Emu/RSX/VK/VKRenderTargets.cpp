@@ -1,14 +1,119 @@
 #include "vkutils/data_heap.h"
 #include "VKFramebuffer.h"
 #include "VKRenderTargets.h"
+#include "VKRTTLoadDiagnostics.hpp"
 #include "VKResourceManager.h"
 #include "Emu/RSX/rsx_methods.h"
 #include "Emu/RSX/RSXThread.h"
 
 #include "Emu/RSX/Common/tiled_dma_copy.hpp"
+#include <cstdlib>
+#include <cstring>
 
 namespace vk
 {
+	static bool blit_coverage_enabled()
+	{
+		static const bool enabled = []
+		{
+			const char* value = std::getenv("RPCS3_EXPERIMENT_BLIT_COVERAGE");
+			return value && std::strcmp(value, "1") == 0;
+		}();
+		return enabled;
+	}
+
+	static bool blit_complement_enabled()
+	{
+		static const bool enabled = []
+		{
+			const char* value = std::getenv("RPCS3_EXPERIMENT_BLIT_COMPLEMENT");
+			return value && std::strcmp(value, "1") == 0;
+		}();
+		return enabled;
+	}
+
+	void render_target::set_blit_coverage_context(const areai& rect, bool integrity_reload, bool discard_allowed)
+	{
+		if (blit_coverage_enabled() || blit_complement_enabled() || rtt_load_diagnostics::enabled())
+		{
+			m_blit_coverage_rect = rect;
+			m_blit_integrity_reload = integrity_reload;
+			m_blit_discard_allowed = discard_allowed;
+			m_blit_coverage_active = true;
+		}
+	}
+
+	void render_target::clear_blit_coverage_context()
+	{
+		if (blit_coverage_enabled() || blit_complement_enabled() || rtt_load_diagnostics::enabled())
+		{
+			m_blit_coverage_active = false;
+		}
+	}
+
+	void render_target::record_blit_load_coverage(bool tiled)
+	{
+		if (!blit_coverage_enabled())
+		{
+			return;
+		}
+		struct category
+		{
+			u64 count = 0, bytes = 0, covered_pixels = 0, total_pixels = 0;
+			u64 eligible_row_band_count = 0, eligible_row_band_bytes = 0;
+		};
+		struct totals
+		{
+			u64 calls = 0;
+			u32 geometry_reports = 0;
+			category kinds[3];
+		};
+		thread_local totals stats;
+		const bool forced = !!(state_flags & rsx::surface_state_flags::force_data_load);
+		const u32 kind = m_blit_coverage_active && forced ? (m_blit_integrity_reload ? 1 : 0) : 2;
+		auto& entry = stats.kinds[kind];
+		const s32 w = surface_width * samples_x;
+		const s32 h = surface_height * samples_y;
+		++entry.count;
+		entry.bytes += static_cast<u64>(rsx_pitch) * h;
+		if (kind < 2)
+		{
+			const s32 x1 = std::clamp<s32>(m_blit_coverage_rect.x1, 0, w);
+			const s32 x2 = std::clamp<s32>(m_blit_coverage_rect.x2, x1, w);
+			const s32 y1 = std::clamp<s32>(m_blit_coverage_rect.y1, 0, h);
+			const s32 y2 = std::clamp<s32>(m_blit_coverage_rect.y2, y1, h);
+			entry.covered_pixels += static_cast<u64>(x2 - x1) * (y2 - y1);
+			entry.total_pixels += static_cast<u64>(w) * h;
+			if (stats.geometry_reports < 8)
+			{
+				++stats.geometry_reports;
+				rsx_log.notice("Blit-load geometry: kind=%u surface=%dx%d rect=(%d,%d)-(%d,%d) pitch=%u bpp=%u tiled=%u swizzled=%u depth=%u spp=%u scale=%u old_contents=%u",
+					kind, w, h, x1, y1, x2, y2, rsx_pitch, get_bpp(), tiled ? 1u : 0u,
+					raster_type == rsx::surface_raster_type::swizzle ? 1u : 0u, is_depth_surface() ? 1u : 0u,
+					spp, resolution_scaling_config.scale_percent, ::size32(old_contents));
+			}
+			if (!tiled && raster_type != rsx::surface_raster_type::swizzle && !is_depth_surface() &&
+				get_bpp() == 4 && spp == 1 && resolution_scaling_config.scale_percent == 100 &&
+				x1 == 0 && x2 == w && y2 > y1 && (y1 > 0 || y2 < h))
+			{
+				++entry.eligible_row_band_count;
+				entry.eligible_row_band_bytes += static_cast<u64>(rsx_pitch) * (y2 - y1);
+			}
+		}
+		++stats.calls;
+		if (stats.calls == 1 || !(stats.calls % 128))
+		{
+			constexpr const char* names[] = { "partial-blit", "integrity-reload", "unattributed" };
+			for (u32 i = 0; i < 3; ++i)
+			{
+				const auto& item = stats.kinds[i];
+				rsx_log.notice("Blit-load coverage %s: copies=%llu source_bytes=%llu overwrite_pixels=%llu/%llu full_width_row_bands=%llu candidate_saved_bytes=%llu",
+					names[i], item.count, item.bytes, item.covered_pixels, item.total_pixels,
+					item.eligible_row_band_count, item.eligible_row_band_bytes);
+			}
+		}
+	}
+
 	namespace surface_cache_utils
 	{
 		void dispose(vk::buffer* buf)
@@ -692,8 +797,46 @@ namespace vk
 	}
 
 	// Load memory from cell and use to initialize the surface
-	void render_target::load_memory(vk::command_buffer& cmd)
+	void render_target::load_memory(vk::command_buffer& cmd, rsx::surface_access access)
 	{
+		rtt_load_diagnostics::span diagnostic;
+		if (rtt_load_diagnostics::enabled())
+		{
+			diagnostic.begin("rtt_load", vk::get_current_frame_id(), true);
+			if (diagnostic)
+			{
+				diagnostic.set(rtt_load_diagnostics::image_uid, uid());
+				diagnostic.set(rtt_load_diagnostics::address, base_addr);
+				diagnostic.set(rtt_load_diagnostics::length, u64(rsx_pitch) * surface_height * samples_y);
+				diagnostic.set(rtt_load_diagnostics::width, surface_width * samples_x);
+				diagnostic.set(rtt_load_diagnostics::height, surface_height * samples_y);
+				diagnostic.set(rtt_load_diagnostics::pitch, rsx_pitch);
+				diagnostic.set(rtt_load_diagnostics::gcm_format, get_gcm_format());
+				diagnostic.set(rtt_load_diagnostics::host_format, format());
+				diagnostic.set(rtt_load_diagnostics::aspect, this->aspect());
+				diagnostic.set(rtt_load_diagnostics::state_flags, this->state_flags);
+				diagnostic.set(rtt_load_diagnostics::msaa_flags, this->msaa_flags);
+				diagnostic.set(rtt_load_diagnostics::old_contents, ::size32(this->old_contents));
+				diagnostic.set(rtt_load_diagnostics::last_use_tag, this->last_use_tag);
+				// Cache metadata may have foreign writers; do not add unsynchronized reads.
+				diagnostic.set(rtt_load_diagnostics::cache_locked, ~u64{0});
+				diagnostic.set(rtt_load_diagnostics::cache_timestamp, ~u64{0});
+				u32 access_code = 0;
+				for (const u32 code : { 1u, 2u, 4u, 8u, 16u, 32u, 64u }) if (access == code) access_code = code;
+				diagnostic.set(rtt_load_diagnostics::access, access_code);
+				diagnostic.set(rtt_load_diagnostics::blit_active, m_blit_coverage_active);
+				diagnostic.set(rtt_load_diagnostics::integrity_reload, m_blit_integrity_reload);
+				diagnostic.set(rtt_load_diagnostics::discard_allowed, m_blit_discard_allowed);
+				diagnostic.set(rtt_load_diagnostics::x1, static_cast<u64>(static_cast<s64>(m_blit_coverage_rect.x1)));
+				diagnostic.set(rtt_load_diagnostics::y1, static_cast<u64>(static_cast<s64>(m_blit_coverage_rect.y1)));
+				diagnostic.set(rtt_load_diagnostics::x2, static_cast<u64>(static_cast<s64>(m_blit_coverage_rect.x2)));
+				diagnostic.set(rtt_load_diagnostics::y2, static_cast<u64>(static_cast<s64>(m_blit_coverage_rect.y2)));
+				diagnostic.set(rtt_load_diagnostics::swizzled, raster_type == rsx::surface_raster_type::swizzle);
+				diagnostic.set(rtt_load_diagnostics::spp, this->spp);
+				diagnostic.set(rtt_load_diagnostics::scale, resolution_scaling_config.scale_percent);
+				diagnostic.set(rtt_load_diagnostics::passthrough, rsx::get_current_renderer()->get_backend_config().supports_passthrough_dma);
+			}
+		}
 		auto& upload_heap = *vk::get_upload_heap();
 		const bool is_swizzled = (raster_type == rsx::surface_raster_type::swizzle);
 
@@ -712,7 +855,10 @@ namespace vk
 		std::vector<u8> ext_data;
 #endif
 
-		if (auto tiled_region = rsx::get_current_renderer()->get_tiled_memory_region(range))
+		const auto tiled_region = rsx::get_current_renderer()->get_tiled_memory_region(range);
+		record_blit_load_coverage(!!tiled_region);
+		if (diagnostic) diagnostic.set(rtt_load_diagnostics::tiled, !!tiled_region);
+		if (tiled_region)
 		{
 #if DEBUG_DMA_TILING
 			auto real_data = vm::get_super_ptr<u8>(range.start);
@@ -748,7 +894,14 @@ namespace vk
 		if (resolution_scaling_config.scale_percent == 100 && spp == 1) [[likely]]
 		{
 			push_layout(cmd, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-			vk::upload_image(cmd, this, { subres }, get_gcm_format(), is_swizzled, 1, aspect(), upload_heap, heap_align, upload_flags);
+			const bool complement = blit_complement_enabled() && m_blit_coverage_active && m_blit_discard_allowed &&
+				!m_blit_integrity_reload && !tiled_region && !is_swizzled && !is_depth_surface() &&
+				old_contents.empty() && (state_flags & rsx::surface_state_flags::force_data_load) &&
+				vk::try_upload_image_complement(cmd, this, subres, get_gcm_format(), m_blit_coverage_rect, upload_heap);
+			if (!complement)
+			{
+				vk::upload_image(cmd, this, { subres }, get_gcm_format(), is_swizzled, 1, aspect(), upload_heap, heap_align, upload_flags);
+			}
 			pop_layout(cmd);
 		}
 		else
@@ -828,7 +981,7 @@ namespace vk
 		}
 		else
 		{
-			load_memory(cmd);
+			load_memory(cmd, access);
 		}
 	}
 

@@ -70,6 +70,7 @@ namespace rsx
 		usz m_put_pos;                 // Start of free space
 		usz m_get_pos;                 // End of free space
 		usz m_min_guard_size;          // If an allocation touches the guard region, reset the heap to avoid going over budget
+		u32 m_generation = 0;          // Changes whenever previously allocated space may be handed out again
 
 		char* m_name;
 	public:
@@ -85,6 +86,7 @@ namespace rsx
 			m_size = heap_size;
 			m_put_pos = 0;
 			m_get_pos = heap_size - 1;
+			m_generation++;
 
 			// Allocation stats
 			m_min_guard_size = min_guard_size;
@@ -110,6 +112,7 @@ namespace rsx
 			}
 
 			m_put_pos = alloc_size;
+			m_generation++;
 			return 0;
 		}
 
@@ -137,6 +140,7 @@ namespace rsx
 			}
 
 			m_put_pos = Size;
+			m_generation++;
 			return 0;
 		}
 
@@ -167,6 +171,11 @@ namespace rsx
 		usz size() const
 		{
 			return m_size;
+		}
+
+		u32 generation() const
+		{
+			return m_generation;
 		}
 
 		// Bulk static allocator. Allows to allocate one large block and subdivide

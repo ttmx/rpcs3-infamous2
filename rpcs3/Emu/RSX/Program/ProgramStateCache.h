@@ -1,5 +1,7 @@
 #pragma once
 
+#include <array>
+#include <cstdlib>
 #include "RSXFragmentProgram.h"
 #include "RSXVertexProgram.h"
 
@@ -211,6 +213,22 @@ protected:
 
 	binary_to_vertex_program m_vertex_shader_cache;
 	binary_to_fragment_program m_fragment_shader_cache;
+
+	// Small memo keyed by the microcode's address. A candidate is only accepted after the same exact
+	// comparison the map uses, so a hit skips hashing the microcode and walking the bucket.
+	static constexpr usz fp_memo_size = 512;
+	std::array<typename binary_to_fragment_program::value_type*, fp_memo_size> m_fragment_program_memo{};
+	bool m_fragment_program_memo_enabled = []
+	{
+		const char* option = std::getenv("RPCS3_FP_ADDRESS_MEMO");
+		return option && option[0] == '1' && !option[1];
+	}();
+
+	static usz fp_memo_index(const RSXFragmentProgram& rsx_fp)
+	{
+		const usz address = reinterpret_cast<usz>(rsx_fp.get_data());
+		return ((address >> 4) ^ (address >> 13) ^ rsx_fp.ctrl) % fp_memo_size;
+	}
 	std::unordered_map<pipeline_key, pipeline_storage_type, pipeline_key_hash, pipeline_key_compare> m_storage;
 
 	decompiler_callback_t notify_pipeline_compiled;
@@ -268,6 +286,18 @@ protected:
 			return std::forward_as_tuple(*cache_hint->get_fragment_program<fragment_program_type>(), true);
 		}
 
+		const usz memo_index = m_fragment_program_memo_enabled ? fp_memo_index(rsx_fp) : 0;
+
+		if (m_fragment_program_memo_enabled)
+		{
+			if (auto candidate = m_fragment_program_memo[memo_index];
+				candidate && program_hash_util::fragment_program_compare()(candidate->first, rsx_fp))
+			{
+				rsx::program_cache_hint_t::cache_fragment_program(cache_hint, rsx_fp, &candidate->second);
+				return std::forward_as_tuple(candidate->second, true);
+			}
+		}
+
 		bool recompile = false;
 		typename binary_to_fragment_program::iterator it;
 		fragment_program_type* new_shader;
@@ -277,6 +307,11 @@ protected:
 			const auto& I = m_fragment_shader_cache.find(rsx_fp);
 			if (I != m_fragment_shader_cache.end())
 			{
+				if (m_fragment_program_memo_enabled)
+				{
+					m_fragment_program_memo[memo_index] = &*I;
+				}
+
 				rsx::program_cache_hint_t::cache_fragment_program(cache_hint, rsx_fp, &(I->second));
 				return std::forward_as_tuple(I->second, true);
 			}
@@ -463,6 +498,7 @@ public:
 		std::scoped_lock lock(m_vertex_mutex, m_fragment_mutex, m_decompiler_mutex, m_pipeline_mutex);
 
 		notify_pipeline_compiled = {};
+		m_fragment_program_memo.fill(nullptr);
 		m_fragment_shader_cache.clear();
 		m_vertex_shader_cache.clear();
 		m_storage.clear();

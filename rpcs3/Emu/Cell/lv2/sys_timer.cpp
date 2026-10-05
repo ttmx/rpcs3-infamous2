@@ -1,3 +1,4 @@
+#include "Emu/RSX/VK/VKLiveCtl.hpp"
 #include "stdafx.h"
 #include "sys_timer.h"
 
@@ -455,7 +456,8 @@ error_code sys_timer_usleep(ppu_thread& ppu, u64 sleep_time)
 
 	if (sleep_time)
 	{
-		const s64 add_time = g_cfg.core.usleep_addend;
+		const u64 live_addend = vk::live_ctl::get(6);
+		const s64 add_time = live_addend ? static_cast<s64>(live_addend - 1) : s64{g_cfg.core.usleep_addend};
 
 		// Over/underflow checks
 		if (add_time >= 0)

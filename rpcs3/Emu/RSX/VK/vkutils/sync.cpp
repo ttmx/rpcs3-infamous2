@@ -12,6 +12,13 @@
 #include "util/asm.hpp"
 #include "util/logs.hpp"
 
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <cstdlib>
+#include <cstring>
+#include <thread>
+
 namespace vk
 {
 	namespace globals
@@ -587,8 +594,158 @@ namespace vk
 		}
 	}
 
+	namespace
+	{
+		enum class event_wait_backoff { none, yield, sleep, mwait };
+		struct event_wait_options
+		{
+			event_wait_backoff mode = event_wait_backoff::none;
+			u64 spin_us = 50;
+			bool statistics = false;
+		};
+
+		const event_wait_options& get_event_wait_options()
+		{
+			static const auto options = []
+			{
+				event_wait_options result;
+				if (const char* mode = std::getenv("RPCS3_EXPERIMENT_EVENT_WAIT"))
+				{
+					if (std::strcmp(mode, "yield") == 0) result.mode = event_wait_backoff::yield;
+					if (std::strcmp(mode, "sleep") == 0) result.mode = event_wait_backoff::sleep;
+					if (std::strcmp(mode, "mwait") == 0) result.mode = event_wait_backoff::mwait;
+				}
+				if (const char* value = std::getenv("RPCS3_EXPERIMENT_EVENT_SPIN_US"))
+				{
+					char* end = nullptr;
+					const u64 parsed = std::strtoull(value, &end, 10);
+					if (end != value && !*end && parsed <= 10000) result.spin_us = parsed;
+				}
+				if (const char* value = std::getenv("RPCS3_EXPERIMENT_EVENT_WAIT_STATS"))
+				{
+					result.statistics = std::strcmp(value, "1") == 0;
+				}
+				return result;
+			}();
+			return options;
+		}
+
+		void record_event_wait(u64 elapsed_us, u64 polls, u64 backoffs, VkResult result)
+		{
+			// Thread-local aggregation avoids cacheline contention among SPU workers.
+			struct totals
+			{
+				u64 count = 0, time_us = 0, max_us = 0, polls = 0, backoffs = 0, failures = 0;
+				std::array<u64, 8> buckets{};
+			};
+			thread_local totals stats;
+			constexpr std::array<u64, 7> limits = { 1, 5, 10, 50, 100, 500, 1000 };
+			usz bucket = 0;
+			while (bucket < limits.size() && elapsed_us > limits[bucket]) ++bucket;
+			++stats.buckets[bucket];
+			++stats.count;
+			stats.time_us += elapsed_us;
+			stats.max_us = std::max(stats.max_us, elapsed_us);
+			stats.polls += polls;
+			stats.backoffs += backoffs;
+			stats.failures += result != VK_SUCCESS;
+			if (stats.count == 128 || (stats.count % 1024) == 0)
+			{
+				rsx_log.notice("Event wait stats: n=%llu time_us=%llu max_us=%llu polls=%llu backoffs=%llu failures=%llu buckets_us[<=1,<=5,<=10,<=50,<=100,<=500,<=1000,>1000]=[%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu]",
+					stats.count, stats.time_us, stats.max_us, stats.polls, stats.backoffs, stats.failures,
+					stats.buckets[0], stats.buckets[1], stats.buckets[2], stats.buckets[3],
+					stats.buckets[4], stats.buckets[5], stats.buckets[6], stats.buckets[7]);
+			}
+		}
+
+		VkResult wait_for_event_experimental(event* pEvent, u64 timeout_us, const event_wait_options& options)
+		{
+			const u64 freq = utils::get_tsc_freq();
+			// Use the same time units and timeout conversion as the stock loop.
+			const u64 ticks_per_us = freq ? freq / 1'000'000 : 1;
+			const u64 timeout = timeout_us * ticks_per_us;
+			const auto clock = [freq]() { return freq ? utils::get_tsc() : get_system_time(); };
+			const u64 entered = clock();
+			u64 start = 0, polls = 0, backoffs = 0;
+			const auto finish = [&](VkResult result)
+			{
+				if (options.statistics)
+				{
+					const u64 now = clock();
+					record_event_wait(now >= entered ? (now - entered) / ticks_per_us : 0, polls, backoffs, result);
+				}
+				return result;
+			};
+			while (true)
+			{
+				++polls;
+				switch (const auto status = pEvent->status())
+				{
+				case VK_EVENT_SET: return finish(VK_SUCCESS);
+				case VK_EVENT_RESET: break;
+				default:
+					die_with_error(status);
+					return finish(status);
+				}
+				const u64 now = clock();
+				if (timeout)
+				{
+					if (!start)
+					{
+						start = now;
+						continue;
+					}
+					if ((now > start) && (now - start) > timeout)
+					{
+						rsx_log.error("[vulkan] vk::wait_for_event has timed out!");
+						return finish(VK_TIMEOUT);
+					}
+				}
+				if (options.mode != event_wait_backoff::none && now >= entered &&
+					(now - entered) >= options.spin_us * ticks_per_us)
+				{
+					if (options.mode == event_wait_backoff::yield)
+					{
+						++backoffs;
+						std::this_thread::yield();
+					}
+					else if (!timeout || (now - start) + ticks_per_us <= timeout)
+					{
+						// Request only 1us; host sleep may wake later due to scheduling.
+						++backoffs;
+						if (options.mode == event_wait_backoff::mwait)
+						{
+							// Monitor only our own isolated CPU cacheline. The Vulkan
+							// event stays opaque and is checked again after the timer.
+							thread_local atomic_t<u32, 64> idle_word{0};
+							utils::spin_on_cacheline_once(idle_word, u32{0}, 1);
+						}
+						else
+						{
+							std::this_thread::sleep_for(std::chrono::microseconds(1));
+						}
+					}
+					else
+					{
+						utils::pause();
+					}
+				}
+				else
+				{
+					utils::pause();
+				}
+			}
+		}
+	}
+
 	VkResult wait_for_event(event* pEvent, u64 timeout)
 	{
+		const auto& options = get_event_wait_options();
+		if (options.mode != event_wait_backoff::none || options.statistics)
+		{
+			return wait_for_event_experimental(pEvent, timeout, options);
+		}
+
 		// Convert timeout to TSC cycles. Timeout accuracy isn't super-important, only fast response when event is signaled (within 10us if possible)
 		const u64 freq = utils::get_tsc_freq();
 

@@ -49,6 +49,25 @@ namespace rsx
 		using surface_ranged_map = ranged_map<surface_storage_type, 0x400000>;
 		using surface_cache_dma_map = surface_cache_dma<Traits, 0x400000>;
 
+	public:
+		// Calls func(memory range) for every surface held, bound or not
+		template <typename F>
+		void for_each_surface_range(F&& func)
+		{
+			const auto scan = [&](surface_ranged_map& data, const rsx::address_range32& bounds)
+			{
+				if (!bounds.valid()) return;
+
+				for (auto it = data.begin_range(bounds); it != data.end(); ++it)
+				{
+					func(it->second->get_memory_range());
+				}
+			};
+
+			scan(m_render_targets_storage, m_render_targets_memory_range);
+			scan(m_depth_stencil_storage, m_depth_stencil_memory_range);
+		}
+
 	protected:
 		surface_ranged_map m_render_targets_storage = {};
 		surface_ranged_map m_depth_stencil_storage = {};

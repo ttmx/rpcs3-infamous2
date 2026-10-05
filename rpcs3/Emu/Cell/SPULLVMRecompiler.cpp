@@ -14,7 +14,22 @@
 #include "SPUThread.h"
 #include "SPUAnalyser.h"
 #include "SPUInterpreter.h"
+#ifdef __linux__
+#include "SelectedKernelTrace.hpp"
+#include "Kernel07170Trace.hpp"
+#include "WholeTileCallbackTrace.hpp"
+#include "Whole890CallbackTrace.hpp"
+#include "Whole890CallbackPairCapture.hpp"
+#include "WholeTileCallbackPairCapture.hpp"
+#endif
+#ifdef ARCH_X64
+#include "SPUNativeRWV.hpp"
+#include "SPUNativeSXE.hpp"
+#include "SPUNative07170.hpp"
+#endif
 #include <algorithm>
+#include <atomic>
+#include <cstdlib>
 #include <thread>
 
 #include "util/v128.hpp"
@@ -48,9 +63,12 @@ const extern spu_decoder<spu_iflag> g_spu_iflag;
 #include <llvm/Analysis/LoopAnalysisManager.h>
 #include <llvm/IR/PassManager.h>
 #include <llvm/Passes/PassBuilder.h>
+#include <llvm/Transforms/InstCombine/InstCombine.h>
 #include <llvm/Transforms/Scalar/ADCE.h>
 #include <llvm/Transforms/Scalar/DeadStoreElimination.h>
 #include <llvm/Transforms/Scalar/EarlyCSE.h>
+#include <llvm/Transforms/Scalar/GVN.h>
+#include <llvm/Transforms/Scalar/JumpThreading.h>
 #include <llvm/Transforms/Scalar/LICM.h>
 #include <llvm/Transforms/Scalar/LoopPassManager.h>
 #include <llvm/Transforms/Scalar/SimplifyCFG.h>
@@ -59,6 +77,563 @@ const extern spu_decoder<spu_iflag> g_spu_iflag;
 #else
 #pragma GCC diagnostic pop
 #endif
+
+namespace
+{
+	const bool g_spu_04ac8_contribution_trace = []
+	{
+#ifdef __linux__
+		const char* path = std::getenv("RPCS3_SPU_04AC8_CONTRIBUTION_TRACE_PATH");
+		return path && *path && whole_tile_callback_trace::initialize(path);
+#else
+		return false;
+#endif
+	}();
+
+	// Requires the existing globally cached tree wrappers, so only main and
+	// terminal helper modules need new JIT objects. All cold paths stay stock.
+	const bool g_spu_06c30_contribution_trace = []
+	{
+#ifdef __linux__
+		const char* path=std::getenv("RPCS3_SPU_06C30_CONTRIBUTION_TRACE_PATH");
+		return g_spu_04ac8_contribution_trace && path && *path && whole_890_callback_trace::initialize(path);
+#else
+		return false;
+#endif
+	}();
+	const bool g_spu_06c30_pair_capture = []
+	{
+#ifdef __linux__
+		const char* path=std::getenv("RPCS3_SPU_06C30_PAIR_CAPTURE_PATH");
+		return g_spu_06c30_contribution_trace && path && *path && whole_890_pair_capture::initialize(path);
+#else
+		return false;
+#endif
+	}();
+#ifdef __linux__
+	whole_890_pair_capture::Point spu_06c30_pair_point(spu_thread*spu,u32 site,u32 target,u32 abi)
+	{
+		whole_890_pair_capture::Point p{};
+		p.source_pc=site;p.context_pc=spu->pc;p.expected_return_pc=target&0x3fffc;
+		p.pending_mfc=spu->mfc_size;p.cpu_state=static_cast<u32>(spu->state.load());p.unsavable=spu->unsavable;
+#ifdef ARCH_X64
+		p.mxcsr=_mm_getcsr();
+#endif
+		p.abi=abi;p.mfc_barrier=spu->mfc_barrier;p.mfc_fence=spu->mfc_fence;p.tag_update=spu->ch_tag_upd;p.tag_mask=spu->ch_tag_mask;return p;
+	}
+#endif
+	void spu_06c30_trace_enter(spu_thread*spu,u32 pc)
+	{
+#ifdef __linux__
+		whole_890_callback_trace::enter(spu,spu->lv2_id,spu->index,pc,spu->gpr[3]._u32[3],0,spu->gpr[0]._u32[3],spu->mfc_size);
+		whole_890_callback_trace::verify_entry(spu,spu->ls);
+		if(g_spu_06c30_pair_capture&&whole_890_pair_capture::needs_entry(spu))whole_890_pair_capture::enter(spu,reinterpret_cast<const u8*>(spu->gpr.data()),spu->ls,spu_06c30_pair_point(spu,pc,spu->gpr[0]._u32[3],0),spu->lv2_id,spu->index);
+#endif
+	}
+	void spu_06c30_trace_return(spu_thread*spu,const u8*ls,u32 site,u32 target)
+	{
+#ifdef __linux__
+		whole_890_callback_trace::return_site(spu,ls,site,target);
+		if(g_spu_06c30_pair_capture&&whole_890_pair_capture::needs_exit(spu))whole_890_pair_capture::leave(spu,reinterpret_cast<const u8*>(spu->gpr.data()),ls,spu_06c30_pair_point(spu,site,target,1));
+#endif
+	}
+	void spu_06c30_trace_abort(spu_thread*spu)
+	{
+#ifdef __linux__
+		whole_890_callback_trace::abort(spu);
+		if(g_spu_06c30_pair_capture)whole_890_pair_capture::abort(spu,3);
+#endif
+	}
+
+	const bool g_spu_04ac8_pair_capture = []
+	{
+#ifdef __linux__
+		const char* path=std::getenv("RPCS3_SPU_04AC8_PAIR_CAPTURE_PATH");
+		const char* lit=std::getenv("RPCS3_SPU_04AC8_PAIR_REQUIRE_LIGHT");
+		const char* nonzero=std::getenv("RPCS3_SPU_04AC8_PAIR_REQUIRE_NONZERO");
+		const char* stride=std::getenv("RPCS3_SPU_04AC8_PAIR_SAMPLE_STRIDE");
+		const bool require_light=lit&&std::strcmp(lit,"1")==0;
+		const u32 sample_stride=stride&&std::strcmp(stride,"7")==0?7:31;
+		return g_spu_04ac8_contribution_trace && path && *path && whole_tile_pair_capture::initialize(path,require_light,sample_stride,nonzero&&std::strcmp(nonzero,"1")==0);
+#else
+		return false;
+#endif
+	}();
+
+#ifdef __linux__
+	whole_tile_pair_capture::Point spu_04ac8_pair_point(spu_thread* spu,u32 site,u32 target,u32 abi)
+	{
+		whole_tile_pair_capture::Point p{};
+		p.source_pc=site;p.context_pc=spu->pc;p.expected_return_pc=target & 0x3fffc;
+		p.pending_mfc=spu->mfc_size;p.cpu_state=static_cast<u32>(spu->state.load());p.unsavable=spu->unsavable;
+#ifdef ARCH_X64
+		p.mxcsr=_mm_getcsr();
+#endif
+		p.abi=abi;p.mfc_barrier=spu->mfc_barrier;p.mfc_fence=spu->mfc_fence;p.tag_update=spu->ch_tag_upd;p.tag_mask=spu->ch_tag_mask;return p;
+	}
+#endif
+
+	void spu_04ac8_trace_enter(spu_thread* spu, u32 pc)
+	{
+#ifdef __linux__
+		whole_tile_callback_trace::enter(spu, spu->lv2_id, spu->index, pc, spu->gpr[3]._u32[3], 0, spu->gpr[0]._u32[3], spu->mfc_size);
+		if(g_spu_04ac8_pair_capture&&whole_tile_pair_capture::needs_entry(spu))whole_tile_pair_capture::enter(spu,reinterpret_cast<const u8*>(spu->gpr.data()),spu->ls,spu_04ac8_pair_point(spu,pc,spu->gpr[0]._u32[3],0),spu->lv2_id,spu->index);
+#endif
+	}
+
+	void spu_04ac8_trace_return(spu_thread* spu, const u8* ls, u32 site, u32 target)
+	{
+#ifdef __linux__
+		whole_tile_callback_trace::return_site(spu, ls, site, target);
+		if(g_spu_04ac8_pair_capture)whole_tile_pair_capture::abort(spu,3);
+#endif
+	}
+
+	void spu_04ac8_trace_return_generic(spu_thread* spu,const u8* ls,u32 site,u32 target)
+	{
+#ifdef __linux__
+		whole_tile_callback_trace::return_site(spu,ls,site,target);
+		if(g_spu_04ac8_pair_capture&&whole_tile_pair_capture::needs_exit(spu))whole_tile_pair_capture::leave(spu,reinterpret_cast<const u8*>(spu->gpr.data()),ls,spu_04ac8_pair_point(spu,site,target,1));
+#endif
+	}
+
+	void spu_04ac8_pair_light_call(spu_thread* spu,u32 site,u32 target)
+	{
+#ifdef __linux__
+		if(g_spu_04ac8_pair_capture)whole_tile_pair_capture::latch(spu,site,target);
+#endif
+	}
+
+	void spu_04ac8_pair_materialized(spu_thread* spu,u32 site,u32 target,u32 base,u32 width)
+	{
+#ifdef __linux__
+		if(whole_tile_callback_trace::accumulator_classification)
+		{
+			auto* record=whole_tile_callback_trace::thread.open;
+			if(record&&record->context_cookie==reinterpret_cast<uintptr_t>(spu)&&site==0x51f0&&target==0x7170)
+			{
+				const auto begin=whole_tile_callback_trace::now_ns();
+				const s32 count=static_cast<s16>(width&0xffff);
+				const u32 category=count<=0||count>2048||(count&3)?3:whole_tile_pair_capture::materialized_finite_nonzero(spu->ls,base,width)?2:1;
+				whole_tile_callback_trace::classify_mode(record->mode,category,whole_tile_callback_trace::now_ns()-begin);
+			}
+		}
+		if(g_spu_04ac8_pair_capture)whole_tile_pair_capture::latch_materialized(spu,spu->ls,site,target,base,width);
+#endif
+	}
+
+	void spu_04ac8_tree_abort(spu_thread* spu)
+	{
+#ifdef __linux__
+		whole_tile_callback_trace::abort(spu);
+		if(g_spu_06c30_contribution_trace)whole_890_callback_trace::abort(spu);
+		if(g_spu_06c30_pair_capture)whole_890_pair_capture::abort(spu,4);
+		if(g_spu_04ac8_pair_capture)whole_tile_pair_capture::abort(spu,4);
+#endif
+	}
+
+	bool spu_04ac8_tree_check_state(spu_thread* spu)
+	{
+		if (!g_spu_04ac8_contribution_trace) return spu->check_state();
+#ifdef __linux__
+		whole_tile_callback_trace::pause_begin(spu);
+		if(g_spu_06c30_contribution_trace)whole_890_callback_trace::pause_begin(spu);
+		if(g_spu_06c30_pair_capture)whole_890_pair_capture::abort(spu,5);
+		if(g_spu_04ac8_pair_capture)whole_tile_pair_capture::abort(spu,5);
+#endif
+		const bool escape = spu->check_state();
+#ifdef __linux__
+		whole_tile_callback_trace::pause_end(spu);
+		if(g_spu_06c30_contribution_trace)whole_890_callback_trace::pause_end(spu);
+		if(escape && g_spu_06c30_contribution_trace)whole_890_callback_trace::abort(spu);
+		if (escape) whole_tile_callback_trace::abort(spu);
+#endif
+		return escape;
+	}
+
+	void spu_04ac8_tree_escape(spu_thread* spu)
+	{
+#ifdef __linux__
+		whole_tile_callback_trace::abort(spu);
+		if(g_spu_06c30_contribution_trace)whole_890_callback_trace::abort(spu);
+		if(g_spu_06c30_pair_capture)whole_890_pair_capture::abort(spu,4);
+#endif
+		spu_runtime::g_escape(spu);
+	}
+
+	const bool g_spu_07170_contribution_trace = []
+	{
+#ifdef __linux__
+		const char* path=std::getenv("RPCS3_SPU_07170_CONTRIBUTION_TRACE_PATH");
+		return path && *path && kernel_07170_trace::initialize(path);
+#else
+		return false;
+#endif
+	}();
+
+	void spu_07170_trace_enter(spu_thread* spu,u32 pc)
+	{
+#ifdef __linux__
+		if(kernel_07170_trace::enter(spu,spu->lv2_id,spu->index,pc,spu->gpr[6]._u32[3],0))
+		{
+			bool mxcsr_supported=false;
+#ifdef ARCH_X64
+			mxcsr_supported=(_mm_getcsr()&0xe040)==0xe040;
+#endif
+			kernel_07170_trace::classify(spu->ls,spu->gpr[6]._u32[3],spu->gpr[5]._u32[3],pc,mxcsr_supported,spu->mfc_size);
+		}
+#endif
+	}
+	void spu_07170_trace_leave(spu_thread* spu,u32 pc)
+	{
+#ifdef __linux__
+		kernel_07170_trace::leave(spu,pc,kernel_07170_trace::stock);
+#endif
+	}
+	void spu_07170_trace_abort(spu_thread* spu)
+	{
+#ifdef __linux__
+		kernel_07170_trace::abort(spu);
+#endif
+	}
+	bool spu_07170_trace_check_state(spu_thread* spu)
+	{
+#ifdef __linux__
+		kernel_07170_trace::pause_begin();
+#endif
+		const bool escape=spu_04ac8_tree_check_state(spu);
+#ifdef __linux__
+		kernel_07170_trace::pause_end();
+		if(escape)kernel_07170_trace::abort(spu);
+#endif
+		return escape;
+	}
+
+	// Diagnostic only. Bootstrap/prefault before guest threads start, never
+	// truncate an existing file. Unset path emits no JIT hooks/cache suffix.
+	const bool g_spu_08ae8_contribution_trace = []
+	{
+#ifdef __linux__
+		const char* path = std::getenv("RPCS3_SPU_08AE8_CONTRIBUTION_TRACE_PATH");
+		return path && *path && selected_kernel_trace::initialize(path);
+#else
+		return false;
+#endif
+	}();
+
+	void spu_08ae8_trace_enter(spu_thread* spu, u32 pc)
+	{
+#ifdef __linux__
+		selected_kernel_trace::enter(spu, spu->lv2_id, spu->index, pc, spu->gpr[3]._u32[3], 0);
+#endif
+	}
+
+	void spu_08ae8_trace_leave(spu_thread* spu, u32 pc)
+	{
+#ifdef __linux__
+		selected_kernel_trace::leave(spu, pc, selected_kernel_trace::stock);
+#endif
+	}
+
+	void spu_08ae8_trace_abort(spu_thread* spu)
+	{
+#ifdef __linux__
+		selected_kernel_trace::abort(spu);
+#endif
+	}
+
+	bool spu_08ae8_trace_check_state(spu_thread* spu)
+	{
+#ifdef __linux__
+		selected_kernel_trace::pause_begin();
+#endif
+		const bool escape = spu_04ac8_tree_check_state(spu);
+#ifdef __linux__
+		selected_kernel_trace::pause_end();
+		if (escape) selected_kernel_trace::abort(spu);
+#endif
+		return escape;
+	}
+
+	// Experiment flag is read once per process. Default preserves the stock pipeline.
+	const bool g_spu_instcombine_experiment = []
+	{
+		const char* value = std::getenv("RPCS3_EXPERIMENT_SPU_INSTCOMBINE");
+		return value && std::string_view(value) == "1";
+	}();
+
+	const bool g_spu_gvn_experiment = []
+	{
+		const char* value = std::getenv("RPCS3_EXPERIMENT_SPU_GVN");
+		return value && std::string_view(value) == "1";
+	}();
+
+	const bool g_spu_pack_cleanup_experiment = []
+	{
+		const char* value = std::getenv("RPCS3_SPU_PACK_CLEANUP");
+		return value && std::string_view(value) == "1";
+	}();
+
+	const bool g_spu_pack_thread_experiment = []
+	{
+		const char* value = std::getenv("RPCS3_SPU_PACK_THREAD");
+		return value && std::string_view(value) == "1";
+	}();
+
+	const bool g_spu_gather_pack_experiment = []
+	{
+		const char* value = std::getenv("RPCS3_SPU_GATHER_PACK");
+		return value && std::string_view(value) == "1";
+	}();
+
+	const bool g_spu_rsqrte_lut_experiment = []
+	{
+		const char* value = std::getenv("RPCS3_SPU_RSQRT_LUT");
+		return value && std::string_view(value) == "1";
+	}();
+
+	const bool g_spu_native_rwv_experiment = []
+	{
+		const char* value = std::getenv("RPCS3_SPU_NATIVE_RWV");
+		return value && std::string_view(value) == "1";
+	}();
+
+	const bool g_spu_native_sxe_experiment = []
+	{
+		const char* value = std::getenv("RPCS3_SPU_NATIVE_SXE");
+		return value && std::string_view(value) == "1";
+	}();
+
+	const bool g_spu_native_07170_experiment = []
+	{
+		const char* value = std::getenv("RPCS3_SPU_NATIVE_07170");
+		return value && std::string_view(value) == "1";
+	}();
+
+	const bool g_spu_native_trace = []
+	{
+		const char* value = std::getenv("RPCS3_SPU_NATIVE_TRACE");
+		return value && std::string_view(value) == "1";
+	}();
+
+#ifdef ARCH_X64
+	// No atomics or logging on the clean timing path. Summaries are bounded to
+	// powers of two through 65536 attempts (at most 17 per kernel per process).
+	struct spu_native_counts
+	{
+		std::atomic<u64> attempts{0}, completed{0}, guard_fallback{0}, mask_fallback{0}, state_fallback{0}, pending_fallback{0}, debugger_fallback{0}, checkpoints{0}, escaped{0};
+	};
+	spu_native_counts g_spu_native_counts[3];
+
+	void spu_native_record(unsigned kernel, unsigned reason)
+	{
+		if (!g_spu_native_trace) return;
+		auto& counts = g_spu_native_counts[kernel];
+		switch (reason)
+		{
+		case 1: counts.completed.fetch_add(1, std::memory_order_relaxed); break;
+		case 2: counts.guard_fallback.fetch_add(1, std::memory_order_relaxed); break;
+		case 3: counts.mask_fallback.fetch_add(1, std::memory_order_relaxed); break;
+		case 4: counts.state_fallback.fetch_add(1, std::memory_order_relaxed); break;
+		case 5: counts.pending_fallback.fetch_add(1, std::memory_order_relaxed); break;
+		case 6: counts.debugger_fallback.fetch_add(1, std::memory_order_relaxed); break;
+		}
+		const u64 attempts = counts.attempts.fetch_add(1, std::memory_order_relaxed) + 1;
+		if (attempts <= 65536 && (attempts & (attempts - 1)) == 0)
+		{
+			spu_log.notice("Native SPU %s: attempts=%u completed=%u guard_fallback=%u mask_fallback=%u state_fallback=%u pending_fallback=%u debugger_fallback=%u checkpoints=%u escaped=%u",
+				kernel == 2 ? "07170" : (kernel ? "SXE" : "RWV"), attempts, counts.completed.load(std::memory_order_relaxed), counts.guard_fallback.load(std::memory_order_relaxed),
+				counts.mask_fallback.load(std::memory_order_relaxed), counts.state_fallback.load(std::memory_order_relaxed),
+				counts.pending_fallback.load(std::memory_order_relaxed), counts.debugger_fallback.load(std::memory_order_relaxed),
+				counts.checkpoints.load(std::memory_order_relaxed), counts.escaped.load(std::memory_order_relaxed));
+		}
+	}
+
+	// Mirrors the stock LLVM check_state cold path. SIMD locals remain live in
+	// the native frame while check_state pauses and returns. g_escape abandons
+	// the frame using the emulator's existing escape protocol; no RAII is live.
+	[[gnu::noinline]] void spu_native_check_state(spu_thread* spu, u32 pc, bool unsafe, unsigned kernel)
+	{
+#ifdef __linux__
+		if(kernel==2 && g_spu_07170_contribution_trace) kernel_07170_trace::pause_begin();
+#endif
+		if (g_spu_native_trace) g_spu_native_counts[kernel].checkpoints.fetch_add(1, std::memory_order_relaxed);
+		spu->pc = pc & 0x3fffc;
+		if (unsafe) spu->unsavable = true;
+		if (spu_04ac8_tree_check_state(spu))
+		{
+	#ifdef __linux__
+			if(kernel==2 && g_spu_07170_contribution_trace) kernel_07170_trace::abort(spu);
+#endif
+			if (g_spu_native_trace) g_spu_native_counts[kernel].escaped.fetch_add(1, std::memory_order_relaxed);
+			(g_spu_04ac8_contribution_trace ? &spu_04ac8_tree_escape : spu_runtime::g_escape)(spu);
+		}
+		if (unsafe) spu->unsavable = false;
+#ifdef __linux__
+		if(kernel==2 && g_spu_07170_contribution_trace) kernel_07170_trace::pause_end();
+#endif
+	}
+
+	bool spu_native_layout_supported()
+	{
+		return ::offset32(&spu_thread::gpr) == 64 && ::offset32(&spu_thread::pc) == 24;
+	}
+
+	// Captured kernels contain no DMA instructions. Admit only the captured
+	// zero-pending-MFC contract; debugger stepping/breakpoints and unusual
+	// layouts fall back before any architectural register or LS mutation.
+	bool spu_native_entry_supported(spu_thread* spu, u8* local_store, unsigned kernel)
+	{
+		if (spu->state)
+		{
+			spu_native_record(kernel, 4);
+			return false;
+		}
+		if (spu->mfc_size)
+		{
+			spu_native_record(kernel, 5);
+			return false;
+		}
+		if (spu->has_active_local_bps)
+		{
+			spu_native_record(kernel, 6);
+			return false;
+		}
+		if ((reinterpret_cast<std::uintptr_t>(spu) & 15)
+			|| (reinterpret_cast<std::uintptr_t>(local_store) & 15)
+			|| (_mm_getcsr() & 0xe040) != 0xe040)
+		{
+			spu_native_record(kernel, 2);
+			return false;
+		}
+		return true;
+	}
+
+	u32 spu_native_rwv(u8* context, u8* local_store, u32 pc)
+	{
+		auto* spu = reinterpret_cast<spu_thread*>(context);
+		if (!spu_native_entry_supported(spu, local_store, 0)) return 0;
+		if (!rpcs3::experimental_rwv::eligible(context, local_store, pc))
+		{
+			spu_native_record(0, 2);
+			return 0;
+		}
+		const unsigned outcome = rpcs3::experimental_rwv::run(context, local_store, pc, [spu](void*, u32 checkpoint_pc)
+		{
+			if (spu->state) [[unlikely]] spu_native_check_state(spu, checkpoint_pc, true, 0);
+			return false;
+		});
+		ensure(outcome != 2); // Production checkpoints resume in place or escape.
+		spu_native_record(0, outcome ? 1 : 3);
+		return outcome;
+	}
+
+	u32 spu_native_sxe(u8* context, u8* local_store, u32 pc)
+	{
+		auto* spu = reinterpret_cast<spu_thread*>(context);
+		if (!spu_native_entry_supported(spu, local_store, 1)) return 0;
+		const unsigned outcome = rpcs3::experimental_sxe::spu_native_sxe_impl(context, local_store, pc, [spu](u32 checkpoint_pc, bool unsafe)
+		{
+			if (spu->state) [[unlikely]] spu_native_check_state(spu, checkpoint_pc, unsafe, 1);
+			return false;
+		});
+		ensure(outcome != 2);
+		spu_native_record(1, outcome ? 1 : 2);
+		return outcome;
+	}
+	u32 spu_native_07170(u8* context, u8* local_store, u32 pc)
+	{
+		auto* spu = reinterpret_cast<spu_thread*>(context);
+		if (!spu_native_entry_supported(spu, local_store, 2)) return 0;
+		// Read-only sparse sampling selects performance only. Each fast body
+		// still proves its actual loaded operands and carried fixed point.
+		if (!rpcs3::experimental_07170::eligible(context, local_store, pc))
+		{
+			spu_native_record(2, 2);
+			return 0;
+		}
+		const unsigned outcome = rpcs3::experimental_07170::run<rpcs3::experimental_07170::Ops>(context, local_store, pc, [spu](u32 checkpoint_pc, bool unsafe)
+		{
+			if (spu->state) [[unlikely]] spu_native_check_state(spu, checkpoint_pc, unsafe, 2);
+			return false;
+		});
+		ensure(outcome == 1); // Entry was admitted; later checks resume or escape.
+		spu_native_record(2, 1);
+#ifdef __linux__
+		if(g_spu_07170_contribution_trace) kernel_07170_trace::leave(spu,spu->pc,kernel_07170_trace::native);
+#endif
+		return outcome;
+	}
+
+#endif
+
+	// Separate all four pipelines so no experiment reuses another's objects.
+	const char* const g_spu_pipeline_cache_suffix = g_spu_gvn_experiment
+		? (g_spu_instcombine_experiment ? "-instcombine-gvn-v1.obj" : "-gvn-v1.obj")
+		: (g_spu_instcombine_experiment ? "-instcombine-v1.obj" : ".obj");
+
+	// Opt-in compile-time inspection; accepts the full or short block hash.
+	const std::string g_spu_dump_ir_hash = []
+	{
+		const char* value = std::getenv("RPCS3_EXPERIMENT_SPU_DUMP_IR_HASH");
+		return value ? std::string(value) : std::string{};
+	}();
+
+	// Empty/unset directory emits no capture instructions into any JIT block.
+	const std::string g_spu_capture_directory = []
+	{
+		const char* value = std::getenv("RPCS3_EXPERIMENT_SPU_CAPTURE_DIR");
+		return value ? std::string(value) : std::string{};
+	}();
+
+	const std::string g_spu_capture_hash = []
+	{
+		const char* value = std::getenv("RPCS3_EXPERIMENT_SPU_CAPTURE_HASH");
+		return value && *value ? std::string(value) : std::string("pNvKT3Vevf0");
+	}();
+
+	// Cached JIT objects contain a target-specific capture call. A changed
+	// capture selector must never reuse the previous target's instrumented
+	// object; digest arbitrary selector text so filenames remain safe.
+	const std::string g_spu_capture_cache_suffix = []
+	{
+		if (g_spu_capture_directory.empty()) return std::string{};
+		sha1_context context;
+		u8 digest[20];
+		sha1_starts(&context);
+		sha1_update(&context, reinterpret_cast<const u8*>(g_spu_capture_hash.data()), g_spu_capture_hash.size());
+		sha1_finish(&context, digest);
+		return fmt::format("-capture-v2-%s", fmt::base57(digest));
+	}();
+
+	void spu_capture_hot_entry(u8* context, u8* local_store, u32 runtime_pc)
+	{
+		static std::atomic<bool> taken{false};
+		if (taken.exchange(true, std::memory_order_relaxed))
+		{
+			return;
+		}
+
+		// Called by this SPU before its entry chunk loads any guest GPRs.
+		// GPRs belong to this executing thread; LS may still receive pending DMA.
+		const auto* spu = reinterpret_cast<const spu_thread*>(context);
+		const std::array<u32, 4> header{runtime_pc, spu->pc, spu->mfc_size, SPU_LS_SIZE};
+		std::string snapshot("RPCS3SPU", 8);
+		snapshot.append(reinterpret_cast<const char*>(header.data()), sizeof(header));
+		snapshot.append(reinterpret_cast<const char*>(spu->gpr.data()), sizeof(spu->gpr));
+		snapshot.append(reinterpret_cast<const char*>(local_store), SPU_LS_SIZE);
+
+		const std::string path = g_spu_capture_directory + "/selected-spu-entry.bin";
+		if (!fs::create_path(g_spu_capture_directory) || !fs::write_file(path, fs::rewrite, snapshot))
+		{
+			spu_log.error("Failed to write one-shot selected SPU entry capture to %s", path);
+		}
+		else
+		{
+			spu_log.notice("Captured selected SPU entry to %s (runtime PC=0x%x, context PC=0x%x, pending MFC=%u)", path, runtime_pc, spu->pc, spu->mfc_size);
+		}
+	}
+}
 
 #ifdef ARCH_ARM64
 #include "Emu/CPU/Backends/AArch64/AArch64JIT.h"
@@ -135,6 +710,10 @@ class spu_llvm_recompiler : public spu_recompiler_base, public cpu_translator
 
 	// Function for check_state execution
 	llvm::Function* m_test_state{};
+	bool m_trace_08ae8{};
+	bool m_trace_07170{};
+	bool m_trace_04ac8{};
+	bool m_trace_06c30{},m_trace_06c30_return{};
 
 	// Chunk for external tail call (dispatch)
 	llvm::Function* m_dispatch{};
@@ -1601,6 +2180,14 @@ public:
 		// Initialize if necessary
 		if (!m_spurt)
 		{
+			if (g_spu_instcombine_experiment)
+			{
+				spu_log.notice("SPU InstCombine experiment enabled (object cache suffix: %s)", g_spu_pipeline_cache_suffix);
+			}
+			if (g_spu_gvn_experiment)
+			{
+				spu_log.notice("SPU GVN experiment enabled (GVN + InstCombine after LICM; object cache suffix: %s)", g_spu_pipeline_cache_suffix);
+			}
 			m_spurt = &g_fxo->get<spu_runtime>();
 			cpu_translator::initialize(m_jit.get_context(), m_jit.get_engine());
 
@@ -1733,6 +2320,25 @@ public:
 		m_pos = func.lower_bound;
 		m_base = func.entry_point;
 		m_size = ::size32(func.data) * 4;
+		// Full code hash/shape, not PC alone; capture identified exactly this
+		// one no-call kernel. All other programs remain uninstrumented.
+		m_trace_08ae8 = g_spu_08ae8_contribution_trace && g_cfg.core.spu_verification
+			&& func.entry_point == 0x8ae8 && func.lower_bound == func.entry_point
+			&& m_size == 245 * 4
+			&& m_hash.find("MJWapFghqTHRnPJR2AbsEtUhS1eQ") != std::string::npos;
+		m_trace_07170=g_spu_07170_contribution_trace && g_cfg.core.spu_verification
+			&& func.entry_point==0x7170 && func.lower_bound==func.entry_point
+			&& m_size==181*4 && m_hash.find("1w2kWCRvCLNHuz4N9YkYe5TQ7CEK")!=std::string::npos;
+		m_trace_06c30=g_spu_06c30_contribution_trace && g_cfg.core.spu_verification
+			&& func.entry_point==0x6c30 && func.lower_bound==func.entry_point
+			&& m_size==164*4 && m_hash.find("EGC0gjYw3PwftJbtb6hXj7Xby6m5")!=std::string::npos;
+		m_trace_06c30_return=g_spu_06c30_contribution_trace && g_cfg.core.spu_verification
+			&& func.entry_point==0x73d8 && func.lower_bound==func.entry_point
+			&& m_size==41*4 && m_hash.find("f2AUjHGQ9wP6X8pidPoSN4W1hhc0")!=std::string::npos;
+		m_trace_04ac8 = g_spu_04ac8_contribution_trace && g_cfg.core.spu_verification
+			&& func.entry_point == 0x4ac8 && func.lower_bound == func.entry_point
+			&& m_size == 472 * 4
+			&& m_hash.find("Hc9ev2Q8JGX0Fcwtuv18zKbed58C") != std::string::npos;
 		const u32 start = m_pos;
 		const u32 end = start + m_size;
 
@@ -1774,7 +2380,21 @@ public:
 		m_engine->clearAllGlobalMappings();
 
 		// Create LLVM module
-		std::unique_ptr<Module> _module = std::make_unique<Module>(m_hash + ".obj", m_context);
+		// Keep serialized LLVM objects distinct if debug object caching is enabled.
+		std::unique_ptr<Module> _module = std::make_unique<Module>(m_hash
+			+ g_spu_capture_cache_suffix
+			+ (m_trace_08ae8 ? "-trace-08ae8-wall-v1" : "")
+			+ (m_trace_07170 ? "-trace-07170-wall-v1" : "")
+			+ ((m_trace_06c30 || m_trace_06c30_return) ? "-trace-06c30-EGC0gjYw3PwftJbtb6hXj7Xby6m5-wall-v1" : "")
+			+ (g_spu_04ac8_contribution_trace ? "-trace-04ac8-Hc9ev2Q8JGX0Fcwtuv18zKbed58C-tree-v4" : "")
+			+ (g_spu_native_rwv_experiment ? "-native-rwv-v1" : "")
+			+ (g_spu_native_sxe_experiment ? "-native-sxe-v1" : "")
+			+ (g_spu_native_07170_experiment ? "-native-07170-zero-v1" : "")
+			+ (g_spu_rsqrte_lut_experiment ? "-rsqrte-lut-v1" : "")
+			+ (g_spu_gather_pack_experiment ? "-gather-pack-v1" : "")
+			+ (g_spu_gather_pack_experiment && g_spu_pack_thread_experiment ? "-pack-thread-v1" : "")
+			+ (g_spu_gather_pack_experiment && g_spu_pack_thread_experiment && g_spu_pack_cleanup_experiment ? "-pack-cleanup-v1" : "")
+			+ g_spu_pipeline_cache_suffix, m_context);
 		_module->setTargetTriple(Triple(jit_compiler::triple2()));
 		_module->setDataLayout(m_jit.get_engine().getTargetMachine()->createDataLayout());
 		m_module = _module.get();
@@ -2466,17 +3086,67 @@ public:
 
 		// Increase block counter with statistics
 		m_ir->SetInsertPoint(label_body);
+		if (!g_spu_capture_directory.empty()
+			&& (m_hash.find(g_spu_capture_hash) != std::string::npos
+				|| fmt::format("%s", fmt::base57(be_t<u64>{m_hash_start})) == g_spu_capture_hash))
+		{
+			// State and code checks passed; the entry chunk has not run yet.
+			call("spu_capture_hot_entry", &spu_capture_hot_entry, m_thread, m_lsptr, m_base_pc);
+		}
+		if(m_trace_06c30) call("spu_06c30_trace_enter",&spu_06c30_trace_enter,m_thread,m_base_pc);
+		if(m_trace_07170) call("spu_07170_trace_enter",&spu_07170_trace_enter,m_thread,m_base_pc);
+		if (m_trace_04ac8)
+			call("spu_04ac8_trace_enter", &spu_04ac8_trace_enter, m_thread, m_base_pc);
+		if (m_trace_08ae8)
+		{
+			// State/code verification passed; no entry-chunk register loads yet.
+			call("spu_08ae8_trace_enter", &spu_08ae8_trace_enter, m_thread, m_base_pc);
+		}
 		const auto pbcount = spu_ptr(&spu_thread::block_counter);
 		m_ir->CreateStore(m_ir->CreateAdd(m_ir->CreateLoad(get_type<u64>(), pbcount), m_ir->getInt64(check_iterations)), pbcount);
 
 		// Call the entry function chunk
 		const auto entry_chunk = add_function(m_pos);
-		const auto entry_call = m_ir->CreateCall(entry_chunk->chunk, {m_thread, m_lsptr, m_base_pc});
-		entry_call->setCallingConv(entry_chunk->chunk->getCallingConv());
 
 		const auto dispatcher = llvm::cast<llvm::Function>(m_module->getOrInsertFunction("spu_dispatcher", main_func->getType()).getCallee());
 		m_engine->updateGlobalMapping("spu_dispatcher", reinterpret_cast<u64>(spu_runtime::tr_all));
 		dispatcher->setCallingConv(main_func->getCallingConv());
+
+#ifdef ARCH_X64
+		// Context GPRs are coherent here: state/code verification passed and no
+		// entry-chunk SSA registers have been loaded. Hash + size + entry bounds
+		// identify exactly the independently lifted complete guest function.
+		const bool native_cpu = utils::has_avx512() && utils::has_fma3() && utils::has_ssse3()
+			&& utils::has_sse41() && spu_native_layout_supported();
+		const bool native_accuracy = g_cfg.core.spu_xfloat_accuracy == xfloat_accuracy::approximate;
+		// Profiling/debugging has per-chunk bookkeeping the complete helper
+		// intentionally does not synthesize. Preserve that path unchanged.
+		const bool native_config = !g_cfg.core.spu_debug && !g_cfg.core.spu_prof
+			&& !g_cfg.core.mfc_debug && !g_cfg.core.external_debugger;
+		const bool native_rwv = g_spu_native_rwv_experiment && m_hash.find("rwvzZbZuxH8A50sdtidEsxsLTgXz") != std::string::npos && m_size == 220 * 4;
+		const bool native_sxe = g_spu_native_sxe_experiment && m_hash.find("sxEbib2U46dUbi4wFFHCejQ5VqGq") != std::string::npos && m_size == 283 * 4;
+		const bool native_07170 = g_spu_native_07170_experiment && utils::has_avx2() && m_hash.find("1w2kWCRvCLNHuz4N9YkYe5TQ7CEK") != std::string::npos && m_size == 181 * 4;
+		if (native_cpu && native_accuracy && native_config && g_cfg.core.spu_verification && func.entry_point == func.lower_bound && (native_rwv || native_sxe || native_07170))
+		{
+			const auto handled = native_rwv
+				? call("spu_native_rwv", &spu_native_rwv, m_thread, m_lsptr, m_base_pc)
+				: native_sxe ? call("spu_native_sxe", &spu_native_sxe, m_thread, m_lsptr, m_base_pc)
+				: call("spu_native_07170", &spu_native_07170, m_thread, m_lsptr, m_base_pc);
+			const auto native_done = BasicBlock::Create(m_context, "native-completed", m_function);
+			const auto native_fallback = BasicBlock::Create(m_context, "native-fallback", m_function);
+			m_ir->CreateCondBr(m_ir->CreateICmpNE(handled, m_ir->getInt32(0)), native_done, native_fallback);
+			m_ir->SetInsertPoint(native_done);
+			// Helper committed the architectural return PC and modified GPRs.
+			// Use the exact stock generic dispatcher ABI, not an internal chunk ABI.
+			const auto next_native = m_ir->CreateCall(main_func->getFunctionType(), dispatcher, {m_thread, m_lsptr, m_ir->getInt64(0)});
+			next_native->setCallingConv(main_func->getCallingConv());
+			next_native->setTailCall();
+			m_ir->CreateRetVoid();
+			m_ir->SetInsertPoint(native_fallback);
+		}
+#endif
+		const auto entry_call = m_ir->CreateCall(entry_chunk->chunk, {m_thread, m_lsptr, m_base_pc});
+		entry_call->setCallingConv(entry_chunk->chunk->getCallingConv());
 
 		// Proceed to the next code
 		if (entry_chunk->chunk->getReturnType() != get_type<void>())
@@ -2493,10 +3163,15 @@ public:
 		m_ir->CreateRetVoid();
 
 		m_ir->SetInsertPoint(label_stop);
-		call("spu_escape", spu_runtime::g_escape, m_thread)->setTailCall();
+		if(m_trace_06c30 || m_trace_06c30_return) call("spu_06c30_trace_abort",&spu_06c30_trace_abort,m_thread);
+		if(m_trace_07170) call("spu_07170_trace_abort",&spu_07170_trace_abort,m_thread);
+		if (m_trace_08ae8) call("spu_08ae8_trace_abort", &spu_08ae8_trace_abort, m_thread);
+		call("spu_escape", (g_spu_04ac8_contribution_trace ? &spu_04ac8_tree_escape : spu_runtime::g_escape), m_thread)->setTailCall();
 		m_ir->CreateRetVoid();
 
 		m_ir->SetInsertPoint(label_diff);
+		if (g_spu_04ac8_contribution_trace)
+			call("spu_04ac8_tree_abort", &spu_04ac8_tree_abort, m_thread);
 
 		if (g_cfg.core.spu_verification)
 		{
@@ -2541,9 +3216,14 @@ public:
 		m_ir->SetInsertPoint(BasicBlock::Create(m_context, "", m_test_state));
 		const auto escape_yes = BasicBlock::Create(m_context, "", m_test_state);
 		const auto escape_no = BasicBlock::Create(m_context, "", m_test_state);
-		m_ir->CreateCondBr(call("spu_exec_check_state", &exec_check_state, m_test_state->getArg(0)), escape_yes, escape_no);
+		const auto checked_state = m_trace_07170
+			? call("spu_07170_trace_check_state",&spu_07170_trace_check_state,m_test_state->getArg(0))
+			: m_trace_08ae8
+			? call("spu_08ae8_trace_check_state", &spu_08ae8_trace_check_state, m_test_state->getArg(0))
+			: call("spu_exec_check_state", &exec_check_state, m_test_state->getArg(0));
+		m_ir->CreateCondBr(checked_state, escape_yes, escape_no);
 		m_ir->SetInsertPoint(escape_yes);
-		call("spu_escape", spu_runtime::g_escape, m_test_state->getArg(0));
+		call("spu_escape", (g_spu_04ac8_contribution_trace ? &spu_04ac8_tree_escape : spu_runtime::g_escape), m_test_state->getArg(0));
 		m_ir->CreateRetVoid();
 		m_ir->SetInsertPoint(escape_no);
 		m_ir->CreateRetVoid();
@@ -3858,10 +4538,34 @@ public:
 
 		FunctionPassManager fpm;
 		// Basic optimizations
+		if (g_spu_instcombine_experiment)
+		{
+			fpm.addPass(InstCombinePass());
+		}
 		fpm.addPass(EarlyCSEPass(true));
 		fpm.addPass(SimplifyCFGPass());
 		fpm.addPass(DSEPass());
 		fpm.addPass(createFunctionToLoopPassAdaptor(LICMPass(LICMOptions()), true));
+		if (g_spu_gvn_experiment)
+		{
+			// Preserve the existing floating-point flags and memory semantics.
+			fpm.addPass(GVNPass(GVNOptions().setScalarPRE(false).setLoadPRE(false)));
+			fpm.addPass(InstCombinePass());
+		}
+		if (g_spu_gather_pack_experiment && g_spu_pack_thread_experiment
+			&& fmt::format("%s", fmt::base57(be_t<u64>{m_hash_start})) == "pNvKT3Vevf0")
+		{
+			// Version the current iteration's packing region using its actual
+			// loaded-mask predicate. Do not hoist across the next mask reload.
+			// Bounded code duplication applies only to this opt-in hot module.
+			fpm.addPass(JumpThreadingPass(250));
+			if (g_spu_pack_cleanup_experiment)
+			{
+				fpm.addPass(GVNPass(GVNOptions().setScalarPRE(false).setLoadPRE(false)));
+				fpm.addPass(InstCombinePass());
+			}
+			fpm.addPass(SimplifyCFGPass());
+		}
 		fpm.addPass(ADCEPass());
 
 		for (auto& f : *m_module)
@@ -3921,6 +4625,25 @@ public:
 			}
 
 			fmt::throw_exception("Compilation failed");
+		}
+
+		if (!g_spu_dump_ir_hash.empty()
+			&& (m_hash.find(g_spu_dump_ir_hash) != std::string::npos
+				|| fmt::format("%s", fmt::base57(be_t<u64>{m_hash_start})) == g_spu_dump_ir_hash))
+		{
+			std::string selected_ir;
+			raw_string_ostream selected_out(selected_ir);
+			_module->print(selected_out, nullptr);
+			selected_out.flush();
+			const std::string dump_path = m_spurt->get_cache_path() + "selected-" + _module->getModuleIdentifier() + ".ll";
+			if (!fs::write_file(dump_path, fs::rewrite, selected_ir))
+			{
+				spu_log.error("Failed to write selected SPU IR to %s", dump_path);
+			}
+			else
+			{
+				spu_log.notice("Selected SPU IR written to %s", dump_path);
+			}
 		}
 
 #if defined(__APPLE__)
@@ -4323,7 +5046,7 @@ public:
 								const auto escape_no = BasicBlock::Create(m_context, "", f);
 								m_ir->CreateCondBr(call("spu_exec_check_state", &exec_check_state, m_thread), escape_yes, escape_no);
 								m_ir->SetInsertPoint(escape_yes);
-								call("spu_escape", spu_runtime::g_escape, m_thread);
+								call("spu_escape", (g_spu_04ac8_contribution_trace ? &spu_04ac8_tree_escape : spu_runtime::g_escape), m_thread);
 								m_ir->CreateBr(_next);
 								m_ir->SetInsertPoint(escape_no);
 								m_ir->CreateBr(_next);
@@ -4390,7 +5113,7 @@ public:
 							m_ir->CreateRetVoid();
 							m_ir->SetInsertPoint(_stop);
 							m_ir->CreateStore(m_interp_pc, spu_ptr(&spu_thread::pc));
-							call("spu_escape", spu_runtime::g_escape, m_thread)->setTailCall();
+							call("spu_escape", (g_spu_04ac8_contribution_trace ? &spu_04ac8_tree_escape : spu_runtime::g_escape), m_thread)->setTailCall();
 							m_ir->CreateRetVoid();
 						}
 					}
@@ -4475,7 +5198,7 @@ public:
 
 	static bool exec_check_state(spu_thread* _spu)
 	{
-		return _spu->check_state();
+		return spu_04ac8_tree_check_state(_spu);
 	}
 
 	template <spu_intrp_func_t F>
@@ -4525,13 +5248,13 @@ public:
 	{
 		if (!_spu->stop_and_signal(code) || _spu->state & cpu_flag::again)
 		{
-			spu_runtime::g_escape(_spu);
+			(g_spu_04ac8_contribution_trace ? &spu_04ac8_tree_escape : spu_runtime::g_escape)(_spu);
 		}
 
 		if (_spu->test_stopped())
 		{
 			_spu->pc += 4;
-			spu_runtime::g_escape(_spu);
+			(g_spu_04ac8_contribution_trace ? &spu_04ac8_tree_escape : spu_runtime::g_escape)(_spu);
 		}
 	}
 
@@ -4573,7 +5296,7 @@ public:
 
 		if (result < 0 || _spu->state & cpu_flag::again)
 		{
-			spu_runtime::g_escape(_spu);
+			(g_spu_04ac8_contribution_trace ? &spu_04ac8_tree_escape : spu_runtime::g_escape)(_spu);
 		}
 
 		static_cast<void>(_spu->test_stopped());
@@ -4745,7 +5468,14 @@ public:
 		{
 			update_pc();
 
-			if (g_cfg.savestate.compatible_mode)
+			// A thread that mostly waits for events would otherwise be unsavable almost all the time.
+			static const bool savable_event_wait = []
+			{
+				const char* option = std::getenv("RPCS3_SPU_SAVABLE_EVENT_WAIT");
+				return option && option[0] == '1' && !option[1];
+			}();
+
+			if (g_cfg.savestate.compatible_mode || savable_event_wait)
 			{
 				ensure_gpr_stores();
 			}
@@ -4756,7 +5486,7 @@ public:
 
 			res.value = call("spu_read_events", &exec_read_events, m_thread);
 
-			if (!g_cfg.savestate.compatible_mode)
+			if (!g_cfg.savestate.compatible_mode && !savable_event_wait)
 			{
 				m_ir->CreateStore(m_ir->getInt8(0), spu_ptr(&spu_thread::unsavable));
 			}
@@ -5011,7 +5741,7 @@ public:
 	{
 		if (!_spu->set_ch_value(ch, value) || _spu->state & cpu_flag::again)
 		{
-			spu_runtime::g_escape(_spu);
+			(g_spu_04ac8_contribution_trace ? &spu_04ac8_tree_escape : spu_runtime::g_escape)(_spu);
 		}
 
 		static_cast<void>(_spu->test_stopped());
@@ -7461,6 +8191,49 @@ public:
 
 	void SHUFB(spu_opcode_t op) //
 	{
+#ifdef ARCH_X64
+		// Selected inFamous 2 packing kernel, identified from a coherent runtime
+		// capture. Guard the actual loaded register value, never LS contents at
+		// function entry: later stores/DMA cannot invalidate this SSA-like value.
+		if (g_spu_gather_pack_experiment && m_block && !m_interp_magn && op.ra != op.rb
+			&& fmt::format("%s", fmt::base57(be_t<u64>{m_hash_start})) == "pNvKT3Vevf0")
+		{
+			const auto c = get_vr<u8[16]>(op.rc);
+			const auto a = get_vr<u8[16]>(op.ra);
+			const auto b = get_vr<u8[16]>(op.rb);
+			const auto expected = build<u8[16]>(0x1f, 0x1e, 0x1d, 0x1c, 0x17, 0x16, 0x15, 0x14,
+				0x0b, 0x0a, 0x09, 0x08, 0x03, 0x02, 0x01, 0x00).eval(m_ir);
+			const auto equal = m_ir->CreateICmpEQ(m_ir->CreateBitCast(c.value, m_ir->getInt128Ty()),
+				m_ir->CreateBitCast(expected, m_ir->getInt128Ty()));
+			const auto fast = llvm::BasicBlock::Create(m_context, "pack.profile", m_function);
+			const auto slow = llvm::BasicBlock::Create(m_context, "pack.generic", m_function);
+			const auto merge = llvm::BasicBlock::Create(m_context, "pack.result", m_function);
+			m_ir->CreateCondBr(equal, fast, slow, m_md_likely);
+
+			m_ir->SetInsertPoint(fast);
+			// Each pack chooses words [b0,b2,a1,a3]. Three such packs form
+			// the four-sample gather/transpose [sample3.w0,...,sample0.w3].
+			const auto packed = m_ir->CreateShuffleVector(bitcast<u32[4]>(b).eval(m_ir),
+				bitcast<u32[4]>(a).eval(m_ir), llvm::ArrayRef<int>({0, 2, 5, 7}));
+			m_ir->CreateBr(merge);
+
+			m_ir->SetInsertPoint(slow);
+			// Exact SHUFB fallback, including every encoded constant selector.
+			const auto index = eval(c ^ 0x0f);
+			const auto shuffled = eval(select_by_bit4(c, pshufb(a, index), pshufb(b, index)));
+			const auto constants = eval(select((c & 0xe0) == 0xc0, splat<u8[16]>(0xff),
+				select((c & 0xe0) == 0xe0, splat<u8[16]>(0x80), splat<u8[16]>(0))));
+			const auto generic = bitcast<u32[4]>(eval(shuffled | constants)).eval(m_ir);
+			m_ir->CreateBr(merge);
+
+			m_ir->SetInsertPoint(merge);
+			const auto result = m_ir->CreatePHI(get_type<u32[4]>(), 2);
+			result->addIncoming(packed, fast);
+			result->addIncoming(generic, slow);
+			set_reg_fixed(op.rt4, result);
+			return;
+		}
+#endif
 		if (match_vr<u8[16], u16[8], u32[4], u64[2]>(op.rc, [&](auto c, auto MP)
 		{
 			using VT = typename decltype(MP)::type;
@@ -8068,6 +8841,33 @@ public:
 		return {"spu_frsqest", {std::forward<T>(a)}};
 	}
 
+	value_t<u32[4]> lookup_frsqest_fraction(value_t<u32[4]> index)
+	{
+#ifdef ARCH_X64
+		if (g_spu_rsqrte_lut_experiment && m_use_avx512)
+		{
+			value_t<u32[16]> lut0, lut1, lut2, lut3;
+			lut0.value = llvm::ConstantDataVector::get(m_context, llvm::ArrayRef(spu_frsqest_fraction_lut, 16));
+			lut1.value = llvm::ConstantDataVector::get(m_context, llvm::ArrayRef(spu_frsqest_fraction_lut + 16, 16));
+			lut2.value = llvm::ConstantDataVector::get(m_context, llvm::ArrayRef(spu_frsqest_fraction_lut + 32, 16));
+			lut3.value = llvm::ConstantDataVector::get(m_context, llvm::ArrayRef(spu_frsqest_fraction_lut + 48, 16));
+
+			// VPERMI2D selects within 32 entries; bit 5 chooses the table half.
+			const auto lower = vperm2d128From512(lut0, index, lut1);
+			const auto upper = vperm2d128From512(lut2, index, lut3);
+			return eval(select(index < splat<u32[4]>(32), lower, upper));
+		}
+#endif
+		value_t<u32[4]> result = eval(splat<u32[4]>(0));
+		for (u32 i = 0; i < 4; i++)
+		{
+			const auto lane_index = eval(extract(index, i));
+			value_t<u32> fraction = load_const<u32>(m_spu_frsqest_fraction_lut, lane_index);
+			result = eval(insert(result, i, fraction));
+		}
+		return result;
+	}
+
 	void FRSQEST(spu_opcode_t op)
 	{
 		register_intrinsic("spu_frsqest", [&](llvm::CallInst* ci)
@@ -8081,14 +8881,7 @@ public:
 			const auto final_exponent = select(a_exponent == 0, splat<u32[4]>(0xFF << 23), r_exponent);
 
 			const auto a_fraction = (a >> splat<u32[4]>(18)) & splat<u32[4]>(0x3F);
-			value_t<u32[4]> final_fraction = eval(splat<u32[4]>(0));
-
-			for (u32 i = 0; i < 4; i++)
-			{
-				const auto eval_fraction = eval(extract(a_fraction, i));
-				value_t<u32> r_fraction = load_const<u32>(m_spu_frsqest_fraction_lut, eval_fraction);
-				final_fraction = eval(insert(final_fraction, i, r_fraction));
-			}
+			const auto final_fraction = lookup_frsqest_fraction(eval(a_fraction));
 
 			return bitcast<f32[4]>(final_fraction | final_exponent);
 		});
@@ -9117,14 +9910,7 @@ public:
 				const auto final_exponent = select(a_exponent == 0, splat<u32[4]>(0xFF << 23), r_exponent);
 
 				const auto a_fraction = (a >> splat<u32[4]>(18)) & splat<u32[4]>(0x3F);
-				value_t<u32[4]> final_fraction = eval(splat<u32[4]>(0));
-
-				for (u32 i = 0; i < 4; i++)
-				{
-					const auto eval_fraction = eval(extract(a_fraction, i));
-					value_t<u32> r_fraction = load_const<u32>(m_spu_frsqest_fraction_lut, eval_fraction);
-					final_fraction = eval(insert(final_fraction, i, r_fraction));
-				}
+				const auto final_fraction = lookup_frsqest_fraction(eval(a_fraction));
 
 				const auto b = final_fraction;
 
@@ -9733,11 +10519,25 @@ public:
 			ret = false;
 		}
 
+		const bool trace_06c30_return_site=m_trace_06c30_return
+			&& m_pos==m_base+0xa0 && op.opcode==0x35000000;
+		const bool trace_04ac8_return_site = g_spu_04ac8_contribution_trace
+			&& m_pos == 0x5000 && op.opcode == 0x35000000;
+
 		if (m_finfo && m_finfo->fn && op.opcode)
 		{
 			const auto cblock = m_ir->GetInsertBlock();
 			const auto result = llvm::BasicBlock::Create(m_context, "", m_function);
 			m_ir->SetInsertPoint(result);
+			if(trace_06c30_return_site)
+				call("spu_06c30_trace_abort",&spu_06c30_trace_abort,m_thread);
+			// Stock real-function ABI has no architectural commit in ret_function();
+			// it only materializes the host r3 SSA return. Generic path below commits PC.
+			if (trace_04ac8_return_site)
+				call("spu_04ac8_trace_return", &spu_04ac8_trace_return, m_thread, m_lsptr, get_pc(m_pos), addr.value);
+			if(m_trace_06c30 || m_trace_06c30_return) call("spu_06c30_trace_abort",&spu_06c30_trace_abort,m_thread);
+			if(m_trace_07170) call("spu_07170_trace_abort",&spu_07170_trace_abort,m_thread);
+			if (m_trace_08ae8) call("spu_08ae8_trace_abort", &spu_08ae8_trace_abort, m_thread);
 			ret_function();
 			m_ir->SetInsertPoint(cblock);
 			return result;
@@ -9773,6 +10573,32 @@ public:
 		}
 
 		m_ir->CreateStore(addr.value, spu_ptr(&spu_thread::pc));
+		// Final tail helper BI7478, after original terminalGPR+PCcommits.
+		// Runtime get_pc handles the stock PIC base; token+fullcode guards pair.
+		if(trace_06c30_return_site)
+			call("spu_06c30_trace_return",&spu_06c30_trace_return,m_thread,m_lsptr,get_pc(m_pos),addr.value);
+		if (trace_04ac8_return_site)
+			call("spu_04ac8_trace_return_generic", &spu_04ac8_trace_return_generic, m_thread, m_lsptr, get_pc(m_pos), addr.value);
+
+		// Exact181-word 07170 has one BI r0 at0x7440. Original terminal
+		// GPR stores and return-PC store dominate this completion hook.
+		if(m_trace_07170)
+		{
+			if(m_pos==m_base+0x2d0 && op.opcode==0x35000000)
+				call("spu_07170_trace_leave",&spu_07170_trace_leave,m_thread,addr.value);
+			else call("spu_07170_trace_abort",&spu_07170_trace_abort,m_thread);
+		}
+
+		// The selected SHA has one indirect exit: BI r0 at 0x8eb8. Previous
+		// basic-block GPR stores dominate this return block; close before any
+		// stack-mirror fast return or dispatcher tailcall. No body clocks.
+		if (m_trace_08ae8)
+		{
+			if (m_pos == m_base + 0x3d0 && op.opcode == 0x35000000)
+				call("spu_08ae8_trace_leave", &spu_08ae8_trace_leave, m_thread, addr.value);
+			else
+				call("spu_08ae8_trace_abort", &spu_08ae8_trace_abort, m_thread);
+		}
 
 		if (ret && g_cfg.core.spu_block_size >= spu_block_size_type::mega)
 		{
@@ -10445,6 +11271,11 @@ public:
 
 	void BRSL(spu_opcode_t op) //
 	{
+		const u32 light_target=spu_branch_target(m_pos,op.i16);
+		if(g_spu_04ac8_contribution_trace&&((m_pos==0x4f44&&light_target==0x8ae8)||(m_pos==0x51d8&&light_target==0x9048)))
+			call("spu_04ac8_pair_light_call",&spu_04ac8_pair_light_call,m_thread,get_pc(m_pos),get_pc(light_target));
+		if(g_spu_04ac8_contribution_trace&&m_pos==0x51f0&&light_target==0x7170)
+			call("spu_04ac8_pair_materialized",&spu_04ac8_pair_materialized,m_thread,get_pc(m_pos),get_pc(light_target),eval(extract(get_reg_fixed(5),3)).value,eval(extract(get_reg_fixed(6),3)).value);
 		set_link(op);
 
 		const u32 target = spu_branch_target(m_pos, op.i16);

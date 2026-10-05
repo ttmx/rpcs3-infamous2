@@ -2,6 +2,7 @@
 
 #include "util/types.hpp"
 #include "../Common/surface_store.h"
+#include "../Common/readback_shared_window.hpp"
 
 #include "VKFormats.h"
 #include "VKHelpers.h"
@@ -82,6 +83,13 @@ namespace vk
 		// Memory spilling support
 		std::unique_ptr<vk::buffer> m_spilled_mem;
 
+		// Diagnostic context exists only during a known upcoming blit initialization.
+		areai m_blit_coverage_rect{};
+		bool m_blit_coverage_active = false;
+		bool m_blit_integrity_reload = false;
+		bool m_blit_discard_allowed = false;
+		void record_blit_load_coverage(bool tiled);
+
 		// MSAA support:
 		// Get the linear resolve target bound to this surface. Initialize if none exists
 		vk::viewable_image* get_resolve_target_safe(vk::command_buffer& cmd);
@@ -94,7 +102,7 @@ namespace vk
 		// Default-initialize memory without loading
 		void clear_memory(vk::command_buffer& cmd, vk::image* surface);
 		// Load memory from cell and use to initialize the surface
-		void load_memory(vk::command_buffer& cmd);
+		void load_memory(vk::command_buffer& cmd, rsx::surface_access access);
 		// Generic - chooses whether to clear or load.
 		void initialize_memory(vk::command_buffer& cmd, rsx::surface_access access);
 
@@ -113,9 +121,33 @@ namespace vk
 		using drawable_surface_t::drawable_surface_t;
 
 		vk::viewable_image* get_surface(rsx::surface_access access_type) override;
+		rsx::frozen_resource_identity readback_window_resource_identity() const
+		{return {static_cast<const vk::viewable_image*>(this),memory.get(),rsx::frozen_handle_key(value)};}
+		const char* readback_window_deferred_copy_rejection() const
+		{
+			if(!value)return "readback_bound_reject_resident_value";
+			if(!memory)return "readback_bound_reject_resident_memory";
+			if(samples()!=1)return "readback_bound_reject_samples";
+			if(!old_contents.empty())return "readback_bound_reject_old_contents";
+			if(state_flags!=rsx::surface_state_flags::ready)return "readback_bound_reject_state_flags";
+			if(msaa_flags!=rsx::surface_state_flags::ready)return "readback_bound_reject_msaa_flags";
+			if(g_cfg.video.read_color_buffers)return "readback_bound_reject_read_color";
+			if(g_cfg.video.read_depth_buffer)return "readback_bound_reject_read_depth";
+			if(resolution_scaling_config.scale_percent!=100)return "readback_bound_reject_resolution_scale";
+			return "readback_bound_reject_predicate_changed";
+		}
+		bool readback_window_can_build_deferred_copy() const
+		{
+			return value && memory && samples()==1 && old_contents.empty() &&
+				state_flags==rsx::surface_state_flags::ready && msaa_flags==rsx::surface_state_flags::ready &&
+				!g_cfg.video.read_color_buffers && !g_cfg.video.read_depth_buffer &&
+				resolution_scaling_config.scale_percent==100;
+		}
 		bool is_depth_surface() const override;
 		bool matches_dimensions(u16 _width, u16 _height) const;
 		void reset_surface_counters();
+		void set_blit_coverage_context(const areai& rect, bool integrity_reload, bool discard_allowed);
+		void clear_blit_coverage_context();
 
 		image_view* get_view(const rsx::texture_channel_remap_t& remap,
 			VkImageAspectFlags mask = VK_IMAGE_ASPECT_COLOR_BIT | VK_IMAGE_ASPECT_DEPTH_BIT) override;

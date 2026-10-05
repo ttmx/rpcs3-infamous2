@@ -1,5 +1,6 @@
 #include "stdafx.h"
 #include "VKCommandStream.h"
+#include "../Common/readback_chain_diagnostics.hpp"
 #include "VKResourceManager.h"
 #include "vkutils/descriptors.h"
 #include "vkutils/sync.h"
@@ -28,7 +29,10 @@ namespace vk
 	static void queue_submit_impl(const queue_submit_t& submit_info)
 	{
 		ensure(submit_info.pfence);
+		rsx::readback_chain_trace::scope chain_lock("queue_submit_lock_wait");
+		chain_lock.packet(reinterpret_cast<std::uintptr_t>(submit_info.commands),submit_info.diagnostic_generation,submit_info.diagnostic_access);
 		acquire_global_submit_lock();
+		chain_lock.finish();
 		VkSubmitInfo info
 		{
 			.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
@@ -42,7 +46,17 @@ namespace vk
 			.pSignalSemaphores = submit_info.signal_semaphores.data()
 		};
 
+		rsx::readback_chain_trace::scope chain_driver("queue_submit_actual");
+		chain_driver.packet(reinterpret_cast<std::uintptr_t>(submit_info.commands),submit_info.diagnostic_generation,submit_info.diagnostic_access);
+		chain_driver.range(rsx::readback_chain_trace::handle_key(submit_info.queue),submit_info.wait_semaphores_count);
+		chain_driver.auxiliary(reinterpret_cast<std::uintptr_t>(submit_info.pfence),rsx::readback_chain_trace::handle_key(submit_info.pfence->handle));
+		if(chain_driver)
+		{
+		 for(u32 i=0;i<submit_info.wait_semaphores_count;++i){rsx::readback_chain_trace::scope s("queue_wait_semaphore");s.packet(reinterpret_cast<std::uintptr_t>(submit_info.commands),submit_info.diagnostic_generation,submit_info.diagnostic_access);s.auxiliary(rsx::readback_chain_trace::handle_key(submit_info.wait_semaphores[i]),submit_info.wait_stages[i]);}
+		 for(u32 i=0;i<submit_info.signal_semaphores_count;++i){rsx::readback_chain_trace::scope s("queue_signal_semaphore");s.packet(reinterpret_cast<std::uintptr_t>(submit_info.commands),submit_info.diagnostic_generation,submit_info.diagnostic_access);s.auxiliary(rsx::readback_chain_trace::handle_key(submit_info.signal_semaphores[i]));}
+		}
 		vkQueueSubmit(submit_info.queue, 1, &info, submit_info.pfence->handle);
+		chain_driver.finish();
 		release_global_submit_lock();
 
 		// Signal fence

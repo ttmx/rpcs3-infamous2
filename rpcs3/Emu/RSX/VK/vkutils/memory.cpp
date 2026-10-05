@@ -1,5 +1,11 @@
 #include "device.h"
 #include "memory.h"
+#include "../../Common/readback_chain_diagnostics.hpp"
+#include "../VKUploadDiagnostics.hpp"
+#include "../VKVertexShadowProbe.hpp"
+#include "../VKVertexBatchReuse.hpp"
+#include "../VKRTTBackgroundProbe.hpp"
+#include "../VKReadbackCopy.hpp"
 
 #include "Emu/RSX/Utils/algorithm.hpp"
 #include "Emu/system_config.h"
@@ -249,6 +255,7 @@ namespace vk
 			const auto [status, type] = do_vma_alloc();
 			if (status == VK_SUCCESS)
 			{
+				if (request.diagnostic_selected_type) *request.diagnostic_selected_type = type;
 				vmm_notify_memory_allocated(vma_alloc, type, request.size, request.pool);
 				return vma_alloc;
 			}
@@ -265,6 +272,7 @@ namespace vk
 				if (status == VK_SUCCESS)
 				{
 					rsx_log.warning("Renderer ran out of video memory but successfully recovered.");
+					if (request.diagnostic_selected_type) *request.diagnostic_selected_type = type;
 					vmm_notify_memory_allocated(vma_alloc, type, request.size, request.pool);
 					return vma_alloc;
 				}
@@ -385,6 +393,7 @@ namespace vk
 			const auto [status, type] = do_vk_alloc();
 			if (status == VK_SUCCESS)
 			{
+				if (request.diagnostic_selected_type) *request.diagnostic_selected_type = type;
 				vmm_notify_memory_allocated(memory, type, request.size, request.pool);
 				return memory;
 			}
@@ -401,6 +410,7 @@ namespace vk
 				if (status == VK_SUCCESS)
 				{
 					rsx_log.warning("Renderer ran out of video memory but successfully recovered.");
+					if (request.diagnostic_selected_type) *request.diagnostic_selected_type = type;
 					vmm_notify_memory_allocated(memory, type, request.size, request.pool);
 					return memory;
 				}
@@ -458,7 +468,9 @@ namespace vk
 		: m_device(dev), m_size(alloc_request.size)
 	{
 		m_mem_allocator = get_current_mem_allocator();
-		m_mem_handle    = m_mem_allocator->alloc(alloc_request);
+		auto request = alloc_request;
+		if (upload_diagnostics::enabled() || vertex_shadow_probe::enabled() || vertex_batch_reuse::enabled() || rtt_background_probe::enabled() || rsx::readback_chain_trace::configured || readback_copy::enabled()) request.diagnostic_selected_type = &m_diagnostic_memory_type;
+		m_mem_handle = m_mem_allocator->alloc(request);
 	}
 
 	memory_block::~memory_block()

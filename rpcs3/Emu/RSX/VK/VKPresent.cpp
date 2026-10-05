@@ -1,5 +1,9 @@
+#include "vkutils/descriptor_reuse.h"
+#include "VKLiveCtl.hpp"
 #include "stdafx.h"
 #include "VKGSRender.h"
+#include "VKPassTiming.hpp"
+#include "VKFrameIntervalTrace.hpp"
 #include "vkutils/buffer_object.h"
 #include "vkutils/memory.h"
 #include "Emu/RSX/Overlays/overlay_manager.h"
@@ -49,9 +53,10 @@ bool VKGSRender::reinitialize_swapchain()
 	}
 
 	// NOTE: This operation will create a hard sync point
-	close_and_submit_command_buffer();
+	close_and_submit_command_buffer(nullptr, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, "swapchain_reinitialize");
 	m_current_command_buffer->reset();
 	m_current_command_buffer->begin();
+	diagnostic_command_begin();
 
 	for (auto &ctx : m_frame_context_storage)
 	{
@@ -134,11 +139,12 @@ bool VKGSRender::reinitialize_swapchain()
 	vk::fence resize_fence(*m_device);
 
 	// Flush the command buffer
-	close_and_submit_command_buffer(&resize_fence);
+	close_and_submit_command_buffer(&resize_fence, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, "swapchain_resize");
 	vk::wait_for_fence(&resize_fence);
 
 	m_current_command_buffer->reset();
 	m_current_command_buffer->begin();
+	diagnostic_command_begin();
 
 	swapchain_unavailable = false;
 	should_reinitialize_swapchain = false;
@@ -155,7 +161,9 @@ void VKGSRender::present(vk::frame_context_t *ctx)
 
 	if (!swapchain_unavailable)
 	{
-		switch (VkResult error = m_swapchain->present(ctx->present_wait_semaphore, ctx->present_image))
+		const VkResult error = m_swapchain->present(ctx->present_wait_semaphore, ctx->present_image);
+		vk_frame_interval_trace::record_present(static_cast<int32_t>(error), ctx->present_image);
+		switch (error)
 		{
 		case VK_SUCCESS:
 			break;
@@ -195,10 +203,138 @@ void VKGSRender::advance_queued_frames()
 	// Texture cache is also double buffered to prevent use-after-free
 	m_texture_cache.on_frame_end();
 	m_samplers_dirty.store(true);
+	if (vk::live_ctl::get(11) && vk::get_current_frame_id() % 600 == 0)
+	{
+		rsx_log.notice("Pipeline reuse: %u clean reuses checked, %u mismatches, %u unchanged dirty states cleared (600 frames)",
+			m_pipeline_reuse_checked, m_pipeline_reuse_mismatches, m_pipeline_reuse_clears);
+		m_pipeline_reuse_checked = m_pipeline_reuse_mismatches = m_pipeline_reuse_clears = 0;
+	}
+
+	if (vk::live_ctl::get(12) && vk::get_current_frame_id() % 600 == 0)
+	{
+		namespace r = vk::descriptor_reuse;
+		rsx_log.notice("Descriptor sets: per frame: %.0f reused, %.0f written, %.1f not keyed, %.1f written the regular way; destroyed per frame: %.1f views, %.1f samplers; "
+			"%.1f entries dropped for them in %.1f passes; %u reuse pools retired in the interval",
+			r::hits / 600., r::misses / 600., r::unkeyed / 600., r::fallbacks / 600., r::retired_views.exchange(0) / 600., r::retired_samplers.exchange(0) / 600.,
+			r::dropped / 600., r::syncs / 600., static_cast<u32>(r::pools_retired));
+		r::hits = r::misses = r::unkeyed = r::syncs = r::dropped = r::pools_retired = r::fallbacks = 0;
+	}
+
+	if (vk::live_ctl::get(10) && vk::get_current_frame_id() % 600 == 0)
+	{
+		auto& b = m_material_bindings;
+		rsx_log.notice("Material bindings: %u lookups, %u hits, %u checked, %u mismatches, %u invalidations (600 frames); generation changes: texture cache %u, section release %u, surface cache %u (new surface pages %u, %u pages marked); stores %u, sharing pages with a surface %u",
+			b.lookups, b.hits, b.checked, b.mismatches, b.invalidations, b.changed[0], b.changed[1], b.changed[2], b.new_surface_pages, b.surface_page_count(), b.stores, b.surface_dependent_stores);
+		b.new_surface_pages = b.stores = b.surface_dependent_stores = 0;
+		b.lookups = b.hits = b.checked = b.mismatches = b.invalidations = 0;
+		b.changed[0] = b.changed[1] = b.changed[2] = 0;
+	}
 
 	vk::remove_unused_framebuffers();
 
 	m_vertex_cache->purge();
+
+	m_multiblock_vertex_cache.end_frame(vk::live_ctl::get(2) == 3);
+
+	if (vk::pass_timing::enabled())
+	{
+		if (const auto report = vk::pass_timing::frame(vk::get_current_frame_id()); !report.empty())
+		{
+			rsx_log.notice("Pass timing per frame:%s", report);
+		}
+	}
+
+	if (vk::live_ctl::get(9) == 3)
+	{
+		auto& v = m_fast_draw_verify;
+		const u32 frame = static_cast<u32>(vk::get_current_frame_id());
+
+		if (frame - m_fast_draw.report_frame >= 600)
+		{
+			rsx_log.notice("Fast draw check: %.0f qualifying draws per frame checked; mismatches by kind: %u %u %u %u %u %u %u %u",
+				v.checked / f64(frame - m_fast_draw.report_frame), static_cast<u32>(v.mismatches[0]), static_cast<u32>(v.mismatches[1]), static_cast<u32>(v.mismatches[2]),
+				static_cast<u32>(v.mismatches[3]), static_cast<u32>(v.mismatches[4]), static_cast<u32>(v.mismatches[5]), static_cast<u32>(v.mismatches[6]), static_cast<u32>(v.mismatches[7]));
+			v.checked = 0;
+			std::memset(v.mismatches, 0, sizeof(v.mismatches));
+			m_fast_draw.report_frame = frame;
+		}
+	}
+
+	if (fast_draw_enabled())
+	{
+		auto& fast = m_fast_draw;
+		const u32 frame = static_cast<u32>(vk::get_current_frame_id());
+
+		if (frame - fast.report_frame >= 600)
+		{
+			const f64 frames = frame - fast.report_frame;
+			std::string stops, blockers;
+			for (u32 i = 0; i < 16; i++)
+			{
+				if (i < 12 && fast.stops[i]) fmt::append(stops, " %u:%.0f", i, fast.stops[i] / frames);
+				if (fast.not_armed[i]) fmt::append(blockers, " %u:%.0f", i, fast.not_armed[i] / frames);
+			}
+
+			rsx_log.notice("Fast draws: per frame: %.0f draws in %.0f runs, %.1f sent to the complete path; run ends by reason:%s; blocked by reason:%s (state bits 0x%x)",
+				fast.draws / frames, fast.batches / frames, fast.fallbacks / frames, stops, blockers, fast.blocking_state_bits);
+			rsx_log.notice("Fast draws: per frame: %.0f with textures set up again, %.1f of those needed another shader variant, %.0f depth bias updates, %.0f semaphore releases, %.0f jumps/calls/returns; "
+				"program checks in the interval: %u, mismatches %u",
+				fast.texture_rebinds / frames, fast.texture_program_changes / frames, fast.depth_bias_updates / frames, fast.semaphores / frames, fast.flow_commands / frames,
+				static_cast<u32>(fast.texture_checks), static_cast<u32>(fast.texture_check_mismatches));
+
+			if (m_fast_draw_stop_methods)
+			{
+				// The methods that ended most runs
+				std::string methods;
+				for (u32 n = 0; n < 12; n++)
+				{
+					u32 best = 0;
+					for (u32 reg = 1; reg < 0x4000; reg++)
+					{
+						if (m_fast_draw_stop_methods[reg] > m_fast_draw_stop_methods[best]) best = reg;
+					}
+
+					if (!m_fast_draw_stop_methods[best]) break;
+					fmt::append(methods, " 0x%x:%.0f", best * 4, m_fast_draw_stop_methods[best] / frames);
+					m_fast_draw_stop_methods[best] = 0;
+				}
+
+				std::memset(m_fast_draw_stop_methods.get(), 0, 0x4000 * sizeof(u32));
+				rsx_log.notice("Fast draws: runs ended per frame by method:%s", methods);
+			}
+
+			fast = {};
+			fast.report_frame = frame;
+		}
+	}
+
+	m_geometry_cache.sequence.end_frame();
+
+	if (vk::geometry_cache::mode())
+	{
+		// Periodic report (per-frame averages over the interval)
+		auto& cache = m_geometry_cache;
+		const u32 frame = static_cast<u32>(vk::get_current_frame_id());
+
+		if (frame - cache.report_frame >= 600)
+		{
+			const auto& st = cache.stats;
+			auto& watch = rsx::write_watch::state();
+			const f64 frames = frame - cache.report_frame;
+			rsx_log.notice("Geometry cache: per frame: vertex %.0f requests, %.0f static, %.0f same-frame, %.1f promoted, %.1f invalidated; "
+				"index %.0f requests, %.0f static, %.1f promoted, %.1f invalidated; %.2f MB reused; "
+				"scans %.1f (%.0f us), %.0f written pages; watched %u MB, heaps %u/%u MB, %u resets, lost chunks %u, %u blocks set dynamic; checks %u, mismatches %u",
+				st.vertex_requests / frames, st.vertex_static_hits / frames, st.vertex_ring_hits / frames, st.vertex_promotions / frames, st.vertex_invalidations / frames,
+				st.index_requests / frames, st.index_static_hits / frames, st.index_promotions / frames, st.index_invalidations / frames,
+				st.bytes_reused / frames / 1048576., watch.scans / frames, watch.scan_ns / frames / 1000., watch.written_pages / frames,
+				watch.watched_chunks, cache.vertex_heap.used >> 20, cache.index_heap.used >> 20, static_cast<u32>(st.heap_resets), static_cast<u32>(watch.lost_chunks), static_cast<u32>(st.dynamic_blocks),
+				static_cast<u32>(st.verify_checks), static_cast<u32>(st.verify_mismatches));
+
+			cache.stats = {};
+			watch.scans = watch.scan_ns = watch.written_pages = watch.lost_chunks = 0;
+			cache.report_frame = frame;
+		}
+	}
 	m_current_frame->tag_frame_end();
 
 	m_queued_frames.push_back(m_current_frame);
@@ -213,29 +349,64 @@ void VKGSRender::advance_queued_frames()
 
 void VKGSRender::queue_swap_request()
 {
+	// Live control for experiments: re-read the control file about once a second.
+	if (static const char* ctl = std::getenv("RPCS3_VK_LIVE_CTL"); ctl)
+	{
+		static u64 last_poll_us = 0;
+		if (const u64 now = get_system_time(); now - last_poll_us > 1'000'000)
+		{
+			last_poll_us = now;
+			if (FILE* f = std::fopen(ctl, "r"))
+			{
+				unsigned long long value = 0;
+				for (u32 i = 0; i < 16 && std::fscanf(f, "%llu", &value) == 1; i++)
+				{
+					if (vk::live_ctl::values[i].exchange(value) != value)
+					{
+						rsx_log.notice("Live control %u set to %u", i, value);
+					}
+				}
+				std::fclose(f);
+				m_periodic_submit_us = vk::live_ctl::get(0);
+			}
+		}
+	}
+
+	// The completed flip is the exact budget boundary used by GPU diagnostics.
+	if (m_draw_prefix_submit_enabled)
+	{
+		m_draw_prefix_armed = false;
+		m_draw_prefix_submitted = false;
+		m_draw_prefix_begin_us = 0;
+		m_draw_prefix_draws = 0;
+	}
+
 	ensure(!m_current_frame->swap_command_buffer);
 	m_current_frame->swap_command_buffer = m_current_command_buffer;
 
 	if (m_swapchain->is_headless())
 	{
 		m_swapchain->end_frame(*m_current_command_buffer, m_current_frame->present_image);
-		close_and_submit_command_buffer();
+		close_and_submit_command_buffer(nullptr, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, "queue_swap_headless");
 	}
 	else
 	{
 		close_and_submit_command_buffer(nullptr,
 			m_current_frame->acquire_signal_semaphore,
 			m_current_frame->present_wait_semaphore,
-			VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT);
+			VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, "queue_swap_present");
 	}
 
 	// Set up a present request for this frame as well
-	present(m_current_frame);
+	{ vk_frame_interval_trace::PresentBinding trace_binding; present(m_current_frame); }
+
+	diagnostic_frame_end();
 
 	// Grab next cb in line and make it usable
 	m_current_command_buffer = m_primary_cb_list.next();
 	m_current_command_buffer->reset();
 	m_current_command_buffer->begin();
+	diagnostic_command_begin();
 
 	// Set up new pointers for the next frame
 	advance_queued_frames();
@@ -385,7 +556,7 @@ vk::viewable_image* VKGSRender::get_present_source(/* inout */ vk::present_surfa
 		if (m_current_command_buffer->flags & vk::command_buffer::cb_has_dma_transfer)
 		{
 			// Submit for processing to lower hard fault penalty
-			flush_command_queue();
+			flush_command_queue(false, false, "present_source_dma");
 		}
 
 		m_texture_cache.invalidate_range(*m_current_command_buffer, range, rsx::invalidation_cause::read);
@@ -424,6 +595,7 @@ vk::viewable_image* VKGSRender::get_present_source(/* inout */ vk::present_surfa
 
 void VKGSRender::flip(const rsx::display_flip_info_t& info)
 {
+	vk_frame_interval_trace::Scope interval_trace(info.emu_flip, info.skip_frame, info.buffer);
 	// Check swapchain condition/status
 	if (!m_swapchain->supports_automatic_wm_reports())
 	{
@@ -456,6 +628,7 @@ void VKGSRender::flip(const rsx::display_flip_info_t& info)
 			{
 				m_frame->flip(m_context);
 				rsx::thread::flip(info);
+				interval_trace.complete(swapchain_unavailable, 2);
 				return;
 			}
 
@@ -499,13 +672,14 @@ void VKGSRender::flip(const rsx::display_flip_info_t& info)
 
 			// Perform a mini-flip here without invoking present code
 			m_current_frame->swap_command_buffer = m_current_command_buffer;
-			flush_command_queue(true);
+			flush_command_queue(true, false, "flip_swapchain_unavailable");
 			vk::advance_frame_counter();
 			frame_context_cleanup(m_current_frame);
 		}
 
 		m_frame->flip(m_context);
 		rsx::thread::flip(info);
+		interval_trace.complete(swapchain_unavailable, 1);
 		return;
 	}
 
@@ -752,7 +926,7 @@ void VKGSRender::flip(const rsx::display_flip_info_t& info)
 		vk::copy_image_to_buffer(*m_current_command_buffer, image_to_copy, &sshot_vkbuf, copy_info);
 		image_to_copy->pop_layout(*m_current_command_buffer);
 
-		flush_command_queue(true);
+		flush_command_queue(true, false, "flip_screenshot_readback");
 		const auto src = sshot_vkbuf.map(0, sshot_size);
 		std::vector<u8> sshot_frame(sshot_size);
 		memcpy(sshot_frame.data(), src, sshot_size);
@@ -978,6 +1152,7 @@ void VKGSRender::flip(const rsx::display_flip_info_t& info)
 
 	m_frame->flip(m_context);
 	rsx::thread::flip(info);
+	interval_trace.complete(swapchain_unavailable, 0);
 
 	// Data sync
 	const rsx::surface_scaling_config_t active_res_scaling_config =
@@ -992,7 +1167,7 @@ void VKGSRender::flip(const rsx::display_flip_info_t& info)
 		if (const auto severity = vk::vmm_determine_memory_load_severity();
 			severity > rsx::problem_severity::low && m_rtts.handle_memory_pressure(*m_current_command_buffer, severity))
 		{
-			flush_command_queue(true);
+			flush_command_queue(true, false, "flip_rescale_memory_pressure_before");
 		}
 
 		// Then apply the change
@@ -1003,7 +1178,7 @@ void VKGSRender::flip(const rsx::display_flip_info_t& info)
 		if (const auto severity = vk::vmm_determine_memory_load_severity();
 			severity > rsx::problem_severity::low && m_rtts.handle_memory_pressure(*m_current_command_buffer, severity))
 		{
-			flush_command_queue(true);
+			flush_command_queue(true, false, "flip_rescale_memory_pressure_after");
 		}
 	}
 }

@@ -1638,7 +1638,7 @@ extern bool try_lock_spu_threads_in_a_state_compatible_with_savestates(bool reve
 	};
 
 	// Attempt to lock for a second, if somehow takes longer abort it
-	for (u64 start = 0, passed_count = 0; passed_count < 15;)
+	for (u64 start = 0, passed_count = 0; passed_count < 60;)
 	{
 		if (revert_lock)
 		{
@@ -1730,6 +1730,7 @@ extern bool try_lock_spu_threads_in_a_state_compatible_with_savestates(bool reve
 		{
 			if (Emu.IsPaused())
 			{
+				sys_log.error("Savestate SPU lock: emulation is paused and an SPU thread is not in a savable state");
 				return false;
 			}
 
@@ -1754,6 +1755,14 @@ extern bool try_lock_spu_threads_in_a_state_compatible_with_savestates(bool reve
 		}
 
 		return true;
+	}
+
+	if (!revert_lock)
+	{
+		for (auto& spu : *get_spus(true, true))
+		{
+			sys_log.error("Savestate SPU lock gave up: %s pc=0x%x unsavable=%d current_func=%s", spu->get_name(), spu->pc, +spu->unsavable, spu->current_func ? spu->current_func : "-");
+		}
 	}
 
 	for (auto& spu : *get_spus(true, true))

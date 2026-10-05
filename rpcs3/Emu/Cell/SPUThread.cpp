@@ -1,3 +1,4 @@
+#include "Emu/RSX/VK/VKLiveCtl.hpp"
 #include "stdafx.h"
 #include "Utilities/JIT.h"
 #include "Utilities/date_time.h"
@@ -20,12 +21,21 @@
 #include "Emu/Cell/SPUDisAsm.h"
 #include "Emu/Cell/SPUAnalyser.h"
 #include "Emu/Cell/SPUThread.h"
+#include "Emu/Cell/SPUDmaListTrace.hpp"
+#include "Emu/RSX/Common/RSXTailDemandTrace.hpp"
 #include "Emu/Cell/SPURecompiler.h"
 #include "Emu/Cell/timers.hpp"
 
 #include "Emu/RSX/Core/RSXReservationLock.hpp"
 
+#include <map>
+#include <mutex>
+#include <tuple>
 #include <cmath>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <mutex>
 #include <cfenv>
 #include <thread>
 #include <shared_mutex>
@@ -1824,6 +1834,7 @@ spu_thread::spu_thread(lv2_spu_group* group, u32 index, std::string_view name, u
 	, lv2_id(lv2_id)
 	, spu_tname(make_single<std::string>(name))
 {
+	spu_dma_list_trace::bootstrap_from_environment();
 	init_spu_decoder();
 
 	if (g_cfg.core.mfc_debug)
@@ -1886,6 +1897,7 @@ spu_thread::spu_thread(utils::serial& ar, lv2_spu_group* group)
 	, lv2_id(ar)
 	, spu_tname(make_single<std::string>(ar.operator std::string()))
 {
+	spu_dma_list_trace::bootstrap_from_environment();
 	init_spu_decoder();
 
 	if (g_cfg.core.mfc_debug)
@@ -2037,11 +2049,408 @@ void spu_thread::push_snr(u32 number, u32 value)
 	});
 }
 
+namespace
+{
+	// Diagnostic only: helper-boundary PC is not necessarily the issuing WRCH.
+	// Inlined JIT DMA paths are intentionally outside this trace.
+	struct spu_dma_trace_sink
+	{
+		std::mutex mutex;
+		std::FILE* file = nullptr;
+		u32 rows = 0;
+		static constexpr u32 max_rows = 50000;
+
+		spu_dma_trace_sink()
+		{
+			if (const char* path = std::getenv("RPCS3_SPU_DMA_TRACE"); path && *path)
+			{
+				file = std::fopen(path, "w");
+				if (file)
+				{
+					std::fprintf(file, "cpu_begin_ns,cpu_end_ns,thread_id,spu_this,context_known,spu_id,spu_index,pc_begin,pc_end,block_hash,cmd,tag,eah,eal,lsa,size,mfc_size_begin,label\n");
+					std::fflush(file);
+				}
+			}
+		}
+
+		~spu_dma_trace_sink()
+		{
+			if (file)
+			{
+				std::fclose(file);
+			}
+		}
+	};
+
+	spu_dma_trace_sink& get_spu_dma_trace_sink()
+	{
+		static spu_dma_trace_sink sink;
+		return sink;
+	}
+
+	bool spu_dma_trace_enabled()
+	{
+		static const bool enabled = []
+		{
+			const char* path = std::getenv("RPCS3_SPU_DMA_TRACE");
+			return path && *path;
+		}();
+		return enabled;
+	}
+
+	u64 spu_dma_trace_now_ns()
+	{
+		return std::chrono::duration_cast<std::chrono::nanoseconds>(
+			std::chrono::steady_clock::now().time_since_epoch()).count();
+	}
+
+	struct scoped_spu_dma_trace
+	{
+		spu_dma_trace_sink* sink = nullptr;
+		spu_thread* context = nullptr;
+		std::uintptr_t identity = 0;
+		spu_mfc_cmd args{};
+		u64 begin = 0;
+		u64 tid = 0;
+		u64 hash = 0;
+		u32 id = 0;
+		u32 index = umax;
+		u32 pc = 0;
+		u32 mfc_size = 0;
+
+		scoped_spu_dma_trace(spu_thread* thread, const spu_mfc_cmd& command)
+		{
+			if (!spu_dma_trace_enabled())
+			{
+				return;
+			}
+
+			auto& output = get_spu_dma_trace_sink();
+			if (!output.file)
+			{
+				return;
+			}
+
+			sink = &output;
+			args = command;
+			identity = reinterpret_cast<std::uintptr_t>(thread);
+			tid = thread_ctrl::get_tid();
+			// Do not sample another thread's mutable PC/GPR-side state.
+			if (thread && cpu_thread::get_current() == thread)
+			{
+				context = thread;
+				id = thread->lv2_id;
+				index = thread->index;
+				pc = thread->pc;
+				hash = thread->block_hash;
+				mfc_size = thread->mfc_size;
+			}
+			begin = spu_dma_trace_now_ns();
+		}
+
+		~scoped_spu_dma_trace()
+		{
+			if (!sink)
+			{
+				return;
+			}
+
+			const u64 end = spu_dma_trace_now_ns();
+			if (end - begin < 10000)
+			{
+				return;
+			}
+
+			const u32 end_pc = context ? context->pc : 0;
+			std::lock_guard lock(sink->mutex);
+			if (sink->rows >= spu_dma_trace_sink::max_rows)
+			{
+				return;
+			}
+			std::fprintf(sink->file,
+				"%llu,%llu,%llu,%llu,%u,%u,%u,%u,%u,%llu,%u,%u,%u,%u,%u,%u,%u,slow_spu_dma\n",
+				static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end),
+				static_cast<unsigned long long>(tid), static_cast<unsigned long long>(identity),
+				context ? 1u : 0u, id, index, pc, end_pc, static_cast<unsigned long long>(hash),
+				static_cast<u32>(args.cmd), static_cast<u32>(args.tag), args.eah, args.eal,
+				args.lsa, static_cast<u32>(args.size), mfc_size);
+			if (++sink->rows % 128 == 0 || sink->rows == spu_dma_trace_sink::max_rows)
+			{
+				std::fflush(sink->file);
+			}
+		}
+	};
+}
+
+// Diagnostic only (RPCS3_SPU_BUFFER_ACCESS_DIAG=1): which SPU program transfers to or from the two
+// 1280x720 deferred-lighting buffers. A program is identified by a hash of its first code bytes in LS.
+namespace spu_buffer_access_diag
+{
+	static const bool s_enabled = []
+	{
+		const char* option = std::getenv("RPCS3_SPU_BUFFER_ACCESS_DIAG");
+		return option && (option[0] == '1' || option[0] == '2') && !option[1];
+	}();
+
+	struct stat_t
+	{
+		u64 count = 0;
+		u64 bytes = 0;
+		u32 pc = 0;
+		u32 min_offset = umax;
+		u32 max_offset = 0;
+	};
+
+	static std::mutex s_mutex;
+	static std::map<std::tuple<u32, u32, u32, u32>, stat_t> s_stats; // program hash, buffer, is_get, lsa page
+	static u64 s_total = 0;
+
+	// Mode 2 (RPCS3_SPU_BUFFER_ACCESS_DIAG=2): for the two lighting jobs, map every transfer by 64 KiB region
+	static const bool s_map_all = []
+	{
+		const char* option = std::getenv("RPCS3_SPU_BUFFER_ACCESS_DIAG");
+		return option && option[0] == '2' && !option[1];
+	}();
+
+	struct region_stat_t
+	{
+		u64 count = 0;
+		u64 bytes = 0;
+		u32 min_ea = umax;
+		u32 max_ea = 0;
+		u32 min_size = umax;
+		u32 max_size = 0;
+		u32 pc = 0;
+	};
+
+	static std::map<std::tuple<u32, u32, u32>, region_stat_t> s_regions; // program hash, kind, ea >> 16
+
+	static void observe_all(spu_thread* spu, const spu_mfc_cmd& args, const u8* ls, u32 kind)
+	{
+		u32 hash = 0x811c9dc5;
+		for (u32 i = 0x4040; i < 0x4140; i++)
+		{
+			hash = (hash ^ ls[i]) * 0x01000193;
+		}
+
+		if (hash != 0x01f9aa7f && hash != 0x8f2e59a2)
+		{
+			return;
+		}
+
+		std::lock_guard lock(s_mutex);
+
+		// Verbatim trace of a short steady-state window: the order of transfers shows the job's pipeline
+		static u64 s_ssao_seen = 0;
+		static const bool s_compact = std::getenv("RPCS3_SPU_SSAO_STAGE_TRACE") != nullptr;
+		bool ssao_window = hash == 0x8f2e59a2 && ++s_ssao_seen >= 60000 && s_ssao_seen < 60000 + 6000;
+
+		if (s_compact)
+		{
+			// Compact whole-frame view: kernel loads, and the first element of every list transfer
+			static u32 s_last_list_pc_lsa[2]{};
+			ssao_window = false;
+			if (hash == 0x8f2e59a2 && s_ssao_seen >= 200000 && s_ssao_seen < 200000 + 400000)
+			{
+				const bool kernel_load = args.eal >= 0x0087d500 && args.eal < 0x00880d90;
+				const bool new_list = kind <= 1 && (args.lsa & 0x3ffff) != s_last_list_pc_lsa[1] + s_last_list_pc_lsa[0];
+				if (kind <= 1) { s_last_list_pc_lsa[1] = args.lsa & 0x3ffff; s_last_list_pc_lsa[0] = (args.size + 15) & ~15u; }
+				ssao_window = kernel_load || new_list;
+			}
+		}
+
+		if (ssao_window)
+		{
+			spu_log.notice("Job IO seq: program=%08x thread=%s %s ea=0x%x size=%u lsa=0x%x pc=0x%x",
+				hash, spu ? spu->get_name() : "?", std::array<const char*, 4>{"PUT", "GET", "PUTLLUC", "PUTLLC"}[kind], args.eal, args.size, args.lsa & 0x3ffff, spu ? spu->pc : 0);
+		}
+
+		auto& stat = s_regions[{hash, kind, args.eal >> 16}];
+		stat.count++;
+		stat.bytes += args.size;
+		stat.min_ea = std::min<u32>(stat.min_ea, args.eal);
+		stat.max_ea = std::max<u32>(stat.max_ea, args.eal + args.size);
+		stat.min_size = std::min<u32>(stat.min_size, args.size);
+		stat.max_size = std::max<u32>(stat.max_size, args.size);
+		stat.pc = spu ? spu->pc : 0;
+
+		if (++s_total == 400000 || !(s_total % 4000000))
+		{
+			for (const auto& [key, value] : s_regions)
+			{
+				spu_log.notice("Job IO map: program=%08x %s region=0x%04x0000 ea=0x%x..0x%x size=%u..%u transfers=%u bytes=%u pc=0x%x",
+					std::get<0>(key), std::array<const char*, 4>{"PUT", "GET", "PUTLLUC", "PUTLLC"}[std::get<1>(key)], std::get<2>(key),
+					value.min_ea, value.max_ea, value.min_size, value.max_size, value.count, value.bytes, value.pc);
+			}
+		}
+	}
+
+	static void observe(spu_thread* spu, const spu_mfc_cmd& args, const u8* ls, u32 kind) // 0 PUT, 1 GET, 2 PUTLLUC, 3 PUTLLC
+	{
+		if (s_map_all)
+		{
+			observe_all(spu, args, ls, kind);
+			return;
+		}
+
+		constexpr u32 buffers[]{0x37400b80, 0x37784b80};
+		constexpr u32 length = 1280 * 720 * 4;
+
+		for (const u32 base : buffers)
+		{
+			if (args.eal + args.size <= base || args.eal >= base + length)
+			{
+				continue;
+			}
+
+			// FNV-1a over 256 bytes of code right after the usual job load address
+			u32 hash = 0x811c9dc5;
+			for (u32 i = 0x4040; i < 0x4140; i++)
+			{
+				hash = (hash ^ ls[i]) * 0x01000193;
+			}
+
+			std::lock_guard lock(s_mutex);
+			auto& stat = s_stats[{hash, base, kind, 0u}];
+			stat.count++;
+			stat.bytes += args.size;
+			stat.pc = spu ? spu->pc : 0;
+			stat.min_offset = std::min<u32>(stat.min_offset, args.eal > base ? args.eal - base : 0);
+			stat.max_offset = std::max<u32>(stat.max_offset, args.eal + args.size - base);
+
+			if (++s_total == 3000 || !(s_total % 50000))
+			{
+				for (const auto& [key, value] : s_stats)
+				{
+					spu_log.notice("Buffer access diag: program=%08x buffer=0x%x %s transfers=%u bytes=%u pc=0x%x offsets=0x%x..0x%x",
+						std::get<0>(key), std::get<1>(key), std::array<const char*, 4>{"PUT", "GET", "PUTLLUC", "PUTLLC"}[std::get<2>(key)], value.count, value.bytes, value.pc, value.min_offset, value.max_offset);
+				}
+			}
+		}
+	}
+}
+
+// Capture one frame of the tiled lighting job for offline study (RPCS3_SPU_LIGHT_CAPTURE_DIR): both G-buffers when the
+// last SSAO stage starts (lighting input), the SPU state at every lighting job start that follows (the job manager's
+// input list GET, first element 256 bytes at 0x00a93c80), and both buffers again when the next frame's SSAO begins
+// (lighting output). Use with the SPU interpreter so GPRs are exact.
+static void spu_light_capture(spu_thread* spu, bool kernel_load, u32 eal, u32 lsa, u32 size)
+{
+	static const char* light_dir = std::getenv("RPCS3_SPU_LIGHT_CAPTURE_DIR");
+	if (!light_dir || !spu) return;
+
+	static std::mutex s_mutex;
+	static u32 s_phase = 0, s_seen = 0, s_runs = 0, s_last_kernel = 0;
+	std::lock_guard lock(s_mutex);
+
+	const auto dump_regions = [&](const std::string& prefix, std::initializer_list<std::pair<u32, u32>> regions)
+	{
+		for (const auto& [ea, bytes] : regions)
+		{
+			fs::write_file(fmt::format("%s-mem-%08x.bin", prefix, ea), fs::rewrite, std::string(vm::get_super_ptr<const char>(ea), bytes));
+		}
+	};
+
+	if (kernel_load)
+	{
+		if (eal == s_last_kernel) return;
+		s_last_kernel = eal;
+
+		// RPCS3_SPU_LIGHT_CAPTURE_MIN_LIGHTS waits for a frame with at least that many lights (e.g. lightning)
+		static const u32 min_lights = []() -> u32 { const char* v = std::getenv("RPCS3_SPU_LIGHT_CAPTURE_MIN_LIGHTS"); return v ? std::strtoul(v, nullptr, 0) : 0; }();
+
+		if (s_phase == 0 && eal == 0x0087ec80 && ++s_seen > 100 && vm::_ref<be_t<u32>>(0x00a93c80 + 0x90) >= min_lights)
+		{
+			dump_regions(fmt::format("%s/pre", light_dir), {{0x37400b80, 0x384000}, {0x37784b80, 0x384000}, {0xcf800000, 0xe1000}});
+			s_phase = 1;
+		}
+		else if (s_phase == 1 && eal == 0x0087d500 && s_runs)
+		{
+			dump_regions(fmt::format("%s/post", light_dir), {{0x37400b80, 0x384000}, {0x37784b80, 0x384000}});
+			s_phase = 2;
+			spu_log.success("Lighting capture complete: %u job runs", s_runs);
+		}
+	}
+	else if (s_phase == 1 && s_runs < 400)
+	{
+		const std::string prefix = fmt::format("%s/run%03u", light_dir, s_runs++);
+		std::string blob("SPUSTATE", 8);
+		const std::array<u32, 8> header{spu->pc, spu->srr0, static_cast<u32>(spu->interrupts_enabled), eal, lsa, size, spu->ch_tag_mask, spu->lv2_id};
+		blob.append(reinterpret_cast<const char*>(header.data()), sizeof(header));
+		blob.append(reinterpret_cast<const char*>(spu->gpr.data()), sizeof(spu->gpr));
+		blob.append(reinterpret_cast<const char*>(spu->ls), SPU_LS_SIZE);
+		fs::write_file(prefix + "-state.bin", fs::rewrite, blob);
+		dump_regions(prefix, {{0x00a93000, 0x1000}, {0x37d6d000, 0x7000}, {0x00a40000, 0x1000}, {0x00b01000, 0x3000}});
+	}
+}
+
+static bool native_ssao_skips_spu_work();
+
 void spu_thread::do_dma_transfer(spu_thread* _this, const spu_mfc_cmd& args, u8* ls)
 {
+	scoped_spu_dma_trace trace(_this, args);
 	perf_meter<"DMA"_u32> perf_;
 
 	const bool is_get = (args.cmd & ~(MFC_BARRIER_MASK | MFC_FENCE_MASK | MFC_START_MASK)) == MFC_GET_CMD;
+
+	// inFamous 2 ambient occlusion is computed on the GPU (RPCS3_NATIVE_SSAO bit 2): each of the job's five
+	// kernels is loaded as usual, then made to return at its entry point so the SPU does no pixel work.
+	if (native_ssao_skips_spu_work() && is_get && args.lsa == 0x6c00 && args.size >= 784 &&
+		(args.eal == 0x0087d500 || args.eal == 0x0087d880 || args.eal == 0x0087e480 || args.eal == 0x0087ec80 || args.eal == 0x0087f880)) [[unlikely]]
+	{
+		std::memcpy(ls + args.lsa, vm::_ptr<const u8>(args.eal), args.size);
+		const be_t<u32> return_to_caller = 0x35000000; // BI $lr
+		std::memcpy(ls + args.lsa + 0x30, &return_to_caller, 4);
+		return;
+	}
+
+	// Capture for offline study (RPCS3_SPU_SSAO_STAGE_CAPTURE_DIR): at the first kernel load of each SSAO stage,
+	// write the SPU state and every buffer the job touches. Use with the SPU interpreter so GPRs are exact.
+	if (static const char* stage_dir = std::getenv("RPCS3_SPU_SSAO_STAGE_CAPTURE_DIR"); stage_dir && _this && is_get &&
+		args.eal >= 0x0087d500 && args.eal < 0x00880d90 && args.size >= 784) [[unlikely]]
+	{
+		static std::mutex s_mutex;
+		static u32 s_last_kernel = 0;
+		static u32 s_seen = 0;
+		static u32 s_written = 0;
+		std::lock_guard lock(s_mutex);
+
+		if (args.eal != s_last_kernel)
+		{
+			s_last_kernel = args.eal;
+
+			// Skip the first cycles after boot, then take seven consecutive stage starts (one frame plus overlap)
+			if (++s_seen > 400 && s_written < 7)
+			{
+				const std::string prefix = fmt::format("%s/stage%u-%x", stage_dir, s_written++, args.eal);
+				std::string blob("SPUSTATE", 8);
+				const std::array<u32, 8> header{_this->pc, static_cast<u32>(args.cmd), args.tag, args.eal, args.lsa, args.size, _this->ch_tag_mask, 0};
+				blob.append(reinterpret_cast<const char*>(header.data()), sizeof(header));
+				blob.append(reinterpret_cast<const char*>(_this->gpr.data()), sizeof(_this->gpr));
+				blob.append(reinterpret_cast<const char*>(_this->ls), SPU_LS_SIZE);
+				fs::write_file(prefix + "-state.bin", fs::rewrite, blob);
+
+				const std::pair<u32, u32> regions[]{{0x37400b80, 0x384000}, {0x37784b80, 0x384000}, {0x37b08000, 0x11a480}, {0xcf800000, 0xe1000}, {0x00a94000, 0x1000}, {0x00a40000, 0x1000}};
+				for (const auto& [ea, size] : regions)
+				{
+					fs::write_file(fmt::format("%s-mem-%08x.bin", prefix, ea), fs::rewrite, std::string(vm::get_super_ptr<const char>(ea), size));
+				}
+
+				spu_log.success("SSAO stage capture %u written (kernel 0x%x)", s_written, args.eal);
+			}
+		}
+	}
+
+	if (is_get && args.eal >= 0x0087d500 && args.eal < 0x00880d90 && args.size >= 784) [[unlikely]]
+	{
+		spu_light_capture(_this, true, args.eal, args.lsa, args.size);
+	}
+
+	if (spu_buffer_access_diag::s_enabled) [[unlikely]]
+		spu_buffer_access_diag::observe(_this, args, ls, is_get ? 1 : 0);
+	if (rsx::tail_demand_trace::configured) [[unlikely]]
+		rsx::tail_demand_trace::observe(args.eal, args.size, args.lsa & 0x3ffff, is_get,
+			_this ? _this->pc : 0, _this ? _this->lv2_id : 0, 3u | (static_cast<u32>(args.cmd) << 8));
 
 	u32 eal = args.eal;
 	u32 lsa = args.lsa & 0x3ffff;
@@ -2827,8 +3236,870 @@ bool spu_thread::do_dma_check(const spu_mfc_cmd& args)
 	return true;
 }
 
+// Set by the renderer once it produces the ambient occlusion image itself and the game samples it
+std::atomic<bool> g_native_ssao_gpu_active{false};
+
+static bool native_ssao_skips_spu_work()
+{
+	static const bool value = []()
+	{
+		const char* flag = std::getenv("RPCS3_NATIVE_SSAO");
+		return flag && (std::strtoul(flag, nullptr, 0) & 4) != 0;
+	}();
+	return value && g_native_ssao_gpu_active.load(std::memory_order_relaxed);
+}
+
+// inFamous 2 tiled lighting computed on the GPU (RPCS3_NATIVE_LIGHTING, see VKNativeLighting.h)
+bool native_lighting_job_start(const u8* params, u32 table, u32 table_bytes);
+static std::atomic<bool> g_native_lighting_skip_puts{false};
+// Neither the lighting job nor the ambient occlusion job uses the G-buffer bytes it loads (both are stubbed)
+std::atomic<bool> g_native_gbuffer_unread{false};
+// Bytes of list transfers left out for that reason
+std::atomic<u64> g_native_gbuffer_skipped_bytes{0};
+
+static u32 native_lighting_mode()
+{
+	static const u32 value = []() -> u32
+	{
+		const char* flag = std::getenv("RPCS3_NATIVE_LIGHTING");
+		return flag ? static_cast<u32>(std::strtoul(flag, nullptr, 0)) : 0;
+	}();
+	return value;
+}
+
+// The job manager is about to GET the lighting job's parameter block. Record the parameters this job will use,
+// and when the GPU produces the frame, make the tile function (LS 0x4ac8) return at its entry point: the job still
+// claims its tiles, moves their rows and signals completion, but does no pixel work.
+static void native_lighting_job_hook(spu_thread& spu, u32 table, u32 table_bytes)
+{
+	static constexpr u8 code[16]{0x40, 0x80, 0x24, 0x1c, 0x34, 0x00, 0x01, 0x9d, 0x40, 0x80, 0x25, 0x1b, 0x24, 0xfd, 0xc0, 0xd8};
+	static constexpr u8 stub[4]{0x35, 0x00, 0x00, 0x00}; // BI $lr
+
+	u8* entry = spu.ls + 0x4ac8;
+	bool loaded = !std::memcmp(entry + 4, code + 4, 12) && (!std::memcmp(entry, code, 4) || !std::memcmp(entry, stub, 4));
+
+	if (loaded)
+	{
+		u32 hash = 0x811c9dc5;
+		for (u32 i = 0x4040; i < 0x4140; i++) hash = (hash ^ spu.ls[i]) * 0x01000193;
+		loaded = hash == 0x01f9aa7f;
+	}
+
+	const bool gpu = native_lighting_job_start(vm::get_super_ptr<const u8>(0x00a93c80), table, table_bytes);
+	const bool skip = gpu && loaded && (native_lighting_mode() & 4);
+
+	if (loaded && std::memcmp(entry, skip ? stub : code, 4))
+	{
+		std::memcpy(entry, skip ? stub : code, 4);
+	}
+
+	if (const bool skip_puts = skip && (native_lighting_mode() & 8); g_native_lighting_skip_puts.load(std::memory_order_relaxed) != skip_puts)
+	{
+		g_native_lighting_skip_puts = skip_puts;
+	}
+
+	if (const bool unread = skip && (native_lighting_mode() & 24) == 24 && native_ssao_skips_spu_work(); g_native_gbuffer_unread.load(std::memory_order_relaxed) != unread)
+	{
+		g_native_gbuffer_unread = unread;
+	}
+}
+
+// A list transfer whose first element lies in the two G-buffer images (0x37400b80, 0x708000 bytes) or in the ambient
+// occlusion job's scratch buffers behind them (up to 0x37c22480). While the lighting and ambient occlusion jobs do no
+// pixel work, the image rows they load are never looked at and the scratch rows the occlusion job stores and reloads
+// are never produced: leave those elements out. Not touching the pages of the two images (the scratch buffers start in
+// the last one) also means no access fault, so the renderer does not have to copy the images back to guest memory.
+// Returns false, having done nothing, when the list must be transferred normally.
+static bool native_gbuffer_list_skip(spu_thread& spu, const spu_mfc_cmd& args)
+{
+	if (!g_native_gbuffer_unread.load(std::memory_order_relaxed))
+	{
+		return false;
+	}
+
+	const auto cmd = args.cmd & ~(MFC_BARRIER_MASK | MFC_FENCE_MASK | MFC_START_MASK);
+	const bool is_get = cmd == MFC_GETL_CMD;
+
+	if (!is_get && cmd != MFC_PUTL_CMD)
+	{
+		return false;
+	}
+
+	// Only the two known jobs: lighting (its writes to the images have their own switch), ambient occlusion
+	u32 hash = 0x811c9dc5;
+	for (u32 i = 0x4040; i < 0x4140; i++) hash = (hash ^ spu.ls[i]) * 0x01000193;
+
+	const bool occlusion = hash == 0x8f2e59a2;
+
+	if (!occlusion && !(hash == 0x01f9aa7f && is_get))
+	{
+		return false;
+	}
+
+	const u32 dead_bytes = occlusion ? 0x37c22480u - 0x37400b80u : 0x708000u;
+
+	const auto element = [&](u32 off, u32& ea, u32& size)
+	{
+		const u8* e = spu.ls + ((args.eal + off) & 0x3fff8);
+		size = ((u32{e[2]} << 8) | e[3]) & 0x7fff;
+		ea = (u32{e[4]} << 24) | (u32{e[5]} << 16) | (u32{e[6]} << 8) | e[7];
+		return !(e[0] & 0x80);
+	};
+
+	const auto dead = [&](u32 ea, u32 size)
+	{
+		return ea - 0x37400b80u < dead_bytes && size <= dead_bytes - (ea - 0x37400b80u);
+	};
+
+	u32 lsa = args.lsa & 0x3fff0;
+
+	for (u32 off = 0, ea, size; off + 8 <= args.size; off += 8)
+	{
+		// Stall-and-notify, a store elsewhere, MMIO or anything running off the end of local storage: not ours
+		if (!element(off, ea, size) || (size && !dead(ea, size) && (!is_get || ea >= RAW_SPU_BASE_ADDR || lsa + (ea & 0xf) + size > SPU_LS_SIZE)))
+		{
+			return false;
+		}
+
+		lsa += utils::align<u32>(size, 16);
+	}
+
+	u64 skipped = 0;
+	lsa = args.lsa & 0x3fff0;
+
+	for (u32 off = 0, ea, size; off + 8 <= args.size; off += 8)
+	{
+		element(off, ea, size);
+
+		if (dead(ea, size))
+		{
+			skipped += size;
+		}
+		else if (size)
+		{
+			std::memcpy(spu.ls + lsa + (ea & 0xf), vm::_ptr<const u8>(ea), size);
+		}
+
+		lsa += utils::align<u32>(size, 16);
+	}
+
+	g_native_gbuffer_skipped_bytes.fetch_add(skipped, std::memory_order_relaxed);
+	return true;
+}
+
+[[gnu::noinline]] static bool do_list_transfer_diagnostic(spu_thread& self, spu_mfc_cmd& args, spu_dma_list_trace::Record* dma_trace)
+{
+	perf_meter<"MFC_LIST"_u64> perf0;
+
+	// Amount of elements to fetch in one go
+	constexpr u32 fetch_size = 6;
+
+	struct alignas(8) list_element
+	{
+		u8 sb; // Stall-and-Notify bit (0x80)
+		u8 pad;
+		be_t<u16> ts; // List Transfer Size
+		be_t<u32> ea; // External Address Low
+	};
+
+	alignas(16) list_element items[fetch_size];
+	static_assert(sizeof(v128) % sizeof(list_element) == 0);
+
+	spu_mfc_cmd transfer;
+	transfer.eah  = 0;
+	transfer.tag  = args.tag;
+	transfer.cmd  = MFC{static_cast<u8>(args.cmd & ~0xf)};
+
+	u32 index = fetch_size;
+
+	auto item_ptr = self._ptr<const list_element>(args.eal & 0x3fff8);
+	u32 arg_lsa = args.lsa & 0x3fff0;
+	u32 arg_size = args.size;
+
+	u8 optimization_compatible = transfer.cmd & (MFC_GET_CMD | MFC_PUT_CMD);
+
+	if (spu_log.trace || g_cfg.core.spu_accurate_dma || g_cfg.core.mfc_debug)
+	{
+		optimization_compatible = 0;
+	}
+
+	rsx::reservation_lock<false, 1> rsx_lock(0, 128, optimization_compatible == MFC_PUT_CMD && (g_cfg.video.strict_rendering_mode || (g_cfg.core.rsx_fifo_accuracy && !g_cfg.core.spu_accurate_dma)));
+
+	spu_dma_list_trace::set_compatible(dma_trace, optimization_compatible);
+
+	constexpr u32 ts_mask = 0x7fff;
+
+	// Assume called with size greater than 0
+	while (true)
+	{
+		// Check if fetching is needed
+		if (index == fetch_size)
+		{
+			const v128 data0 = v128::loadu(item_ptr, 0);
+			const v128 data1 = v128::loadu(item_ptr, 1);
+			const v128 data2 = v128::loadu(item_ptr, 2);
+
+			// In a perfect world this would not be needed until after the if but relying on the compiler to keep the elements in SSE registers through it all is unrealistic
+			std::memcpy(&items[sizeof(v128) / sizeof(list_element) * 0], &data0, sizeof(v128));
+			std::memcpy(&items[sizeof(v128) / sizeof(list_element) * 1], &data1, sizeof(v128));
+			std::memcpy(&items[sizeof(v128) / sizeof(list_element) * 2], &data2, sizeof(v128));
+			spu_dma_list_trace::group(dma_trace, items, arg_lsa, arg_size,
+				static_cast<u32>(reinterpret_cast<const u8*>(item_ptr) - self.ls));
+
+			u32 s_size = data0._u32[0];
+
+			// We need to verify matching between odd and even elements (vector test is position independent)
+			// 0-5 is the most unlikely couple match for many reasons so it skips the entire check very efficiently in most cases
+			// Assumes padding bits should match
+			if (optimization_compatible == MFC_GET_CMD && s_size == data0._u32[2] && arg_size >= fetch_size * 8)
+			{
+				const v128 ored = (data0 | data1 | data2) & v128::from64p(std::bit_cast<be_t<u64>>(1ull << 63 | (u64{ts_mask} << 32) | 0xe000'0000));
+				const v128 anded = (data0 & data1 & data2) & v128::from64p(std::bit_cast<be_t<u64>>(0xe000'0000 | (u64{ts_mask} << 32)));
+
+				// Tests:
+				// 1. Unset stall-and-notify bit on all 6 elements
+				// 2. Equality of transfer size across all 6 elements
+				// 3. Be in the same 512mb region, this is because this case is not expected to be broken usually and we need to ensure MMIO is not involved in any of the transfers (assumes MMIO to be so rare that this is the last check)
+				if (ored == anded && items[0].ea < RAW_SPU_BASE_ADDR && items[1].ea < RAW_SPU_BASE_ADDR)
+				{
+					// Execute the postponed byteswapping and masking
+					s_size = std::bit_cast<be_t<u32>>(s_size) & ts_mask;
+
+					u8* src = vm::_ptr<u8>(0);
+					u8* dst = self.ls + arg_lsa;
+
+					// Assume success, prepare the next elements
+					arg_lsa += fetch_size * utils::align<u32>(s_size, 16);
+					item_ptr += fetch_size;
+					arg_size -= fetch_size * 8;
+
+					// Type which is friendly for fused address calculations
+					constexpr usz _128 = 128;
+
+					// This whole function relies on many constraints to be met (crashes real MFC), we can a have minor optimization assuming EA alignment to be +16 with +16 byte transfers
+#define MOV_T(type, index, _ea) { const usz ea = _ea; rsx::tail_demand_trace::observe(ea, sizeof(type), static_cast<u32>(dst - self.ls + index * utils::align<u32>(sizeof(type), 16) + ea % (sizeof(type) < 16 ? 16 : 1)), true, self.pc, self.lv2_id, 1); *reinterpret_cast<type*>(dst + index * utils::align<u32>(sizeof(type), 16) + ea % (sizeof(type) < 16 ? 16 : 1)) = *reinterpret_cast<const type*>(src + ea); } void()
+#define MOV_128(index, _ea) { const usz ea = (_ea); rsx::tail_demand_trace::observe(ea, 128, static_cast<u32>(dst - self.ls + index * _128), true, self.pc, self.lv2_id, 1); mov_rdata(*reinterpret_cast<decltype(self.rdata)*>(dst + index * _128), *reinterpret_cast<const decltype(self.rdata)*>(src + ea)); } void()
+
+					if (dma_trace && (s_size == 0 || s_size == 1 || s_size == 2 || s_size == 4 || s_size == 8 ||
+						s_size == 16 || s_size == 32 || s_size == 48 || s_size == 64 ||
+						s_size == 128 || s_size == 256 || s_size == 512))
+						spu_dma_list_trace::batch(dma_trace, items, s_size);
+
+					switch (s_size)
+					{
+					case 0:
+					{
+						if (!arg_size)
+						{
+							return true;
+						}
+
+						continue;
+					}
+					case 1:
+					{
+						MOV_T(u8, 0, items[0].ea);
+						MOV_T(u8, 1, items[1].ea);
+						MOV_T(u8, 2, items[2].ea);
+						MOV_T(u8, 3, items[3].ea);
+						MOV_T(u8, 4, items[4].ea);
+						MOV_T(u8, 5, items[5].ea);
+
+						if (!arg_size)
+						{
+							return true;
+						}
+
+						continue;
+					}
+					case 2:
+					{
+						MOV_T(u16, 0, items[0].ea);
+						MOV_T(u16, 1, items[1].ea);
+						MOV_T(u16, 2, items[2].ea);
+						MOV_T(u16, 3, items[3].ea);
+						MOV_T(u16, 4, items[4].ea);
+						MOV_T(u16, 5, items[5].ea);
+
+						if (!arg_size)
+						{
+							return true;
+						}
+
+						continue;
+					}
+					case 4:
+					{
+						MOV_T(u32, 0, items[0].ea);
+						MOV_T(u32, 1, items[1].ea);
+						MOV_T(u32, 2, items[2].ea);
+						MOV_T(u32, 3, items[3].ea);
+						MOV_T(u32, 4, items[4].ea);
+						MOV_T(u32, 5, items[5].ea);
+
+						if (!arg_size)
+						{
+							return true;
+						}
+
+						continue;
+					}
+					case 8:
+					{
+						MOV_T(u64, 0, items[0].ea);
+						MOV_T(u64, 1, items[1].ea);
+						MOV_T(u64, 2, items[2].ea);
+						MOV_T(u64, 3, items[3].ea);
+						MOV_T(u64, 4, items[4].ea);
+						MOV_T(u64, 5, items[5].ea);
+
+						if (!arg_size)
+						{
+							return true;
+						}
+
+						continue;
+					}
+					case 16:
+					{
+						MOV_T(v128, 0, items[0].ea);
+						MOV_T(v128, 1, items[1].ea);
+						MOV_T(v128, 2, items[2].ea);
+						MOV_T(v128, 3, items[3].ea);
+						MOV_T(v128, 4, items[4].ea);
+						MOV_T(v128, 5, items[5].ea);
+
+						if (!arg_size)
+						{
+							return true;
+						}
+
+						continue;
+					}
+					case 32:
+					{
+						struct mem
+						{
+							v128 a[2];
+						};
+
+						MOV_T(mem, 0, items[0].ea);
+						MOV_T(mem, 1, items[1].ea);
+						MOV_T(mem, 2, items[2].ea);
+						MOV_T(mem, 3, items[3].ea);
+						MOV_T(mem, 4, items[4].ea);
+						MOV_T(mem, 5, items[5].ea);
+
+						if (!arg_size)
+						{
+							return true;
+						}
+
+						continue;
+					}
+					case 48:
+					{
+						struct mem
+						{
+							v128 a[3];
+						};
+
+						MOV_T(mem, 0, items[0].ea);
+						MOV_T(mem, 1, items[1].ea);
+						MOV_T(mem, 2, items[2].ea);
+						MOV_T(mem, 3, items[3].ea);
+						MOV_T(mem, 4, items[4].ea);
+						MOV_T(mem, 5, items[5].ea);
+
+						if (!arg_size)
+						{
+							return true;
+						}
+
+						continue;
+					}
+					case 64:
+					{
+						struct mem
+						{
+							v128 a[4];
+						};
+
+						// TODO: Optimize (4 16-bytes movings is bad)
+						MOV_T(mem, 0, items[0].ea);
+						MOV_T(mem, 1, items[1].ea);
+						MOV_T(mem, 2, items[2].ea);
+						MOV_T(mem, 3, items[3].ea);
+						MOV_T(mem, 4, items[4].ea);
+						MOV_T(mem, 5, items[5].ea);
+
+						if (!arg_size)
+						{
+							return true;
+						}
+
+						continue;
+					}
+					case 128:
+					{
+						MOV_128(0, items[0].ea);
+						MOV_128(1, items[1].ea);
+						MOV_128(2, items[2].ea);
+						MOV_128(3, items[3].ea);
+						MOV_128(4, items[4].ea);
+						MOV_128(5, items[5].ea);
+
+						if (!arg_size)
+						{
+							return true;
+						}
+
+						continue;
+					}
+					case 256:
+					{
+						const usz ea0 = items[0].ea;
+						MOV_128(0, ea0 + 0);
+						MOV_128(1, ea0 + _128);
+						const usz ea1 = items[1].ea;
+						MOV_128(2, ea1 + 0);
+						MOV_128(3, ea1 + _128);
+						const usz ea2 = items[2].ea;
+						MOV_128(4, ea2 + 0);
+						MOV_128(5, ea2 + _128);
+						const usz ea3 = items[3].ea;
+						MOV_128(6, ea3 + 0);
+						MOV_128(7, ea3 + _128);
+						const usz ea4 = items[4].ea;
+						MOV_128(8, ea4 + 0);
+						MOV_128(9, ea4 + _128);
+						const usz ea5 = items[5].ea;
+						MOV_128(10, ea5 + 0);
+						MOV_128(11, ea5 + _128);
+
+						if (!arg_size)
+						{
+							return true;
+						}
+
+						continue;
+					}
+					case 512:
+					{
+						const usz ea0 = items[0].ea;
+						MOV_128(0 , ea0 + _128 * 0);
+						MOV_128(1 , ea0 + _128 * 1);
+						MOV_128(2 , ea0 + _128 * 2);
+						MOV_128(3 , ea0 + _128 * 3);
+						const usz ea1 = items[1].ea;
+						MOV_128(4 , ea1 + _128 * 0);
+						MOV_128(5 , ea1 + _128 * 1);
+						MOV_128(6 , ea1 + _128 * 2);
+						MOV_128(7 , ea1 + _128 * 3);
+						const usz ea2 = items[2].ea;
+						MOV_128(8 , ea2 + _128 * 0);
+						MOV_128(9 , ea2 + _128 * 1);
+						MOV_128(10, ea2 + _128 * 2);
+						MOV_128(11, ea2 + _128 * 3);
+						const usz ea3 = items[3].ea;
+						MOV_128(12, ea3 + _128 * 0);
+						MOV_128(13, ea3 + _128 * 1);
+						MOV_128(14, ea3 + _128 * 2);
+						MOV_128(15, ea3 + _128 * 3);
+						const usz ea4 = items[4].ea;
+						MOV_128(16, ea4 + _128 * 0);
+						MOV_128(17, ea4 + _128 * 1);
+						MOV_128(18, ea4 + _128 * 2);
+						MOV_128(19, ea4 + _128 * 3);
+						const usz ea5 = items[5].ea;
+						MOV_128(20, ea5 + _128 * 0);
+						MOV_128(21, ea5 + _128 * 1);
+						MOV_128(22, ea5 + _128 * 2);
+						MOV_128(23, ea5 + _128 * 3);
+
+						if (!arg_size)
+						{
+							return true;
+						}
+
+						continue;
+					}
+					default:
+					{
+						// TODO: Are more cases common enough? (in the range of less than 512 bytes because for more than that the optimization is doubtful)
+						break;
+					}
+					}
+#undef MOV_T
+#undef MOV_128
+					// Optimization miss, revert changes
+					arg_lsa -= fetch_size * utils::align<u32>(s_size, 16);
+					item_ptr -= fetch_size;
+					arg_size += fetch_size * 8;
+				}
+			}
+
+			// Reset to elements array head
+			index = 0;
+		}
+
+		const u32 size = items[index].ts & ts_mask;
+		const u32 addr = items[index].ea;
+		if (optimization_compatible == MFC_GET_CMD || optimization_compatible == MFC_PUT_CMD)
+			rsx::tail_demand_trace::observe(addr, size, arg_lsa + (addr & 0xf),
+				optimization_compatible == MFC_GET_CMD, self.pc, self.lv2_id, 2);
+
+		if (dma_trace)
+		{
+			const bool trace_get = addr < RAW_SPU_BASE_ADDR && size && optimization_compatible == MFC_GET_CMD;
+			const bool trace_put = optimization_compatible == MFC_PUT_CMD &&
+				((addr >> 28 == rsx::constants::local_mem_base >> 28) ||
+				(addr < RAW_SPU_BASE_ADDR && size - 1 <= 0x400 - 1 && (addr % 0x10000 + size - 1) < 0x10000));
+			const bool trace_main_put = trace_put && addr >> 28 != rsx::constants::local_mem_base >> 28;
+			spu_dma_list_trace::element(dma_trace, addr, size,
+				trace_get ? spu_dma_list_trace::direct_get : trace_put ? spu_dma_list_trace::direct_put : spu_dma_list_trace::general_fallback,
+				trace_main_put, trace_main_put);
+		}
+
+		// Try to inline the transfer
+		if (size && addr - 0xcf800000u < 0xe1000u && native_ssao_skips_spu_work()) [[unlikely]]
+		{
+			// Ambient occlusion output image: produced on the GPU instead, leave the guest texture untouched
+			arg_lsa += utils::align<u32>(size, 16);
+		}
+		else if (size && addr - 0x37400b80u < 0x708000u && optimization_compatible == MFC_PUT_CMD && g_native_lighting_skip_puts.load(std::memory_order_relaxed)) [[unlikely]]
+		{
+			// Lighting output images: produced on the GPU instead
+			arg_lsa += utils::align<u32>(size, 16);
+		}
+		else if (addr < RAW_SPU_BASE_ADDR && size && optimization_compatible == MFC_GET_CMD)
+		{
+			const u8* src = vm::_ptr<u8>(addr);
+			u8* dst = self.ls + arg_lsa + (addr & 0xf);
+
+			switch (u32 _size = size)
+			{
+			case 1:
+			{
+				*reinterpret_cast<u8*>(dst) = *reinterpret_cast<const u8*>(src);
+				break;
+			}
+			case 2:
+			{
+				*reinterpret_cast<u16*>(dst) = *reinterpret_cast<const u16*>(src);
+				break;
+			}
+			case 4:
+			{
+				*reinterpret_cast<u32*>(dst) = *reinterpret_cast<const u32*>(src);
+				break;
+			}
+			case 8:
+			{
+				*reinterpret_cast<u64*>(dst) = *reinterpret_cast<const u64*>(src);
+				break;
+			}
+			default:
+			{
+				if (_size > s_rep_movsb_threshold)
+				{
+					__movsb(dst, src, _size);
+				}
+				else
+				{
+					// Avoid unaligned stores in mov_rdata_avx
+					if (reinterpret_cast<u64>(dst) & 0x10)
+					{
+						*reinterpret_cast<v128*>(dst) = *reinterpret_cast<const v128*>(src);
+
+						dst += 16;
+						src += 16;
+						_size -= 16;
+					}
+
+					while (_size >= 128)
+					{
+						mov_rdata(*reinterpret_cast<spu_rdata_t*>(dst), *reinterpret_cast<const spu_rdata_t*>(src));
+
+						dst += 128;
+						src += 128;
+						_size -= 128;
+					}
+
+					while (_size)
+					{
+						*reinterpret_cast<v128*>(dst) = *reinterpret_cast<const v128*>(src);
+
+						dst += 16;
+						src += 16;
+						_size -= 16;
+					}
+				}
+
+				break;
+			}
+			}
+
+			arg_lsa += utils::align<u32>(size, 16);
+		}
+		// Avoid inlining huge transfers because it intentionally drops range lock unlock
+		else if (optimization_compatible == MFC_PUT_CMD && ((addr >> 28 == rsx::constants::local_mem_base >> 28) || (addr < RAW_SPU_BASE_ADDR && size - 1 <= 0x400 - 1 && (addr % 0x10000 + (size - 1)) < 0x10000)))
+		{
+			if (addr >> 28 != rsx::constants::local_mem_base >> 28)
+			{
+				rsx_lock.update_if_enabled(addr, size, self.range_lock);
+
+				vm::range_lock(self.range_lock, addr & -128, utils::align<u32>(addr + size, 128) - (addr & -128));
+			}
+			else
+			{
+				self.range_lock->release(0);
+				rsx_lock.unlock();
+			}
+
+			u8* dst = vm::_ptr<u8>(addr);
+			const u8* src = self.ls + arg_lsa + (addr & 0xf);
+
+			switch (u32 _size = size)
+			{
+			case 1:
+			{
+				*reinterpret_cast<u8*>(dst) = *reinterpret_cast<const u8*>(src);
+				break;
+			}
+			case 2:
+			{
+				*reinterpret_cast<u16*>(dst) = *reinterpret_cast<const u16*>(src);
+				break;
+			}
+			case 4:
+			{
+				*reinterpret_cast<u32*>(dst) = *reinterpret_cast<const u32*>(src);
+				break;
+			}
+			case 8:
+			{
+				*reinterpret_cast<u64*>(dst) = *reinterpret_cast<const u64*>(src);
+				break;
+			}
+			default:
+			{
+				if (_size > s_rep_movsb_threshold)
+				{
+					__movsb(dst, src, _size);
+				}
+				else
+				{
+					// Avoid unaligned stores in mov_rdata_avx
+					if (reinterpret_cast<u64>(dst) & 0x10)
+					{
+						*reinterpret_cast<v128*>(dst) = *reinterpret_cast<const v128*>(src);
+
+						dst += 16;
+						src += 16;
+						_size -= 16;
+					}
+
+					while (_size >= 128)
+					{
+						mov_rdata(*reinterpret_cast<spu_rdata_t*>(dst), *reinterpret_cast<const spu_rdata_t*>(src));
+
+						dst += 128;
+						src += 128;
+						_size -= 128;
+					}
+
+					while (_size)
+					{
+						*reinterpret_cast<v128*>(dst) = *reinterpret_cast<const v128*>(src);
+
+						dst += 16;
+						src += 16;
+						_size -= 16;
+					}
+				}
+
+				break;
+			}
+			}
+
+			arg_lsa += utils::align<u32>(size, 16);
+		}
+		else if (size)
+		{
+			self.range_lock->release(0);
+			rsx_lock.unlock();
+
+			spu_log.trace("LIST: item=0x%016x, lsa=0x%05x", std::bit_cast<be_t<u64>>(items[index]), arg_lsa | (addr & 0xf));
+
+			transfer.eal  = addr;
+			transfer.lsa  = arg_lsa | (addr & 0xf);
+			transfer.size = size;
+
+			arg_lsa += utils::align<u32>(size, 16);
+			spu_thread::do_dma_transfer(&self, transfer, self.ls);
+		}
+
+		arg_size -= 8;
+
+		if (!arg_size)
+		{
+			// No more elements
+			break;
+		}
+
+		item_ptr++;
+
+		if (items[index].sb & 0x80) [[unlikely]]
+		{
+			self.range_lock->release(0);
+
+			self.ch_stall_mask |= std::rotl<u32>(1, args.tag);
+
+			if (!self.ch_stall_stat.get_count())
+			{
+				self.set_events(SPU_EVENT_SN);
+			}
+
+			self.ch_stall_stat.set_value(std::rotl<u32>(1, args.tag) | self.ch_stall_stat.get_value());
+
+			args.tag |= 0x80; // Set stalled status
+			args.eal = ::narrow<u32>(reinterpret_cast<const u8*>(item_ptr) - self.ls);
+			args.lsa = arg_lsa;
+			args.size = arg_size;
+			return false;
+		}
+
+		index++;
+	}
+
+	self.range_lock->release(0);
+	return true;
+}
+
 bool spu_thread::do_list_transfer(spu_mfc_cmd& args)
 {
+	if (native_lighting_mode()) [[unlikely]]
+	{
+		const u8* first = this->ls + (args.eal & 0x3fff8);
+		if (first[2] == 1 && first[3] == 0 && first[4] == 0x00 && first[5] == 0xa9 && first[6] == 0x3c && first[7] == 0x80 &&
+			(args.cmd & ~(MFC_BARRIER_MASK | MFC_FENCE_MASK | MFC_START_MASK)) == MFC_GETL_CMD)
+		{
+			// Second element: the light table
+			const bool has_table = args.size >= 16;
+			const u32 table = (u32{first[12]} << 24) | (u32{first[13]} << 16) | (u32{first[14]} << 8) | first[15];
+			const u32 table_bytes = (u32{first[10]} << 8) | first[11];
+			native_lighting_job_hook(*this, has_table ? table : 0u, has_table ? table_bytes : 0u);
+		}
+		else if ((native_lighting_mode() & 16) && first[4] == 0x37 && native_gbuffer_list_skip(*this, args))
+		{
+			return true;
+		}
+	}
+
+	if (static const bool light_capture = !!std::getenv("RPCS3_SPU_LIGHT_CAPTURE_DIR"); light_capture) [[unlikely]]
+	{
+		const u8* first = this->ls + (args.eal & 0x3fff8);
+		const u32 first_size = (u32{first[2]} << 8) | first[3];
+		const u32 first_ea = (u32{first[4]} << 24) | (u32{first[5]} << 16) | (u32{first[6]} << 8) | first[7];
+		if (first_ea == 0x00a93c80 && first_size == 256)
+		{
+			// eal = list address in LS, lsa = destination, size = list size
+			spu_light_capture(this, false, args.eal, args.lsa, args.size);
+		}
+	}
+
+	// One-shot capture for offline study of the SSAO job (RPCS3_SPU_SSAO_CAPTURE_DIR): SPU state at the
+	// start of a stage-2 input list GET (half-res depth rows, 512-byte elements) and at the following
+	// output list PUT on the same thread, plus the guest memory the stage reads.
+	if (static const char* capture_dir = std::getenv("RPCS3_SPU_SSAO_CAPTURE_DIR"); capture_dir) [[unlikely]]
+	{
+		static std::atomic<u32> s_stage{0}; // 0 waiting, 1 pre captured, 2 done
+		static std::atomic<u32> s_skip{0};
+		static spu_thread* s_owner = nullptr;
+
+		const u8* first = this->ls + (args.eal & 0x3fff8);
+		const u32 first_size = (u32{first[2]} << 8) | first[3];
+		const u32 first_ea = (u32{first[4]} << 24) | (u32{first[5]} << 16) | (u32{first[6]} << 8) | first[7];
+		const bool is_get = (args.cmd & ~(MFC_BARRIER_MASK | MFC_FENCE_MASK | MFC_START_MASK)) == MFC_GETL_CMD;
+
+		const auto dump = [&](const char* name)
+		{
+			std::string blob("SPUSTATE", 8);
+			const std::array<u32, 8> header{pc, static_cast<u32>(args.cmd), args.tag, args.eal, args.lsa, args.size, ch_tag_mask, 0};
+			blob.append(reinterpret_cast<const char*>(header.data()), sizeof(header));
+			blob.append(reinterpret_cast<const char*>(gpr.data()), sizeof(gpr));
+			blob.append(reinterpret_cast<const char*>(this->ls), SPU_LS_SIZE);
+			fs::write_file(fmt::format("%s/%s.bin", capture_dir, name), fs::rewrite, blob);
+		};
+
+		if (s_stage == 0 && is_get && first_size == 512 && first_ea >= 0x37b08000 && first_ea < 0x37be9b80 && ++s_skip == 4000)
+		{
+			u32 expected = 0;
+			if (s_stage.compare_exchange_strong(expected, 1))
+			{
+				s_owner = this;
+				dump("stage2-pre");
+				fs::write_file(fmt::format("%s/mem-37b08000.bin", capture_dir), fs::rewrite, std::string(vm::get_super_ptr<const char>(0x37b08000), 0x11a480));
+				fs::write_file(fmt::format("%s/mem-00a94000.bin", capture_dir), fs::rewrite, std::string(vm::get_super_ptr<const char>(0x00a94000), 0x1000));
+			}
+		}
+		else if (s_stage == 1 && s_owner == this && !is_get && first_ea >= 0x37be9b80 && first_ea < 0x37c22480)
+		{
+			// First output PUT after the capture point belongs to the previous band; keep going to the second
+			static u32 s_puts = 0;
+			dump(fmt::format("stage2-post%u", s_puts).c_str());
+			fs::write_file(fmt::format("%s/mem-37b08000-post%u.bin", capture_dir, s_puts), fs::rewrite, std::string(vm::get_super_ptr<const char>(0x37b08000), 0x11a480));
+			fs::write_file(fmt::format("%s/mem-00a94000-post%u.bin", capture_dir, s_puts), fs::rewrite, std::string(vm::get_super_ptr<const char>(0x00a94000), 0x1000));
+			if (++s_puts == 3)
+			{
+				s_stage = 2;
+				spu_log.success("SSAO stage 2 capture written");
+			}
+		}
+		else if (s_stage == 1 && s_owner == this)
+		{
+			// Any other list command of this thread between the two points, for the record
+			static u32 s_between = 0;
+			dump(fmt::format("stage2-between-%u", s_between++).c_str());
+		}
+	}
+
+	if (spu_buffer_access_diag::s_enabled) [[unlikely]]
+	{
+		// List elements live in LS at args.eal: { u16 flags, u16 size, u32 ea }, big-endian
+		const bool is_get = (args.cmd & ~(MFC_BARRIER_MASK | MFC_FENCE_MASK | MFC_START_MASK)) == MFC_GETL_CMD;
+		const u8* ls_base = this->ls;
+		u32 diag_lsa = args.lsa & 0x3fff0;
+
+		for (u32 offset = 0; offset + 8 <= args.size; offset += 8)
+		{
+			const u8* item = ls_base + ((args.eal + offset) & 0x3fff8);
+			spu_mfc_cmd element{};
+			element.size = static_cast<u16>((item[2] << 8) | item[3]);
+			element.eal = (u32{item[4]} << 24) | (u32{item[5]} << 16) | (u32{item[6]} << 8) | item[7];
+			element.lsa = diag_lsa | (element.eal & 0xf);
+			diag_lsa += (element.size + 15) & ~15u;
+			if (element.size)
+			{
+				spu_buffer_access_diag::observe(this, element, ls_base, is_get ? 1 : 0);
+			}
+		}
+	}
+
+	if (spu_dma_list_trace::mapping || rsx::tail_demand_trace::configured) [[unlikely]]
+	{
+		auto* dma_trace = spu_dma_list_trace::enter(this, lv2_id, index, pc, block_hash,
+			static_cast<u32>(args.cmd), args.tag, args.eah, args.eal, args.lsa, args.size,
+			mfc_size, !!state);
+		const bool result = do_list_transfer_diagnostic(*this, args, dma_trace);
+		// Stock local destructors (including reservation unlock) have completed.
+		if (dma_trace)
+			spu_dma_list_trace::leave(dma_trace, this, pc, args.tag, args.eal,
+				args.lsa, args.size, result, !!state);
+		return result;
+	}
+
 	perf_meter<"MFC_LIST"_u64> perf0;
 
 	// Amount of elements to fetch in one go
@@ -2876,6 +4147,24 @@ bool spu_thread::do_list_transfer(spu_mfc_cmd& args)
 			const v128 data0 = v128::loadu(item_ptr, 0);
 			const v128 data1 = v128::loadu(item_ptr, 1);
 			const v128 data2 = v128::loadu(item_ptr, 2);
+
+			// The list names its source addresses in advance: start fetching the following batch now so the
+			// misses overlap with this batch's copies (live control 7 = bytes to prefetch per element, 0 = off)
+			if (const u64 prefetch_bytes = vk::live_ctl::get(7); prefetch_bytes && optimization_compatible == MFC_GET_CMD && arg_size >= fetch_size * 16)
+			{
+				const u8* base = vm::_ptr<u8>(0);
+				for (u32 i = fetch_size; i < fetch_size * 2; i++)
+				{
+					const u32 next_ea = item_ptr[i].ea;
+					if (next_ea < RAW_SPU_BASE_ADDR)
+					{
+						for (u64 offset = 0; offset < prefetch_bytes; offset += 64)
+						{
+							__builtin_prefetch(base + next_ea + offset, 0, 3);
+						}
+					}
+				}
+			}
 
 			// In a perfect world this would not be needed until after the if but relying on the compiler to keep the elements in SSE registers through it all is unrealistic
 			std::memcpy(&items[sizeof(v128) / sizeof(list_element) * 0], &data0, sizeof(v128));
@@ -3178,7 +4467,17 @@ bool spu_thread::do_list_transfer(spu_mfc_cmd& args)
 		const u32 addr = items[index].ea;
 
 		// Try to inline the transfer
-		if (addr < RAW_SPU_BASE_ADDR && size && optimization_compatible == MFC_GET_CMD)
+		if (size && addr - 0xcf800000u < 0xe1000u && native_ssao_skips_spu_work()) [[unlikely]]
+		{
+			// Ambient occlusion output image: produced on the GPU instead, leave the guest texture untouched
+			arg_lsa += utils::align<u32>(size, 16);
+		}
+		else if (size && addr - 0x37400b80u < 0x708000u && optimization_compatible == MFC_PUT_CMD && g_native_lighting_skip_puts.load(std::memory_order_relaxed)) [[unlikely]]
+		{
+			// Lighting output images: produced on the GPU instead
+			arg_lsa += utils::align<u32>(size, 16);
+		}
+		else if (addr < RAW_SPU_BASE_ADDR && size && optimization_compatible == MFC_GET_CMD)
 		{
 			const u8* src = vm::_ptr<u8>(addr);
 			u8* dst = this->ls + arg_lsa + (addr & 0xf);
@@ -3385,6 +4684,14 @@ bool spu_thread::do_list_transfer(spu_mfc_cmd& args)
 
 bool spu_thread::do_putllc(const spu_mfc_cmd& args)
 {
+	if (spu_buffer_access_diag::s_enabled) [[unlikely]]
+	{
+		spu_mfc_cmd line = args;
+		line.eal = args.eal & -128;
+		line.size = 128;
+		spu_buffer_access_diag::observe(this, line, this->ls, 3);
+	}
+
 	perf_meter<"PUTLLC-"_u64> perf0;
 	perf_meter<"PUTLLC+"_u64> perf1 = perf0;
 
@@ -3712,6 +5019,14 @@ void do_cell_atomic_128_store(u32 addr, const void* to_write)
 
 void spu_thread::do_putlluc(const spu_mfc_cmd& args)
 {
+	if (spu_buffer_access_diag::s_enabled) [[unlikely]]
+	{
+		spu_mfc_cmd line = args;
+		line.eal = args.eal & -128;
+		line.size = 128;
+		spu_buffer_access_diag::observe(this, line, this->ls, 2);
+	}
+
 	perf_meter<"PUTLLUC"_u64> perf0;
 
 	const u32 addr = args.eal & -128;
@@ -5778,9 +7093,12 @@ s64 spu_thread::get_ch_value(u32 ch)
 #if defined(ARCH_X64)
 				if (utils::has_um_wait())
 				{
+					// Longer waits let the checking thread idle in MWAITX instead of spinning (live control 5)
+					const u64 spin_cap = vk::live_ctl::get(5);
+
 					if (utils::has_waitpkg())
 					{
-						__tpause(static_cast<u32>(std::min<u64>(eventstat_spin_count, 10) * 500), 0x1);
+						__tpause(static_cast<u32>(std::min<u64>(eventstat_spin_count, spin_cap ? spin_cap : 10) * 500), 0x1);
 					}
 					else
 					{
@@ -5793,7 +7111,7 @@ s64 spu_thread::get_ch_value(u32 ch)
 						};
 
 						// Provide the first X64 cache line of the reservation to be tracked
-						__mwaitx<check_wait_t>(static_cast<u32>(std::min<u64>(eventstat_spin_count, 17) * 500), 0xf0, std::addressof(*resrv_mem), +rtime, vm::reservation_acquire(raddr));
+						__mwaitx<check_wait_t>(static_cast<u32>(std::min<u64>(eventstat_spin_count, spin_cap ? spin_cap : 17) * 500), 0xf0, std::addressof(*resrv_mem), +rtime, vm::reservation_acquire(raddr));
 					}
 				}
 				else

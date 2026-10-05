@@ -1,4 +1,5 @@
 #include "commands.h"
+#include "../../Common/readback_chain_diagnostics.hpp"
 #include "device.h"
 #include "shared.h"
 #include "sync.h"
@@ -88,7 +89,10 @@ namespace vk
 	{
 		if (m_submit_fence && is_pending)
 		{
+			rsx::readback_chain_trace::scope chain_wait("command_reuse_fence_wait");
+			chain_wait.command(*this);chain_wait.auxiliary(reinterpret_cast<std::uintptr_t>(m_submit_fence));
 			wait_for_fence(m_submit_fence);
+			chain_wait.finish();
 			is_pending = false;
 
 			//CHECK_RESULT(vkResetFences(pool->get_owner(), 1, &m_submit_fence));
@@ -107,6 +111,7 @@ namespace vk
 		begin_infos.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
 		begin_infos.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
 		CHECK_RESULT(vkBeginCommandBuffer(commands, &begin_infos));
+		if(rsx::readback_chain_trace::configured)m_diagnostic_recording_generation=rsx::readback_chain_trace::next_id();
 		is_open = true;
 
 		clear_state_cache();
@@ -142,6 +147,10 @@ namespace vk
 		}
 
 		submit_info.commands = this->commands;
+		if(rsx::readback_chain_trace::configured)
+		{submit_info.diagnostic_generation=m_diagnostic_recording_generation;submit_info.diagnostic_access=static_cast<u64>(access_hint);}
+		rsx::readback_chain_trace::scope chain_submit("command_submit_call");chain_submit.command(*this);
+		chain_submit.auxiliary(reinterpret_cast<std::uintptr_t>(submit_info.pfence),flush);
 		queue_submit(submit_info, flush);
 		clear_flags();
 	}

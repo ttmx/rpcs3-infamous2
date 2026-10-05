@@ -107,6 +107,7 @@ namespace vk
 		// Properties
 		bool is_dirty() const;
 		bool has_shadow() const { return !!shadow; }
+		const buffer* diagnostic_upload_buffer() const { return shadow ? shadow.get() : heap.get(); }
 	};
 
 	extern data_heap* get_upload_heap();

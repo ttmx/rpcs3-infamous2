@@ -1,8 +1,10 @@
 #include "stdafx.h"
+#include "VKLiveCtl.hpp"
 #include "VKAsyncScheduler.h"
 #include "VKCompute.h"
 #include "VKDMA.h"
 #include "VKHelpers.h"
+#include "VKRTTLoadDiagnostics.hpp"
 #include "VKFormats.h"
 #include "VKRenderPass.h"
 
@@ -15,6 +17,9 @@
 #include "Utilities/deferred_op.hpp"
 
 #include "util/asm.hpp"
+#include <atomic>
+#include <cstdlib>
+#include <cstring>
 
 namespace vk
 {
@@ -1113,10 +1118,128 @@ namespace vk
 		return { row_pitch, upload_pitch_in_texel };
 	}
 
+	bool try_upload_image_complement(const vk::command_buffer& cmd, vk::image* dst_image,
+		const rsx::subresource_layout& layout, int format, const areai& overwrite, vk::data_heap& upload_heap)
+	{
+		// This deliberately reuses the stock CPU endian-conversion path. Unsupported
+		// layouts fall back before allocating memory or recording any GPU commands.
+		if ((format != CELL_GCM_TEXTURE_A8R8G8B8 && format != CELL_GCM_TEXTURE_D8R8G8B8) ||
+			dst_image->aspect() != VK_IMAGE_ASPECT_COLOR_BIT || vk::get_format_texel_width(dst_image->format()) != 4 ||
+			dst_image->info.mipLevels != 1 || dst_image->info.arrayLayers != 1 || layout.depth != 1 ||
+			layout.border || layout.layer || layout.level || layout.width_in_texel != dst_image->width() ||
+			layout.height_in_texel != dst_image->height() || layout.width_in_block != layout.width_in_texel ||
+			layout.height_in_block != layout.height_in_texel || layout.pitch_in_block < layout.width_in_block)
+		{
+			return false;
+		}
+		const s32 w = layout.width_in_texel, h = layout.height_in_texel;
+		if (overwrite.x1 < 0 || overwrite.y1 < 0 || overwrite.x2 > w || overwrite.y2 > h ||
+			overwrite.x1 >= overwrite.x2 || overwrite.y1 >= overwrite.y2 ||
+			(overwrite.x1 == 0 && overwrite.y1 == 0 && overwrite.x2 == w && overwrite.y2 == h))
+		{
+			return false;
+		}
+		const auto source = layout.data.as_span<const std::byte>();
+		const u64 pitch = static_cast<u64>(layout.pitch_in_block) * 4;
+		if (static_cast<u64>(h - 1) * pitch + static_cast<u64>(w) * 4 > source.size())
+		{
+			return false;
+		}
+		const std::array<areai, 4> bands = {{
+			{ 0, 0, w, overwrite.y1 }, { 0, overwrite.y2, w, h },
+			{ 0, overwrite.y1, overwrite.x1, overwrite.y2 },
+			{ overwrite.x2, overwrite.y1, w, overwrite.y2 }
+		}};
+		std::array<VkBufferImageCopy, 4> regions{};
+		u32 region_count = 0;
+		usz uploaded_bytes = 0;
+		for (const auto& band : bands)
+		{
+			uploaded_bytes += static_cast<usz>(band.x2 - band.x1) * (band.y2 - band.y1) * 4;
+		}
+		ensure(uploaded_bytes);
+		rsx::flags32_t upload_flags = upload_contents_inline;
+		auto& cmd2 = prepare_for_transfer(cmd, dst_image, upload_flags);
+		// Keep every region on one backing buffer even when the upload ring wraps.
+		const usz base_offset = upload_heap.alloc<512>(uploaded_bytes);
+		auto* mapped = static_cast<u8*>(upload_heap.map(base_offset, uploaded_bytes));
+		usz packed_offset = 0;
+		for (const auto& band : bands)
+		{
+			if (band.x1 == band.x2 || band.y1 == band.y2)
+			{
+				continue;
+			}
+			auto partial = layout;
+			partial.width_in_block = partial.width_in_texel = ::narrow<u16>(band.x2 - band.x1);
+			partial.height_in_block = partial.height_in_texel = ::narrow<u16>(band.y2 - band.y1);
+			const usz source_offset = static_cast<usz>(band.y1) * pitch + static_cast<usz>(band.x1) * 4;
+			const usz source_length = static_cast<usz>(partial.height_in_texel - 1) * pitch + partial.width_in_texel * 4;
+			partial.data = source.subspan(source_offset, source_length);
+			const usz packed_size = static_cast<usz>(partial.width_in_texel) * partial.height_in_texel * 4;
+			rsx::io_buffer output(mapped + packed_offset, packed_size);
+			rsx::texture_uploader_capabilities caps{};
+			caps.alignment = partial.width_in_texel * 4;
+			if (live_ctl::get(3) & 2)
+			{
+				// The band is narrow rows at a wide pitch, which defeats the hardware prefetcher.
+				const usz row_bytes = static_cast<usz>(partial.width_in_texel) * 4;
+				for (u32 row = 0; row < partial.height_in_texel; row++)
+				{
+					live_ctl::prefetch_range(partial.data.data() + row * pitch, row_bytes + 63, ~usz{0});
+				}
+			}
+			const auto converted = rsx::upload_texture_subresource(output, partial, format, false, caps);
+			ensure(!converted.require_upload && !converted.require_swap && !converted.require_deswizzle);
+			auto& copy = regions[region_count++];
+			copy.bufferOffset = base_offset + packed_offset;
+			copy.bufferRowLength = partial.width_in_texel;
+			copy.imageOffset = { band.x1, band.y1, 0 };
+			copy.imageExtent = { partial.width_in_texel, partial.height_in_texel, 1 };
+			copy.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+			packed_offset += packed_size;
+		}
+		ensure(region_count && packed_offset == uploaded_bytes);
+		upload_heap.unmap();
+		vkCmdCopyBufferToImage(cmd2, upload_heap.heap->value, dst_image->value,
+			VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, region_count, regions.data());
+		static std::atomic_flag reported{};
+		if (!reported.test_and_set(std::memory_order_relaxed))
+		{
+			rsx_log.notice("Blit complement active: %llu bytes in %u rectangles instead of %llu bytes",
+				uploaded_bytes, region_count, pitch * h);
+		}
+		if (auto rsxthr = static_cast<VKGSRender*>(rsx::get_current_renderer()))
+		{
+			rsxthr->on_guest_texture_read(cmd2);
+		}
+		return true;
+	}
+
 	void upload_image(const vk::command_buffer& cmd, vk::image* dst_image,
 		const std::vector<rsx::subresource_layout>& subresource_layout, int format, bool is_swizzled, u16 layer_count,
 		VkImageAspectFlags flags, vk::data_heap &upload_heap, u32 heap_align, rsx::flags32_t image_setup_flags)
 	{
+		rtt_load_diagnostics::span upload_diagnostic;
+		if (rtt_load_diagnostics::enabled())
+		{
+			upload_diagnostic.begin("upload_total", vk::get_current_frame_id(), true);
+			if (upload_diagnostic)
+			{
+				upload_diagnostic.set(rtt_load_diagnostics::image_uid, dst_image->uid());
+				upload_diagnostic.set(rtt_load_diagnostics::gcm_format, format);
+				upload_diagnostic.set(rtt_load_diagnostics::host_format, dst_image->format());
+				upload_diagnostic.set(rtt_load_diagnostics::aspect, flags);
+				upload_diagnostic.set(rtt_load_diagnostics::swizzled, is_swizzled);
+				upload_diagnostic.set(rtt_load_diagnostics::source_gpu, !!(image_setup_flags & source_is_gpu_resident));
+				upload_diagnostic.set(rtt_load_diagnostics::depth_process, (dst_image->aspect() & VK_IMAGE_ASPECT_STENCIL_BIT) || (format == CELL_GCM_TEXTURE_DEPTH16_FLOAT));
+			}
+		}
+		static const bool sparse_dma_upload = []
+		{
+			const char* value = std::getenv("RPCS3_EXPERIMENT_SPARSE_TEXTURE_DMA");
+			return value && std::strcmp(value, "1") == 0;
+		}();
 		const bool requires_depth_processing = (dst_image->aspect() & VK_IMAGE_ASPECT_STENCIL_BIT) || (format == CELL_GCM_TEXTURE_DEPTH16_FLOAT);
 		auto pdev = vk::get_current_renderer();
 		rsx::texture_uploader_capabilities caps{ .supports_dxt = pdev->get_texture_compression_bc_support(), .alignment = heap_align };
@@ -1176,7 +1299,20 @@ namespace vk
 			};
 
 			auto io_buf = rsx::io_buffer(buf_allocator);
+			rtt_load_diagnostics::span decode_diagnostic;
+			if (upload_diagnostic) decode_diagnostic.begin("cpu_layout", vk::get_current_frame_id());
 			opt = upload_texture_subresource(io_buf, layout, format, is_swizzled, caps);
+			if (decode_diagnostic)
+			{
+				decode_diagnostic.set(rtt_load_diagnostics::length, image_linear_size);
+				decode_diagnostic.set(rtt_load_diagnostics::width, layout.width_in_texel);
+				decode_diagnostic.set(rtt_load_diagnostics::height, layout.height_in_texel);
+				decode_diagnostic.set(rtt_load_diagnostics::pitch, row_pitch);
+				decode_diagnostic.set(rtt_load_diagnostics::require_upload, opt.require_upload);
+				decode_diagnostic.set(rtt_load_diagnostics::require_swap, opt.require_swap);
+				decode_diagnostic.set(rtt_load_diagnostics::require_deswizzle, opt.require_deswizzle);
+				decode_diagnostic.end();
+			}
 			upload_heap.unmap();
 
 			if (image_setup_flags & source_is_gpu_resident)
@@ -1224,10 +1360,65 @@ namespace vk
 					src_address = uptr(base_addr) - uptr(vm::g_base_addr);
 				}
 
+				rtt_load_diagnostics::span map_diagnostic;
+				if (upload_diagnostic) map_diagnostic.begin("dma_map", vk::get_current_frame_id());
 				auto dma_mapping = vk::map_dma(static_cast<u32>(src_address), static_cast<u32>(data_length));
+				if (map_diagnostic)
+				{
+					map_diagnostic.set(rtt_load_diagnostics::address, src_address);
+					map_diagnostic.set(rtt_load_diagnostics::length, data_length);
+					map_diagnostic.set(rtt_load_diagnostics::upload_buffer_uid, dma_mapping.second->uid());
+					map_diagnostic.set(rtt_load_diagnostics::upload_offset, dma_mapping.first);
+					map_diagnostic.end();
+				}
 
 				ensure(dma_mapping.second->size() >= (dma_mapping.first + data_length));
-				vk::load_dma(::narrow<u32>(src_address), data_length);
+				// Direct buffer-to-image transfers read only the active blocks in each row.
+				// Preserve the original mapping/stride, but avoid copying unused row padding.
+				// Conversion kernels may read whole rows, so leave those paths unchanged.
+				u32 row_bytes = 0;
+				bool sparse_rows = false;
+				if (sparse_dma_upload && !heap_align && !layout.border && !is_swizzled &&
+					!opt.require_swap && !opt.require_deswizzle && !requires_depth_processing && layout.depth == 1)
+				{
+					const u32 block_bytes = rsx::get_format_block_size_in_bytes(format);
+					row_bytes = layout.width_in_block * block_bytes;
+					sparse_rows = row_bytes >= 1024 && row_bytes <= row_pitch / 2 && layout.height_in_block > 1 &&
+						data_length >= 65536 && row_pitch == layout.pitch_in_block * block_bytes &&
+						static_cast<u64>(layout.height_in_block - 1) * row_pitch + row_bytes <= data_length;
+				}
+				if (sparse_rows)
+				{
+					for (u32 row = 0; row < layout.height_in_block; ++row)
+					{
+						vk::load_dma(::narrow<u32>(src_address + static_cast<u64>(row) * row_pitch), row_bytes);
+					}
+					static std::atomic_flag reported{};
+					if (!reported.test_and_set(std::memory_order_relaxed))
+					{
+						rsx_log.notice("Sparse texture DMA active: %u bytes instead of %u (%u rows, pitch %u)",
+							row_bytes * layout.height_in_block, data_length, layout.height_in_block, row_pitch);
+					}
+				}
+				else
+				{
+					rtt_load_diagnostics::span dma_diagnostic;
+					if (upload_diagnostic) dma_diagnostic.begin("dma_load", vk::get_current_frame_id());
+					vk::load_dma(::narrow<u32>(src_address), data_length);
+					if (dma_diagnostic)
+					{
+						dma_diagnostic.set(rtt_load_diagnostics::address, src_address);
+						dma_diagnostic.set(rtt_load_diagnostics::length, data_length);
+						dma_diagnostic.set(rtt_load_diagnostics::width, layout.width_in_texel);
+						dma_diagnostic.set(rtt_load_diagnostics::height, layout.height_in_texel);
+						dma_diagnostic.set(rtt_load_diagnostics::pitch, row_pitch);
+						dma_diagnostic.set(rtt_load_diagnostics::require_swap, opt.require_swap);
+						dma_diagnostic.set(rtt_load_diagnostics::require_deswizzle, opt.require_deswizzle);
+						dma_diagnostic.set(rtt_load_diagnostics::upload_buffer_uid, dma_mapping.second->uid());
+						dma_diagnostic.set(rtt_load_diagnostics::upload_offset, dma_mapping.first);
+						dma_diagnostic.end();
+					}
+				}
 
 				upload_buffer = dma_mapping.second;
 				offset_in_upload_buffer = dma_mapping.first;
@@ -1315,6 +1506,15 @@ namespace vk
 		}
 
 		ensure(upload_buffer);
+		rtt_load_diagnostics::span gpu_record_diagnostic;
+		if (upload_diagnostic)
+		{
+			gpu_record_diagnostic.begin("gpu_record", vk::get_current_frame_id());
+			gpu_record_diagnostic.set(rtt_load_diagnostics::require_swap, opt.require_swap);
+			gpu_record_diagnostic.set(rtt_load_diagnostics::require_deswizzle, opt.require_deswizzle);
+			gpu_record_diagnostic.set(rtt_load_diagnostics::upload_buffer_uid, upload_buffer->uid());
+			gpu_record_diagnostic.set(rtt_load_diagnostics::upload_offset, offset_in_upload_buffer);
+		}
 
 		if (opt.require_swap || opt.require_deswizzle || requires_depth_processing)
 		{

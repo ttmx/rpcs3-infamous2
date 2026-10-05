@@ -1,10 +1,14 @@
 #pragma once
 
+#include "RSXTailDemandTrace.hpp"
 #include "Emu/RSX/Common/simple_array.hpp"
 #include "Emu/RSX/Core/RSXContext.h"
 #include "Emu/RSX/Utils/algorithm.hpp"
 
 #include "texture_cache_utils.h"
+#include "cache_wait_diagnostics.hpp"
+#include "readback_chain_diagnostics.hpp"
+#include "readback_shared_window.hpp"
 #include "texture_cache_predictor.h"
 #include "texture_cache_helpers.h"
 #include "texture_cache_blit_helpers.h"
@@ -651,6 +655,7 @@ namespace rsx
 		 */
 
 		shared_mutex m_cache_mutex;
+		readback_shared_window m_readback_shared_window;
 		ranged_storage m_storage;
 		std::unordered_multimap<u32, std::pair<deferred_subresource, image_view_type>> m_temporary_subresource_cache;
 		std::vector<image_view_type> m_uncached_subresources;
@@ -757,6 +762,20 @@ namespace rsx
 		 * Internal implementation methods and helpers
 		 */
 
+		static bool shared_readback_hits_enabled()
+		{
+			if constexpr (requires(section_storage_type& section) { section.wait_for_gpu_readback(); })
+				return readback_shared_window_enabled();
+			return false;
+		}
+
+		static image_view_type existing_shared_hit_view(const section_storage_type& section, const texture_channel_remap_t& remap)
+		{
+			if constexpr (requires { section.get_existing_readback_window_view(remap); })
+				return section.get_existing_readback_window_view(remap);
+			return {};
+		}
+
 		inline bool region_intersects_cache(const address_range32 &test_range, bool is_writing)
 		{
 			AUDIT(test_range.valid());
@@ -794,6 +813,14 @@ namespace rsx
 		void flush_set(commandbuffer_type& cmd, thrashed_set& data, std::function<void()> on_data_transfer_completed, Args&&... extras)
 		{
 			AUDIT(!data.flushed);
+			readback_chain_trace::scope chain_batch("flush_batch", true);
+			if (tail_demand_trace::configured && tail_demand_trace::owner_fault)
+			{
+				for (const auto* section : data.sections_to_flush) tail_demand_trace::section(*section, 0);
+				for (const auto* section : data.sections_to_exclude) tail_demand_trace::section(*section, 1);
+				for (const auto* section : data.sections_to_unprotect) tail_demand_trace::section(*section, 2);
+			}
+			chain_batch.auxiliary(data.sections_to_flush.size(), data.sections_to_exclude.size());
 
 			if (data.sections_to_flush.size() > 1)
 			{
@@ -824,12 +851,16 @@ namespace rsx
 			{
 				// Batch all hard faults together
 				prepare_for_dma_transfers(cmd);
+				chain_batch.command(cmd);
+				readback_chain_trace::scope chain_record("flush_batch_record");
+				chain_record.command(cmd);
 
 				for (auto &surface : sections_to_transfer)
 				{
 					surface->copy_texture(cmd, true, std::forward<Args>(extras)...);
 				}
 
+				chain_record.finish();
 				cleanup_after_dma_transfers(cmd);
 			}
 
@@ -840,6 +871,45 @@ namespace rsx
 
 			for (auto &surface : data.sections_to_flush)
 			{
+				if constexpr (requires(section_storage_type& section) { section.wait_for_gpu_readback(); section.can_wait_for_gpu_readback(); })
+				{
+					if (shared_readback_hits_enabled() && data.sections_to_flush.size() == 1 &&
+						surface->get_context() == texture_upload_context::framebuffer_storage &&
+						surface->is_locked(true) && surface->can_wait_for_gpu_readback())
+					{
+						// Publish every affected page before opening reader admission.
+						// Exclusive cache ownership remains held throughout the wait.
+						auto& pages = m_readback_shared_window.reserved_pages;
+						auto reserve = [&](const auto& sections)
+						{
+							for (const auto* section : sections)
+							{
+								if (section->get_section_range().valid())
+									pages.push_back(section->get_section_range().to_page_range());
+								if (section->get_locked_range().valid())
+									pages.push_back(section->get_locked_range());
+                                if(readback_bound_framebuffer_enabled()||readback_bound_framebuffer_shadow())
+                                {
+                                 if constexpr(requires{section->readback_window_resource_identity();})
+                                 {
+                                  const auto id=section->readback_window_resource_identity();
+                                  if(!id.object||!id.memory||!id.image)m_readback_shared_window.resource_identities_complete=false;
+                                  else m_readback_shared_window.reserved_resources.push_back(id);
+                                 }
+                                 else m_readback_shared_window.resource_identities_complete=false;
+                                }
+							}
+						};
+						reserve(data.sections_to_flush);
+						reserve(data.sections_to_unprotect);
+						reserve(data.sections_to_exclude);
+						cache_wait_trace::probe window_trace("readback_frozen_window", false, surface->get_confirmed_range().start, surface->get_confirmed_range().length());
+						readback_shared_window::frozen_guard frozen(m_readback_shared_window);
+						surface->wait_for_gpu_readback();
+					}
+				}
+				readback_chain_trace::scope chain_retire("readback_retirement");
+				chain_retire.range(surface->get_confirmed_range().start,surface->get_confirmed_range().length());
 				surface->flush();
 
 				// Exclude this region when flushing other sections that should not trample it
@@ -916,6 +986,8 @@ namespace rsx
 		//       Otherwise the page protections will end up incorrect and things will break!
 		void unprotect_set(thrashed_set& data)
 		{
+			readback_chain_trace::scope chain_unprotect("readback_unprotect");
+			chain_unprotect.range(data.fault_range.start,data.fault_range.length());
 			auto protect_ranges = [](address_range_vector32& _set, utils::protection _prot)
 			{
 				//u32 count = 0;
@@ -1898,6 +1970,62 @@ namespace rsx
 		section_storage_type *find_texture_from_dimensions(u32 rsx_address, u32 format, u16 width = 0, u16 height = 0, u16 depth = 0, u16 mipmaps = 0)
 		{
 			auto &block = m_storage.block_for(rsx_address);
+			if (texture_exact_index::enabled() && block.exact_address_index_valid())
+			{
+				static std::atomic<bool> activated{false};
+				if (!activated.exchange(true, std::memory_order_relaxed)) rsx_log.notice("Ordered exact texture lookup index active: original protection and match checks preserved");
+				for (const auto& candidate : block.exact_address_candidates(rsx_address))
+				{
+					auto& tex = *candidate.section;
+					if constexpr (check_unlocked)
+					{
+						if (!tex.is_locked()) continue;
+					}
+					if (!tex.is_dirty() && tex.matches(rsx_address, format, width, height, depth, mipmaps) && tex.sync_protection())
+						return &tex;
+				}
+				return nullptr;
+			}
+			if (texture_exact_index::shadow_enabled() && block.exact_address_index_valid() &&
+				readback_chain_trace::active() && texture_exact_index::admit_shadow())
+			{
+				readback_chain_trace::scope shadow("texture_exact_index_shadow");
+				if (shadow)
+				{
+					const auto candidates = block.exact_address_candidates(rsx_address);
+					std::size_t index = 0;
+					bool same_order = true;
+					for (auto& tex : block)
+					{
+						if (!tex.valid_range() || tex.get_section_base() != rsx_address) continue;
+						if (index >= candidates.size() || candidates[index].section != &tex) same_order = false;
+						++index;
+					}
+					same_order &= index == candidates.size();
+					section_storage_type* stock = nullptr;
+					u64 visited = 0;
+					for (auto& tex : block)
+					{
+						++visited;
+						if constexpr (check_unlocked) { if (!tex.is_locked()) continue; }
+						if (!tex.is_dirty() && tex.matches(rsx_address, format, width, height, depth, mipmaps) && tex.sync_protection())
+						{ stock = &tex; break; }
+					}
+					// Failed original sync_protection dirties the section. No second VM/CPU synchronization is run.
+					section_storage_type* indexed = nullptr;
+					for (const auto& candidate : candidates)
+					{
+						auto& tex = *candidate.section;
+						if constexpr (check_unlocked) { if (!tex.is_locked()) continue; }
+						if (!tex.is_dirty() && tex.matches(rsx_address, format, width, height, depth, mipmaps))
+						{ indexed = &tex; break; }
+					}
+					shadow.range(rsx_address, block.size());
+					shadow.auxiliary(candidates.size(), same_order && stock == indexed);
+					shadow.event(visited, stock);
+					return stock;
+				}
+			}
 			for (auto &tex : block)
 			{
 				if constexpr (check_unlocked)
@@ -2163,8 +2291,13 @@ namespace rsx
 		template <typename ...Args>
 		bool flush_all(commandbuffer_type& cmd, thrashed_set& data, std::function<void()> on_data_transfer_completed = {}, Args&&... extras)
 		{
+			cache_wait_trace::probe lock_trace("cache_flush_exclusive", false, data.fault_range.start, data.fault_range.length());
+			readback_chain_trace::scope chain_lock("cache_flush_exclusive");
+			chain_lock.command(cmd);chain_lock.range(data.fault_range.start,data.fault_range.length());
 			std::lock_guard lock(m_cache_mutex);
+			lock_trace.finish();chain_lock.finish(10000);
 
+			readback_chain_trace::scope chain_owner("cache_flush_owned",true);chain_owner.command(cmd);
 			AUDIT(data.cause.deferred_flush());
 			AUDIT(!data.flushed);
 
@@ -2380,6 +2513,9 @@ namespace rsx
 
 		image_view_type create_temporary_subresource(commandbuffer_type &cmd, deferred_subresource& desc)
 		{
+			readback_chain_trace::scope chain_temporary("temporary_consumer", true);
+			chain_temporary.command(cmd);chain_temporary.range(desc.address, desc.pitch * desc.height);
+			chain_temporary.auxiliary(static_cast<u64>(desc.op), desc.sections_to_copy.size());
 			if (!desc.do_not_cache) [[likely]]
 			{
 				const auto desc_key = desc.encoded_properties();
@@ -2390,7 +2526,10 @@ namespace rsx
 						continue;
 
 					if (desc.op == deferred_request_command::copy_image_dynamic)
+					{
+						readback_fallback_trace("stock_fallback_dynamic_copy_update", desc.address, desc.pitch * desc.height);
 						update_image_contents(cmd, It->second.second, desc);
+					}
 
 					if (It->second.first.remap.encoded != desc.remap.encoded)
 					{
@@ -2402,7 +2541,10 @@ namespace rsx
 				}
 			}
 
+			readback_chain_trace::scope chain_lock("temporary_lock_wait");
+			chain_lock.command(cmd);chain_lock.range(desc.address,desc.pitch * desc.height);
 			std::lock_guard lock(m_cache_mutex);
+			chain_lock.finish();
 			image_view_type result = 0;
 
 			switch (desc.op)
@@ -2450,6 +2592,7 @@ namespace rsx
 			case deferred_request_command::copy_image_static:
 			case deferred_request_command::copy_image_dynamic:
 			{
+				readback_fallback_trace("stock_fallback_temporary_copy_create", desc.address, desc.pitch * desc.height);
 				result = create_temporary_subresource_view(cmd, desc);
 				break;
 			}
@@ -2543,6 +2686,7 @@ namespace rsx
 				if (auto texptr = m_rtts.get_surface_at(attr.address);
 					helpers::check_framebuffer_resource(texptr, attr, extended_dimension))
 				{
+					readback_fallback_trace("stock_fallback_bound_surface", attr.address, memory_range.length());
 					const bool force_convert = !render_target_format_is_compatible(texptr, attr.gcm_format);
 
 					auto result = helpers::process_framebuffer_resource_fast<sampled_image_descriptor>(
@@ -2552,6 +2696,7 @@ namespace rsx
 					{
 						// A texture barrier is only necessary when the rendertarget is going to be bound as a shader input.
 						// If a temporary copy is to be made, this should not be invoked
+						readback_fallback_trace("stock_fallback_cyclic_texture_barrier", attr.address, memory_range.length());
 						insert_texture_barrier(cmd, texptr);
 					}
 
@@ -2568,6 +2713,7 @@ namespace rsx
 
 				if (!last.is_clipped) //<- A non-clipped hit fully contains the requested box. We're good to go with the framebuffer processing.
 				{
+					readback_fallback_trace("stock_fallback_merged_surface", attr.address, memory_range.length());
 					const bool force_convert = !render_target_format_is_compatible(last.surface, attr.gcm_format);
 
 					// Need to check for cyclic ref since we now allow offsets.
@@ -2579,6 +2725,7 @@ namespace rsx
 					if (!options.skip_texture_barriers && result.is_cyclic_reference)
 					{
 						ensure(surface_is_rop_target);
+						readback_fallback_trace("stock_fallback_cyclic_texture_barrier", attr.address, memory_range.length());
 						insert_texture_barrier(cmd, last.surface);
 					}
 
@@ -2636,6 +2783,7 @@ namespace rsx
 						break;
 					}
 
+					readback_fallback_trace("stock_fallback_local_exact", attr.address, memory_range.length());
 					return
 					{
 						cached_texture->get_view(remap),
@@ -2729,10 +2877,12 @@ namespace rsx
 							};
 
 							helpers::calculate_sample_clip_parameters(result, position2i(0, 0), size2i(attr.width, attr.height), size2i(normalized_width, last->get_height()));
+							readback_fallback_trace("stock_fallback_local_clip", attr.address, memory_range.length());
 							return result;
 						}
 
 						// Declare transfer rect in dest space and request coordinate transform
+						readback_fallback_trace("stock_fallback_local_copy", attr.address, memory_range.length());
 						const coord3u xfer_rect = { 0, 0, 0, attr.width, attr.height, 1 };
 						return
 						{
@@ -2753,6 +2903,7 @@ namespace rsx
 
 				auto result = helpers::merge_cache_resources<sampled_image_descriptor>(
 					cmd, overlapping_fbos, overlapping_locals, attr, scale, extended_dimension, remap, _pool);
+				readback_fallback_trace("stock_fallback_gather_merge", attr.address, memory_range.length());
 
 				const bool is_simple_subresource_copy =
 					(result.external_subresource_desc.op == deferred_request_command::copy_image_static) ||
@@ -3177,12 +3328,276 @@ namespace rsx
 			}
 
 			const auto lookup_range = utils::address_range32::start_length(attributes.address, attributes.pitch * required_surface_height);
-			reader_lock lock(m_cache_mutex);
+			cache_wait_trace::probe lock_trace("cache_upload_shared", false, lookup_range.start, lookup_range.length());
+			readback_chain_trace::scope chain_lock("cache_upload_shared");
+			chain_lock.command(cmd);chain_lock.range(lookup_range.start,lookup_range.length());
+			std::optional<sampled_image_descriptor> bound_shadow_expected;
+			if (shared_readback_hits_enabled())
+			{
+				const bool trace_rejections = readback_shared_rejections_enabled();
+				while (!m_cache_mutex.try_lock_shared())
+				{
+					if (!m_readback_shared_window.try_acquire())
+					{
+						std::this_thread::yield();
+						continue;
+					}
+					sampled_image_descriptor hit;
+					bool compressed_hit = false;
+					const char* rejection = "readback_reject_no_exact_match";
+					{
+						readback_shared_window::lease lease(m_readback_shared_window);
+                        if((readback_bound_framebuffer_enabled()||readback_bound_framebuffer_shadow()) &&
+                           !options.is_compressed_format && subsurface_count==1 &&
+                           extended_dimension==rsx::texture_dimension_extended::texture_dimension_2d &&
+                           rsx::get_current_renderer()->is_current_thread() &&
+                           m_rtts.address_is_bound(attributes.address))
+                        {
+                         bool admitted=false;
+                         auto* surface=m_rtts.get_surface_at(attributes.address);
+                         if constexpr(requires{surface->readback_window_can_build_deferred_copy();surface->readback_window_resource_identity();})
+                         {
+                          if(surface && helpers::check_framebuffer_resource(surface,attributes,extended_dimension) &&
+                             surface->readback_window_can_build_deferred_copy() &&
+                             texture_cache_helpers::force_strict_fbo_sampling(surface->samples()) &&
+                             render_target_format_is_compatible(surface,attributes.gcm_format) &&
+                             (helpers::is_gcm_depth_format(attributes.gcm_format)==surface->is_depth_surface() || (surface->is_depth_surface() && (attributes.gcm_format==CELL_GCM_TEXTURE_A8R8G8B8 || attributes.gcm_format==CELL_GCM_TEXTURE_X16))) &&
+                             surface->get_memory_range().valid() && lookup_range.inside(surface->get_memory_range()) &&
+                             m_readback_shared_window.disjoint(lookup_range.to_page_range()) &&
+                             m_readback_shared_window.disjoint(surface->get_memory_range().to_page_range()) &&
+                             m_readback_shared_window.resource_disjoint(surface->readback_window_resource_identity()))
+                          {
+                           admitted=true;
+                           if(cache_wait_trace::enabled){const auto now=cache_wait_trace::now();cache_wait_trace::record("readback_bound_descriptor_eligible",now,now,thread_ctrl::get_tid(),0,0,lookup_range.start,lookup_range.length());}
+                           if(readback_bound_framebuffer_shadow())
+                           {
+                            auto shadow_attributes=attributes;
+                            if(surface->is_depth_surface() && !helpers::is_gcm_depth_format(attributes.gcm_format))
+                             shadow_attributes.gcm_format=helpers::get_compatible_depth_format(attributes.gcm_format);
+                            const coord3u rect={0,0,0,attributes.width,attributes.height,1};
+                            bound_shadow_expected.emplace(deferred_subresource::create_copy(static_cast<image_resource_type>(surface),shadow_attributes,rect,rect,rsx::surface_transform::coordinate_transform,tex.decoded_remap(),true),texture_upload_context::framebuffer_storage,surface->format_class(),scale,extended_dimension,surface->base_addr);
+                            bound_shadow_expected->external_subresource_desc.cache_range=lookup_range;
+                            if(!bound_shadow_expected->ref_address)bound_shadow_expected->ref_address=attributes.address;
+                            bound_shadow_expected->surface_cache_tag=m_rtts.write_tag;
+                           }
+                           else
+                           {
+                            hit=helpers::process_framebuffer_resource_fast<sampled_image_descriptor>(cmd,surface,attributes,{},scale,extended_dimension,tex.decoded_remap(),true,false);
+                            ensure(hit.validate()&&!hit.image_handle&&!hit.is_cyclic_reference);
+                            hit.external_subresource_desc.cache_range=lookup_range;
+                            if(!hit.ref_address)hit.ref_address=attributes.address;
+                            hit.surface_cache_tag=m_rtts.write_tag;
+                            static std::atomic<bool> activated{false};
+                            if(!activated.exchange(true,std::memory_order_relaxed))rsx_log.notice("Experimental frozen-window bound framebuffer descriptor path activated");
+                            if(cache_wait_trace::enabled){const auto now=cache_wait_trace::now();cache_wait_trace::record("readback_bound_descriptor_hit",now,now,thread_ctrl::get_tid(),0,0,lookup_range.start,lookup_range.length());}
+                           }
+                          }
+                         }
+                         if(!admitted && readback_bound_framebuffer_shadow() && cache_wait_trace::enabled)
+                         {
+                          // Isolated diagnostic proposal: at most one rejection label per lookup.
+                          // Re-evaluated pure predicates under the same counted lease; never call get_surface.
+                          const char* reason="readback_bound_reject_unsupported_backend";
+                          if constexpr(requires{surface->readback_window_can_build_deferred_copy();surface->readback_window_resource_identity();})
+                          {
+                           reason=[&]() -> const char*
+                           {
+                            if(!surface)return "readback_bound_reject_no_surface";
+                            if(!helpers::check_framebuffer_resource(surface,attributes,extended_dimension))return "readback_bound_reject_shape_pitch";
+                            if(!surface->readback_window_can_build_deferred_copy())return surface->readback_window_deferred_copy_rejection();
+                            if(!texture_cache_helpers::force_strict_fbo_sampling(surface->samples()))return "readback_bound_reject_not_strict";
+                            if(!render_target_format_is_compatible(surface,attributes.gcm_format))return "readback_bound_reject_host_format";
+                            if(!(helpers::is_gcm_depth_format(attributes.gcm_format)==surface->is_depth_surface() || (surface->is_depth_surface() && (attributes.gcm_format==CELL_GCM_TEXTURE_A8R8G8B8 || attributes.gcm_format==CELL_GCM_TEXTURE_X16))))return "readback_bound_reject_depth_conversion";
+                            if(!surface->get_memory_range().valid())return "readback_bound_reject_invalid_full_range";
+                            if(!lookup_range.inside(surface->get_memory_range()))return "readback_bound_reject_lookup_outside";
+                            if(!m_readback_shared_window.disjoint(lookup_range.to_page_range()))return "readback_bound_reject_lookup_pages";
+                            if(!m_readback_shared_window.disjoint(surface->get_memory_range().to_page_range()))return "readback_bound_reject_surface_pages";
+                            if(!m_readback_shared_window.resource_identities_complete||m_readback_shared_window.reserved_resources.empty())return "readback_bound_reject_unknown_owner";
+                            const auto id=surface->readback_window_resource_identity();
+                            if(!id.object||!id.image||!id.memory)return "readback_bound_reject_unknown_candidate";
+                            for(const auto& owner:m_readback_shared_window.reserved_resources)
+                            {
+                             if(id.object==owner.object)return "readback_bound_reject_object_alias";
+                             if(id.image==owner.image)return "readback_bound_reject_image_alias";
+                             if(id.memory==owner.memory)return "readback_bound_reject_memory_alias";
+                            }
+                            return "readback_bound_reject_unclassified";
+                           }();
+                          }
+                          const auto now=cache_wait_trace::now();cache_wait_trace::record(reason,now,now,thread_ctrl::get_tid(),0,0,lookup_range.start,lookup_range.length());
+                         }
+                        }
+						if (options.is_compressed_format && readback_shared_compressed_enabled())
+						{
+							// Match the compressed stock branch: block order, dimensions
+							// with mipmaps=0, then protection sync, then first valid hit.
+							// A failed hash needs stock discard side effects, so fall back
+							// before accepting any later match. This path never mutates.
+							const ranged_storage& frozen_storage = m_storage;
+							for (const auto& candidate : frozen_storage.block_for(attributes.address))
+							{
+								if (candidate.is_dirty() || !candidate.matches(attributes.address, attributes.gcm_format,
+									attributes.width, attributes.height, attributes.depth, 0))
+									continue;
+								// get_locked_range requires logical protection, including hash.
+								// Unsupported first matches return to stock before any access.
+								if (candidate.get_context() != texture_upload_context::shader_read ||
+									!candidate.exists() || !candidate.is_managed() || !candidate.is_locked())
+								{
+									rejection = "readback_reject_compressed_resource";
+									break;
+								}
+								if (!m_readback_shared_window.disjoint(candidate.get_section_range().to_page_range()) ||
+									!m_readback_shared_window.disjoint(candidate.get_locked_range()))
+								{
+									rejection = "readback_reject_compressed_pages";
+									break;
+								}
+								// buffered_section::sync is const: lock strategy returns true,
+								// hash strategy recomputes the exact original stored hash.
+								// Do not call sync_protection: it discards on hash failure.
+								if (!candidate.sync())
+								{
+									rejection = "readback_reject_compressed_hash";
+									break;
+								}
+								const auto view = existing_shared_hit_view(candidate, tex.decoded_remap());
+								if (!view)
+								{
+									rejection = "readback_reject_compressed_view";
+									break;
+								}
+								hit = {view, candidate.get_context(), candidate.get_format_class(), scale,
+									candidate.get_image_type(), candidate.get_section_base()};
+								hit.surface_cache_tag = m_rtts.write_tag;
+								compressed_hit = hit.validate();
+								break;
+							}
+							// The uncompressed search below is intentionally inapplicable.
+						}
+						if (trace_rejections && !(options.is_compressed_format && readback_shared_compressed_enabled()))
+						{
+							if (subsurface_count != 1) rejection = "readback_reject_subresources";
+							else if (options.is_compressed_format) rejection = "readback_reject_compressed";
+							else if (options.prefer_surface_cache) rejection = "readback_reject_prefer_surface";
+							else if (!(options.lookup_mask & texture_upload_context::shader_read)) rejection = "readback_reject_lookup_mask";
+							else if (!m_readback_shared_window.disjoint(lookup_range.to_page_range())) rejection = "readback_reject_requested_pages";
+							else if (m_rtts.address_is_bound(attributes.address)) rejection = "readback_reject_bound_surface";
+						}
+
+						if (subsurface_count == 1 && !options.is_compressed_format && !options.prefer_surface_cache &&
+							(options.lookup_mask & texture_upload_context::shader_read) &&
+							m_readback_shared_window.disjoint(lookup_range.to_page_range()) &&
+							!m_rtts.address_is_bound(attributes.address))
+						{
+							const ranged_storage& frozen_storage = m_storage;
+							for (auto it = frozen_storage.range_begin(lookup_range, full_range, true); it != frozen_storage.range_end(); ++it)
+							{
+								auto& candidate = *it;
+								const auto context = candidate.get_context();
+								if (candidate.is_dirty() ||
+									!(static_cast<u32>(context) & options.lookup_mask & (texture_upload_context::shader_read |
+										texture_upload_context::blit_engine_src | texture_upload_context::blit_engine_dst)) ||
+									!candidate.matches(attributes.address, attributes.gcm_format, attributes.width,
+										attributes.height, attributes.depth, 0) ||
+									(attributes.height > 1 && !rsx::pitch_compatible<false>(&candidate, attributes.pitch, -1)))
+									continue;
+								// Only an existing view is accepted. No object, view cache,
+								// protection, index or readback metadata is changed.
+								if (candidate.get_context() != texture_upload_context::shader_read ||
+									!candidate.exists() || !candidate.is_managed() || candidate.is_dirty() ||
+									!candidate.is_locked(true) ||
+									!candidate.matches(attributes.address, attributes.gcm_format, attributes.width,
+										attributes.height, attributes.depth, attributes.mipmaps) ||
+									candidate.is_swizzled() != attributes.swizzled ||
+									candidate.get_image_type() != extended_dimension ||
+									!lookup_range.inside(candidate.get_confirmed_range()) ||
+									!m_readback_shared_window.disjoint(candidate.get_section_range().to_page_range()) ||
+									!m_readback_shared_window.disjoint(candidate.get_locked_range()))
+								{
+									if (trace_rejections)
+									{
+										if (candidate.get_context() != texture_upload_context::shader_read) rejection = "readback_reject_context";
+										else if (!candidate.exists()) rejection = "readback_reject_no_image";
+										else if (!candidate.is_managed()) rejection = "readback_reject_unmanaged";
+										else if (!candidate.is_locked(true)) rejection = "readback_reject_hashed_protection";
+										else if (!candidate.matches(attributes.address, attributes.gcm_format, attributes.width, attributes.height, attributes.depth, attributes.mipmaps)) rejection = "readback_reject_mipmaps";
+										else if (candidate.is_swizzled() != attributes.swizzled) rejection = "readback_reject_swizzle";
+										else if (candidate.get_image_type() != extended_dimension) rejection = "readback_reject_image_type";
+										else if (!lookup_range.inside(candidate.get_confirmed_range())) rejection = "readback_reject_confirmed_range";
+										else rejection = "readback_reject_section_pages";
+									}
+									break;
+								}
+								const auto view = existing_shared_hit_view(candidate, tex.decoded_remap());
+								if (!view)
+								{
+									rejection = "readback_reject_existing_view";
+									break;
+								}
+								hit = {view, candidate.get_context(),
+									candidate.get_format_class(), scale, extended_dimension, attributes.address};
+								hit.surface_cache_tag = m_rtts.write_tag;
+								break;
+							}
+						}
+					}
+					if (hit.validate())
+					{
+						m_readback_shared_window.hits.fetch_add(1, std::memory_order_relaxed);
+						if (cache_wait_trace::enabled)
+						{
+							const auto now = cache_wait_trace::now();
+							cache_wait_trace::record("readback_shared_hit", now, now, thread_ctrl::get_tid(), 0, 0, lookup_range.start, lookup_range.length());
+							if (compressed_hit)
+								cache_wait_trace::record("readback_shared_compressed_hit", now, now, thread_ctrl::get_tid(), 0, 0, lookup_range.start, lookup_range.length());
+						}
+						lock_trace.finish();chain_lock.finish(10000);
+						return hit;
+					}
+					m_readback_shared_window.misses.fetch_add(1, std::memory_order_relaxed);
+					if (cache_wait_trace::enabled)
+					{
+						const auto now = cache_wait_trace::now();
+						cache_wait_trace::record("readback_shared_miss", now, now, thread_ctrl::get_tid(), 0, 0, lookup_range.start, lookup_range.length());
+						if (trace_rejections)
+							cache_wait_trace::record(rejection, now, now, thread_ctrl::get_tid(), 0, 0, lookup_range.start, lookup_range.length());
+					}
+					// Lease has ended. A miss waits for the unchanged normal path.
+					m_cache_mutex.lock_shared();
+					break;
+				}
+			}
+			else
+			{
+				m_cache_mutex.lock_shared();
+			}
+			readback_shared_window::adopted_reader lock(m_cache_mutex);
+			lock_trace.finish();chain_lock.finish(10000);
 
 			auto result = fast_texture_search(cmd, attributes, scale, tex.decoded_remap(),
 				options, lookup_range, extended_dimension, m_rtts,
 				std::forward<Args>(extras)...);
+			if (readback_fallback_classification_enabled(attributes.address))
+			{
+				const char* classification = "stock_fallback_descriptor_invalid";
+				if (result.validate())
+				{
+					if (result.image_handle)
+						classification = result.upload_context == texture_upload_context::framebuffer_storage
+							? "stock_fallback_descriptor_framebuffer_view" : "stock_fallback_descriptor_local_view";
+					else if (result.external_subresource_desc.op == deferred_request_command::copy_image_dynamic)
+						classification = "stock_fallback_descriptor_dynamic_copy";
+					else if (result.external_subresource_desc.op == deferred_request_command::copy_image_static)
+						classification = "stock_fallback_descriptor_static_copy";
+					else
+						classification = "stock_fallback_descriptor_deferred_gather";
+				}
+				readback_fallback_trace(classification, attributes.address, lookup_range.length());
+			}
 
+			if(bound_shadow_expected && !result.validate() && cache_wait_trace::enabled)
+			{const auto now=cache_wait_trace::now();cache_wait_trace::record("readback_bound_shadow_invalid_stock",now,now,thread_ctrl::get_tid(),0,0,lookup_range.start,lookup_range.length());}
 			if (result.validate())
 			{
 				if (!result.image_handle) [[unlikely]]
@@ -3201,6 +3616,11 @@ namespace rsx
 				}
 
 				result.surface_cache_tag = m_rtts.write_tag;
+                if(bound_shadow_expected && cache_wait_trace::enabled)
+                {
+                 const bool equal=readback_bound_descriptor_equal(*bound_shadow_expected,result);
+                 const auto now=cache_wait_trace::now();cache_wait_trace::record(equal?"readback_bound_shadow_equal":"readback_bound_shadow_mismatch",now,now,thread_ctrl::get_tid(),0,0,lookup_range.start,lookup_range.length());
+                }
 
 				// A 3D texture keeps each mipmap level in its own group of depth slices separate as complete sub-textures.
 				// Scan for each of the mip levels individually. Best-effort impl, we cannot promise to capture all of them.
@@ -3313,6 +3733,7 @@ namespace rsx
 			}
 
 			// Do direct upload from CPU as the last resort
+			readback_fallback_trace("stock_fallback_cpu_upload", attributes.address, lookup_range.length());
 			m_texture_upload_misses_this_frame++;
 
 			const auto subresources_layout = get_subresources_layout(tex);
@@ -3398,6 +3819,7 @@ namespace rsx
 			// Check if src/dst are parts of render targets
 			typename surface_store_type::surface_overlap_info dst_subres;
 			bool use_null_region = false;
+			bool dst_integrity_reload = false;
 
 			// TODO: Handle cases where src or dst can be a depth texture while the other is a color texture - requires a render pass to emulate
 			// NOTE: Grab the src first as requirements for reading are more strict than requirements for writing
@@ -3439,6 +3861,7 @@ namespace rsx
 				// Do the transfer CPU side and we should eventually "read" the data on RCB/RDB barrier.
 				dst_subres.surface->invalidate_GPU_memory();
 				dst_subres.surface->state_flags |= rsx::surface_state_flags::force_data_load;
+				dst_integrity_reload = true;
 			}
 
 			if (src_is_render_target)
@@ -3536,7 +3959,11 @@ namespace rsx
 				}
 			}
 
+			cache_wait_trace::probe lock_trace("cache_blit_shared", false, dst_range.start, dst_range.length());
+			readback_chain_trace::scope chain_lock("cache_blit_shared");
+			chain_lock.command(cmd);chain_lock.range(dst_range.start,dst_range.length());
 			reader_lock lock(m_cache_mutex);
+			lock_trace.finish();chain_lock.finish(10000);
 
 			if (dst_is_render_target)
 			{
@@ -3777,7 +4204,18 @@ namespace rsx
 				}
 
 				// Commit any pending writes before we do the transfer. Writes will be done on super_ptr so locking beforehand is ok.
+				if constexpr (requires { dst_subres.surface->set_blit_coverage_context(dst_area, dst_integrity_reload, false); })
+				{
+					const bool discard_allowed = !use_null_region && vram_texture != dest_texture &&
+						!typeless_info.src_is_typeless && !typeless_info.dst_is_typeless &&
+						typeless_info.src_scaling_hint == 1.f && typeless_info.dst_scaling_hint == 1.f;
+					dst_subres.surface->set_blit_coverage_context(dst_area, dst_integrity_reload, discard_allowed);
+				}
 				m_rtts.prepare_transfer_target(cmd, dst_subres.surface, rsx::surface_access::transfer_write, std::forward<Args>(extras)...);
+				if constexpr (requires { dst_subres.surface->clear_blit_coverage_context(); })
+				{
+					dst_subres.surface->clear_blit_coverage_context();
+				}
 			}
 
 			if (src_is_render_target)

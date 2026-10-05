@@ -1,3 +1,4 @@
+#include "VK/VKLiveCtl.hpp"
 #include "stdafx.h"
 
 #include "Emu/Memory/vm.h"
@@ -9,10 +10,30 @@
 #include "Utilities/lockless.h"
 
 #include <thread>
+#include <cstdlib>
 #include "util/asm.hpp"
 
 namespace rsx
 {
+	// Optional offload of large vertex copies only (live control 4 = minimum bytes, 0 = off).
+	// Needs the offload thread, so it has to be requested at startup.
+	static bool copy_offload_available()
+	{
+		static const bool value = []
+		{
+			const char* option = std::getenv("RPCS3_RSX_COPY_OFFLOAD");
+			return option && option[0] == '1' && !option[1];
+		}();
+		return value;
+	}
+
+	static bool offload_copy(u32 length)
+	{
+		if (g_cfg.video.multithreaded_rsx) return true;
+		const u64 minimum = vk::live_ctl::get(4);
+		return minimum && length >= minimum && copy_offload_available();
+	}
+
 	struct dma_manager::offload_thread
 	{
 		lf_queue<transport_packet> m_work_queue;
@@ -24,7 +45,7 @@ namespace rsx
 
 		void operator ()()
 		{
-			if (!g_cfg.video.multithreaded_rsx)
+			if (!g_cfg.video.multithreaded_rsx && !copy_offload_available())
 			{
 				// Abort if disabled
 				return;
@@ -112,10 +133,14 @@ namespace rsx
 
 	void dma_manager::copy(void *dst, void *src, u32 length) const
 	{
-		if (length <= max_immediate_transfer_size || !g_cfg.video.multithreaded_rsx)
+		if (length <= max_immediate_transfer_size || !offload_copy(length))
 		{
 			const u32 vm_addr = vm::try_get_addr(src).first;
 			rsx::reservation_lock<true, 1> rsx_lock(vm_addr, length, g_cfg.video.strict_rendering_mode && vm_addr);
+			if (length >= 256 && (vk::live_ctl::get(3) & 1))
+			{
+				vk::live_ctl::prefetch_range(src, length, 0x40000);
+			}
 			std::memcpy(dst, src, length);
 		}
 		else

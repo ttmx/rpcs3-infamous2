@@ -147,12 +147,20 @@ namespace vk
 		std::unordered_map<u64, std::unique_ptr<vk::image_view>> views;
 		viewable_image* clone();
 
+	private:
+		u64 m_last_view_key = 0;
+		image_view* m_last_view = nullptr;
+
 	public:
 		using image::image;
 
 		virtual image_view* get_view(
 			const rsx::texture_channel_remap_t& remap,
 			VkImageAspectFlags mask = VK_IMAGE_ASPECT_COLOR_BIT | VK_IMAGE_ASPECT_DEPTH_BIT);
+
+		// Pure lookup: does not create views or update the last-view cache.
+		image_view* find_existing_view(const rsx::texture_channel_remap_t& remap,
+			VkImageAspectFlags mask = VK_IMAGE_ASPECT_COLOR_BIT | VK_IMAGE_ASPECT_DEPTH_BIT) const;
 
 		void set_native_component_layout(VkComponentMapping new_layout);
 	};

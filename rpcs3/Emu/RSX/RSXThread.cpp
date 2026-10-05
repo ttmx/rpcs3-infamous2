@@ -980,7 +980,12 @@ namespace rsx
 		method_registers.current_draw_clause.post_execute_cleanup(m_ctx);
 
 		m_graphics_state |= rsx::pipeline_state::framebuffer_reads_dirty;
-		m_eng_interrupt_mask |= rsx::backend_interrupt;
+
+		if (!(m_eng_interrupt_mask & rsx::backend_interrupt))
+		{
+			m_eng_interrupt_mask |= rsx::backend_interrupt;
+		}
+
 		ROP_sync_timestamp = rsx::get_shared_tag();
 
 		m_draw_processor.clear_push_buffers();
@@ -1368,7 +1373,11 @@ namespace rsx
 
 	void thread::do_local_task(FIFO::state state)
 	{
-		m_eng_interrupt_mask.clear(rsx::backend_interrupt);
+		// Test first: the locked clear is expensive and this runs for every FIFO round
+		if (m_eng_interrupt_mask & rsx::backend_interrupt)
+		{
+			m_eng_interrupt_mask.clear(rsx::backend_interrupt);
+		}
 
 		if (async_flip_requested & flip_request::emu_requested)
 		{
@@ -3499,8 +3508,10 @@ namespace rsx
 		}
 
 		// Reset current stats
+		if (rsx::profiling_timer::native_phase_diagnostics_enabled())
+			++m_native_stats_generation;
 		m_frame_stats = {};
-		m_profiler.enabled = !!g_cfg.video.debug_overlay;
+		m_profiler.enabled = !!g_cfg.video.debug_overlay || rsx::profiling_timer::native_phase_diagnostics_enabled();
 	}
 
 	f64 thread::get_cached_display_refresh_rate()

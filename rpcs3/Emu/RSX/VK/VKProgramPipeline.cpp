@@ -2,6 +2,8 @@
 #include "VKProgramPipeline.h"
 #include "VKResourceManager.h"
 #include "vkutils/descriptors.h"
+#include "vkutils/descriptor_reuse.h"
+#include "VKLiveCtl.hpp"
 #include "vkutils/device.h"
 #include "vkutils/image.h"
 #include "vkutils/sampler.h"
@@ -436,6 +438,12 @@ namespace vk
 				m_descriptor_pool.reset();
 			}
 
+			if (m_reuse_pool)
+			{
+				vkDestroyDescriptorPool(m_device, m_reuse_pool, nullptr);
+				m_reuse_pool = VK_NULL_HANDLE;
+			}
+
 			m_device = VK_NULL_HANDLE;
 		}
 
@@ -589,6 +597,135 @@ namespace vk
 			m_descriptor_template_cache_id = m_descriptor_set.cache_id();
 		}
 
+		// Everything a set is written with, slot by slot. False if a slot holds an image array (interpreter only).
+		bool descriptor_table_t::make_reuse_key(u64& hash, u64& handle_classes)
+		{
+			m_reuse_key.clear();
+			handle_classes = 0;
+
+			for (const auto& slot : m_descriptor_slots)
+			{
+				if (auto ptr = std::get_if<VkDescriptorImageInfoEx>(&slot))
+				{
+					m_reuse_key.push_back(ptr->resourceId);
+					m_reuse_key.push_back(reinterpret_cast<u64>(ptr->imageView));
+					m_reuse_key.push_back(reinterpret_cast<u64>(ptr->sampler));
+					m_reuse_key.push_back(u64{static_cast<u32>(ptr->imageLayout)} | (1ull << 60));
+					handle_classes |= vk::descriptor_reuse::handle_bit(reinterpret_cast<u64>(ptr->imageView)) | vk::descriptor_reuse::handle_bit(reinterpret_cast<u64>(ptr->sampler));
+				}
+				else if (auto ptr = std::get_if<VkDescriptorBufferInfoEx>(&slot))
+				{
+					m_reuse_key.push_back(ptr->resourceId);
+					m_reuse_key.push_back(reinterpret_cast<u64>(ptr->buffer));
+					m_reuse_key.push_back(ptr->offset);
+					m_reuse_key.push_back(ptr->range ^ (2ull << 60));
+				}
+				else if (auto ptr = std::get_if<VkDescriptorBufferViewEx>(&slot))
+				{
+					m_reuse_key.push_back(ptr->resourceId);
+					m_reuse_key.push_back(reinterpret_cast<u64>(ptr->view));
+					m_reuse_key.push_back(3ull << 60);
+				}
+				else
+				{
+					return false;
+				}
+			}
+
+			hash = 14695981039346656037ull;
+			for (const u64 word : m_reuse_key)
+			{
+				hash = (hash ^ word) * 1099511628211ull;
+				hash ^= hash >> 29;
+			}
+
+			return true;
+		}
+
+		// Command buffers that are still in flight may use the sets, so the pool goes through deferred disposal
+		void descriptor_table_t::retire_reuse_pool()
+		{
+			if (!m_reuse_pool)
+			{
+				return;
+			}
+
+			auto cleanup_obj = std::make_unique<gc_callback_t>([device = m_device, pool = m_reuse_pool]()
+			{
+				vkDestroyDescriptorPool(device, pool, nullptr);
+			});
+			vk::get_gc()->dispose(cleanup_obj);
+
+			for (u32 i = 0; m_reuse_entries && i < reuse_entry_count; i++)
+			{
+				m_reuse_entries[i].set = VK_NULL_HANDLE;
+			}
+
+			m_reuse_pool = VK_NULL_HANDLE;
+			m_reuse_pool_used = 0;
+			m_reuse_pool_sets = std::min(m_reuse_pool_sets * 2, reuse_pool_max_sets);
+			m_reuse_free_sets.clear();
+			vk::descriptor_reuse::pools_retired++;
+		}
+
+		// VK_NULL_HANDLE if the pool cannot provide one; the caller then writes a regular set
+		VkDescriptorSet descriptor_table_t::allocate_reusable_set()
+		{
+			if (m_reuse_free_sets.empty())
+			{
+				constexpr u32 batch = 64;
+
+				if (m_reuse_pool && m_reuse_pool_used + batch > m_reuse_pool_sets)
+				{
+					retire_reuse_pool();
+				}
+
+				if (!m_reuse_pool)
+				{
+					auto sizes = m_descriptor_pool_sizes.map([count = m_reuse_pool_sets](const VkDescriptorPoolSize& size)
+					{
+						auto ret = size;
+						ret.descriptorCount *= count;
+						return ret;
+					});
+
+					VkDescriptorPoolCreateInfo info = {};
+					info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+					info.flags = vk::g_render_device->get_descriptor_update_after_bind_support() ? VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT : 0;
+					info.maxSets = m_reuse_pool_sets;
+					info.poolSizeCount = ::size32(sizes);
+					info.pPoolSizes = sizes.data();
+
+					if (vkCreateDescriptorPool(m_device, &info, nullptr, &m_reuse_pool) != VK_SUCCESS)
+					{
+						m_reuse_pool = VK_NULL_HANDLE;
+						return VK_NULL_HANDLE;
+					}
+				}
+
+				VkDescriptorSetLayout layouts[batch];
+				std::fill_n(layouts, batch, m_descriptor_set_layout);
+
+				VkDescriptorSetAllocateInfo alloc_info = {};
+				alloc_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+				alloc_info.descriptorPool = m_reuse_pool;
+				alloc_info.descriptorSetCount = batch;
+				alloc_info.pSetLayouts = layouts;
+
+				m_reuse_free_sets.resize(batch);
+				if (vkAllocateDescriptorSets(m_device, &alloc_info, m_reuse_free_sets.data()) != VK_SUCCESS)
+				{
+					m_reuse_free_sets.clear();
+					m_reuse_pool_used = m_reuse_pool_sets;
+					return VK_NULL_HANDLE;
+				}
+
+				m_reuse_pool_used += batch;
+			}
+
+			return m_reuse_free_sets.pop_back();
+		}
+
 		VkDescriptorSet descriptor_table_t::commit()
 		{
 			if (!m_descriptor_set)
@@ -603,7 +740,90 @@ namespace vk
 				return m_descriptor_set.value();
 			}
 
-			m_descriptor_set = allocate_descriptor_set();
+			// A set that was already written with exactly these contents is bound again instead of writing another one.
+			// Tables that rarely change are left alone.
+			reuse_entry_t* reuse_entry = nullptr;
+			u64 reuse_hash = 0, reuse_classes = 0;
+			VkDescriptorSet new_set = VK_NULL_HANDLE;
+
+			if (vk::live_ctl::get(12) == 1 && !m_descriptor_template.empty() && ++m_reuse_commits > 64)
+			{
+				m_reuse_commits = 65;
+
+				if (make_reuse_key(reuse_hash, reuse_classes))
+				{
+					if (!m_reuse_entries)
+					{
+						m_reuse_entries = std::make_unique<reuse_entry_t[]>(reuse_entry_count);
+						m_reuse_retire_tag = vk::descriptor_reuse::retire_count.load(std::memory_order_acquire);
+					}
+
+					if (vk::descriptor_reuse::retire_count.load(std::memory_order_acquire) != m_reuse_retire_tag)
+					{
+						// A destroyed view or sampler may give its handle value to another object
+						u64 handles[16], retired = 0;
+						u32 handle_count = 0;
+						const bool listed = vk::descriptor_reuse::retired_since(m_reuse_retire_tag, handles, 16, handle_count, retired);
+
+						for (u32 i = 0; i < reuse_entry_count; i++)
+						{
+							auto& entry = m_reuse_entries[i];
+							if (!entry.set || !(entry.handle_classes & retired))
+							{
+								continue;
+							}
+
+							// Same class: look for the value itself (any word of the key, which errs on the side of dropping)
+							bool drop = !listed;
+							for (u32 n = 0; n < handle_count && !drop; n++)
+							{
+								drop = std::find(entry.key.begin(), entry.key.end(), handles[n]) != entry.key.end();
+							}
+
+							if (drop)
+							{
+								entry.set = VK_NULL_HANDLE;
+								vk::descriptor_reuse::dropped++;
+							}
+						}
+
+						vk::descriptor_reuse::syncs++;
+					}
+
+					reuse_entry = &m_reuse_entries[reuse_hash % reuse_entry_count];
+
+					if (reuse_entry->set && reuse_entry->hash == reuse_hash && reuse_entry->key == m_reuse_key)
+					{
+						// The slots that changed stay marked: the write template still has their previous values
+						m_descriptor_set = reuse_entry->set;
+						m_any_descriptors_dirty = false;
+						vk::descriptor_reuse::hits++;
+						return reuse_entry->set;
+					}
+
+					// Retiring the pool clears the entries, this one included
+					new_set = allocate_reusable_set();
+
+					if (new_set)
+					{
+						reuse_entry->hash = reuse_hash;
+						reuse_entry->handle_classes = reuse_classes;
+						reuse_entry->set = new_set;
+						reuse_entry->key = m_reuse_key;
+						vk::descriptor_reuse::misses++;
+					}
+					else
+					{
+						vk::descriptor_reuse::fallbacks++;
+					}
+				}
+				else
+				{
+					vk::descriptor_reuse::unkeyed++;
+				}
+			}
+
+			m_descriptor_set = new_set ? new_set : allocate_descriptor_set();
 
 			if (!m_descriptor_template.empty()) [[ likely ]]
 			{

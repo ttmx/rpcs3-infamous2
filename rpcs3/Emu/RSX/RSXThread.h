@@ -158,6 +158,7 @@ namespace rsx
 		// Profiler
 		rsx::profiling_timer m_profiler;
 		frame_statistics_t m_frame_stats{};
+		u64 m_native_stats_generation = 0; // Only advanced by opt-in counter diagnostics.
 
 		// Savestates related
 		u32 m_pause_after_x_flips = 0;
@@ -352,6 +353,10 @@ namespace rsx
 		virtual void emit_geometry(u32) {}
 
 		void run_FIFO();
+
+		// The plain cases of run_FIFO's flow control (jump elsewhere, call, return), for a consumer that reads the
+		// command stream itself. The FIFO has to be positioned on the command word. False: nothing was done.
+		bool fifo_flow_control(u32 cmd);
 
 	public:
 		thread(const thread&) = delete;

@@ -37,6 +37,7 @@ namespace vk
 		std::array<VkPipelineStageFlags, 4> wait_stages {};
 		u32 wait_semaphores_count = 0;
 		u32 signal_semaphores_count = 0;
+		u64 diagnostic_generation = 0, diagnostic_access = 0;
 
 		queue_submit_t() = default;
 		queue_submit_t(VkQueue queue_, vk::fence* fence_)
@@ -70,6 +71,7 @@ namespace vk
 
 		command_pool* pool = nullptr;
 		VkCommandBuffer commands = nullptr;
+		u64 m_diagnostic_recording_generation = 0;
 
 		// State cache
 		mutable std::array<VkDescriptorSet, 2> m_bound_descriptor_sets {{ VK_NULL_HANDLE }};
@@ -118,6 +120,8 @@ namespace vk
 		command_pool& get_command_pool() const { return *pool; }
 		u32 get_queue_family() const { return pool->get_queue_family(); }
 		bool is_recording() const { return is_open; }
+		u64 diagnostic_recording_generation() const { return m_diagnostic_recording_generation; }
+		u64 diagnostic_command_key() const { return reinterpret_cast<std::uintptr_t>(commands); }
 
 		void clear_flags() { flags = 0; }
 		void set_flag(command_buffer_data_flag flag) { flags |= flag; }

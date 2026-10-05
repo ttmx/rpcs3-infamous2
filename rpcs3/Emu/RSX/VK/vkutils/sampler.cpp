@@ -1,5 +1,6 @@
 #include "memory.h"
 #include "sampler.h"
+#include "descriptor_reuse.h"
 #include "../../Utils/color_utils.hpp"
 #include "../../Utils/algorithm.hpp"
 
@@ -103,6 +104,8 @@ namespace vk
 
 	sampler::~sampler()
 	{
+		descriptor_reuse::retire_handle(reinterpret_cast<u64>(value));
+		descriptor_reuse::retired_samplers++;
 		vkDestroySampler(m_device, value, nullptr);
 		vmm_notify_object_freed(VMM_ALLOCATION_POOL_SAMPLER);
 	}

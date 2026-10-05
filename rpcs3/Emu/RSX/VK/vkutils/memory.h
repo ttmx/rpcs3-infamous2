@@ -74,6 +74,7 @@ namespace vk
 		vmm_allocation_pool pool = VMM_ALLOCATION_POOL_UNDEFINED;
 		bool throw_on_fail = true;
 		bool recover_vmem_on_fail = true;
+		u32* diagnostic_selected_type = nullptr; // Optional immutable diagnostic metadata.
 	};
 
 	class mem_allocator_base
@@ -167,6 +168,7 @@ namespace vk
 		virtual void unmap();
 
 		u64 size() const;
+		u32 diagnostic_memory_type() const { return m_diagnostic_memory_type; }
 
 		memory_block(const memory_block&) = delete;
 		memory_block(memory_block&&)      = delete;
@@ -179,6 +181,7 @@ namespace vk
 		vk::mem_allocator_base* m_mem_allocator = nullptr;
 		mem_allocator_base::mem_handle_t m_mem_handle;
 		u64 m_size;
+		u32 m_diagnostic_memory_type = ~0u;
 	};
 
 	struct memory_block_host : public memory_block

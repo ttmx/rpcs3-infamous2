@@ -3,6 +3,7 @@
 #include "texture_cache_types.h"
 #include "texture_cache_predictor.h"
 #include "TextureUtils.h"
+#include "TextureExactAddressIndex.hpp"
 
 #include "Emu/Memory/vm.h"
 #include "Emu/RSX/Host/MM.h"
@@ -233,6 +234,7 @@ namespace rsx
 		u32 index = 0;
 		address_range32 range = {};
 		block_container_type sections = {};
+		texture_exact_index::ordered_address_index<section_storage_type> m_exact_address_index;
 		unowned_container_type unowned; // pointers to sections from other blocks that overlap this block
 		atomic_t<u32> exists_count = 0;
 		atomic_t<u32> locked_count = 0;
@@ -285,6 +287,8 @@ namespace rsx
 		inline u32 get_exists_count() const { return exists_count; }
 		inline u32 get_locked_count() const { return locked_count; }
 		inline u32 get_unreleased_count() const { return unreleased_count; }
+		inline bool exact_address_index_valid() const { return m_exact_address_index.valid(); }
+		inline auto exact_address_candidates(u32 address) const { return m_exact_address_index.find(address); }
 
 		/**
 		 * Utilities
@@ -319,6 +323,7 @@ namespace rsx
 			AUDIT(exists_count == 0);
 			AUDIT(unreleased_count == 0);
 			AUDIT(locked_count == 0);
+			m_exact_address_index.clear();
 			sections.clear();
 		}
 
@@ -375,12 +380,16 @@ namespace rsx
 			AUDIT(section.valid_range());
 			AUDIT(range.overlaps(section.get_section_base()));
 			add_owned_section_overlaps(section);
+			if (texture_exact_index::maintained())
+				m_exact_address_index.publish(section.get_section_base(), section.get_storage_ordinal(), &section);
 		}
 
 		inline void on_section_range_invalid(section_storage_type &section)
 		{
 			AUDIT(section.valid_range());
 			AUDIT(range.overlaps(section.get_section_base()));
+			if (texture_exact_index::maintained())
+				m_exact_address_index.revoke(section.get_section_base(), &section);
 			remove_owned_section_overlaps(section);
 		}
 
@@ -1059,6 +1068,7 @@ namespace rsx
 			return static_cast<const derived_type*>(this);
 		}
 
+		u32 m_storage_ordinal = 0;
 		bool dirty = true;
 		bool triggered_exists_callbacks = false;
 		bool triggered_unreleased_callbacks = false;
@@ -1094,6 +1104,7 @@ namespace rsx
 		predictor_entry_type* m_predictor_entry = nullptr;
 
 	public:
+		u32 get_storage_ordinal() const noexcept { return m_storage_ordinal; }
 		u64 cache_tag = 0;
 		u64 last_write_tag = 0;
 
@@ -1111,6 +1122,7 @@ namespace rsx
 		void initialize(ranged_storage_block_type* block)
 		{
 			ensure(m_block == nullptr && m_tex_cache == nullptr && m_storage == nullptr);
+			m_storage_ordinal = block->size();
 			m_block = block;
 			m_storage = &block->get_storage();
 			m_tex_cache = &block->get_texture_cache();

@@ -1,4 +1,5 @@
 #include "stdafx.h"
+#include "Common/geometry_sync.h"
 
 #include "Emu/System.h"
 #include "RSXFIFO.h"
@@ -11,6 +12,10 @@
 
 #include "util/asm.hpp"
 
+#include <cstdlib>
+#include <chrono>
+#include <fstream>
+#include "Utilities/File.h"
 #include <thread>
 
 using spu_rdata_t = std::byte[128];
@@ -22,6 +27,135 @@ namespace rsx
 {
 	namespace FIFO
 	{
+		// Opt-in experiment: avoid the out-of-line fetch on already validated cache hits.
+		// All cache fills, reservation checks, PUT bounds and GET publication remain unchanged.
+		static const bool s_inline_cache_reads = []
+		{
+			const char* value = std::getenv("RPCS3_FIFO_INLINE_CACHE");
+			return value && value[0] == '1' && value[1] == '\0';
+		}();
+
+		// Opt-in transition trace only. It never edits GET, PUT or guest memory.
+		static const bool s_idle_trace_enabled = []
+		{
+			const char* value = std::getenv("RPCS3_FIFO_IDLE_TRACE");
+			return value && value[0] == '1' && value[1] == '\0';
+		}();
+
+		class idle_trace
+		{
+		public:
+			enum class stage { running, empty_put_get, empty_pending, self_jump, nop, busy, flow_control, error };
+		private:
+			static constexpr u64 minimum_span_ns = 10000;
+			static constexpr u64 maximum_rows = 262144;
+			std::ofstream m_output;
+			stage m_stage = stage::running;
+			u64 m_begin = 0, m_rows = 0, m_short_spans = 0, m_short_ns = 0, m_dropped = 0;
+			u32 m_get = 0, m_put = 0;
+			static u64 now()
+			{
+				return std::chrono::duration_cast<std::chrono::nanoseconds>(
+					std::chrono::steady_clock::now().time_since_epoch()).count();
+			}
+			static const char* label(stage value)
+			{
+				switch (value)
+				{
+				case stage::running: return "running";
+				case stage::empty_put_get: return "empty_put_get";
+				case stage::empty_pending: return "empty_pending";
+				case stage::self_jump: return "self_jump";
+				case stage::nop: return "nop";
+				case stage::busy: return "busy";
+				case stage::flow_control: return "flow_control";
+				case stage::error: return "error";
+				}
+				return "unknown";
+			}
+			void change(stage next, u32 get, u32 put)
+			{
+				if (next == m_stage || !m_output)
+					return;
+				const u64 end = now();
+				if (m_begin && m_stage != stage::running)
+				{
+					if (end - m_begin < minimum_span_ns)
+					{
+						++m_short_spans;
+						m_short_ns += end - m_begin;
+					}
+					else if (m_rows < maximum_rows)
+					{
+						m_output << label(m_stage) << ',' << m_begin << ',' << end << ','
+							<< m_get << ',' << m_put << ',' << get << ',' << put << ",1,"
+							<< m_short_spans << ',' << m_short_ns << ',' << m_dropped << '\n';
+						if (!(++m_rows % 256))
+							m_output.flush();
+					}
+					else
+					{
+						++m_dropped;
+						if (!(m_dropped & (m_dropped - 1)))
+						{
+							m_output << "trace_overflow," << m_begin << ',' << end << ','
+								<< m_get << ',' << m_put << ',' << get << ',' << put << ",0,"
+								<< m_short_spans << ',' << m_short_ns << ',' << m_dropped << '\n';
+							m_output.flush();
+						}
+					}
+				}
+				m_stage = next;
+				m_begin = end;
+				m_get = get;
+				m_put = put;
+			}
+		public:
+			idle_trace()
+			{
+				const char* requested = std::getenv("RPCS3_FIFO_IDLE_TRACE_PATH");
+				const std::string path = requested && *requested ? requested : fs::get_cache_dir() + "fifo-idle.csv";
+				m_output.open(path, std::ios::out | std::ios::trunc);
+				if (!m_output)
+				{
+					rsx_log.warning("FIFO idle trace could not open %s", path);
+					return;
+				}
+				m_output << "label,cpu_begin_ns,cpu_end_ns,get_begin,put_begin,get_end,put_end,completed,short_spans_total,short_duration_ns_total,dropped_total\n";
+			}
+			~idle_trace()
+			{
+				// Final open interval is explicitly incomplete; consumers must exclude it.
+				if (m_output && m_begin)
+					m_output << label(m_stage) << ',' << m_begin << ',' << now() << ','
+						<< m_get << ',' << m_put << ',' << m_get << ',' << m_put << ",0,"
+						<< m_short_spans << ',' << m_short_ns << ',' << m_dropped << '\n';
+			}
+			template <typename Fifo, typename Ctrl>
+			void transition(stage next, const Fifo& fifo, const Ctrl& ctrl)
+			{
+				// Identical state: no clock read, pointer loads or file IO.
+				if (next != m_stage)
+					change(next, fifo.get_pos(), ctrl.put.load());
+			}
+			template <typename Fifo, typename Ctrl>
+			void empty(const Fifo& fifo, const Ctrl& ctrl)
+			{
+				const u32 get = fifo.get_pos(), put = ctrl.put.load();
+				if ((put & ~3u) == get)
+					change(stage::empty_put_get, get, put);
+				else if (m_stage != stage::self_jump || m_get != get)
+					change(stage::empty_pending, get, put);
+				// A confirmed self-jump can subsequently return FIFO_EMPTY through memwatch.
+			}
+		};
+
+		static idle_trace& get_idle_trace()
+		{
+			thread_local idle_trace trace;
+			return trace;
+		}
+
 		FIFO_control::FIFO_control(::rsx::thread* pctrl)
 		{
 			m_thread = pctrl;
@@ -80,16 +214,21 @@ namespace rsx
 		{
 			if constexpr (!Full)
 			{
-				return m_ctrl->put & ~3;
+				const u32 put = m_ctrl->put & ~3;
+				rsx::geometry_sync::observe_put(put);
+				return put;
 			}
 			else
 			{
 				if (u32 put = m_ctrl->put; (put & 3) == 0) [[likely]]
 				{
+					rsx::geometry_sync::observe_put(put);
 					return put;
 				}
 
-				return m_ctrl->put.and_fetch(~3);
+				const u32 put = m_ctrl->put.and_fetch(~3);
+				rsx::geometry_sync::observe_put(put);
+				return put;
 			}
 		}
 
@@ -284,6 +423,16 @@ namespace rsx
 
 		bool FIFO_control::read_unsafe(register_pair& data)
 		{
+			const auto fetch_cached = [this](u32 addr) -> std::pair<bool, u32>
+			{
+				if (s_inline_cache_reads && addr - m_cache_addr < m_cache_size)
+				{
+					return {true, read_from_ptr_unsafe<be_t<u32>>(+m_cache[0], addr - m_cache_addr)};
+				}
+
+				return fetch_u32(addr);
+			};
+
 			// Fast read with no processing, only safe inside a PACKET_BEGIN+count block
 			if (m_remaining_commands)
 			{
@@ -294,7 +443,7 @@ namespace rsx
 
 				if (g_cfg.core.rsx_fifo_accuracy) [[ unlikely ]]
 				{
-					std::tie(ok, arg) = fetch_u32(m_fifo_pos);
+					std::tie(ok, arg) = fetch_cached(m_fifo_pos);
 
 					if (!ok)
 					{
@@ -359,6 +508,16 @@ namespace rsx
 
 		void FIFO_control::read(register_pair& data)
 		{
+			const auto fetch_cached = [this](u32 addr) -> std::pair<bool, u32>
+			{
+				if (s_inline_cache_reads && addr - m_cache_addr < m_cache_size)
+				{
+					return {true, read_from_ptr_unsafe<be_t<u32>>(+m_cache[0], addr - m_cache_addr)};
+				}
+
+				return fetch_u32(addr);
+			};
+
 			if (m_remaining_commands)
 			{
 				// Previous block aborted to wait for PUT pointer
@@ -408,7 +567,7 @@ namespace rsx
 			}
 			else
 			{
-				if (auto [ok, arg] = fetch_u32(m_fifo_pos); ok)
+				if (auto [ok, arg] = fetch_cached(m_fifo_pos); ok)
 				{
 					m_cmd = arg;
 				}
@@ -459,7 +618,7 @@ namespace rsx
 			{
 				m_fifo_pos += 4;
 
-				auto [ok, arg] = fetch_u32(m_fifo_pos);
+				auto [ok, arg] = fetch_cached(m_fifo_pos);
 
 				if (!ok)
 				{
@@ -660,6 +819,81 @@ namespace rsx
 		}
 	}
 
+	bool thread::fifo_flow_control(u32 cmd)
+	{
+		if (FIFO::s_idle_trace_enabled)
+		{
+			return false;
+		}
+
+		if (bit_set<2> jump_type; jump_type
+			.set_unsafe(0, (cmd & RSX_METHOD_OLD_JUMP_CMD_MASK) == RSX_METHOD_OLD_JUMP_CMD)
+			.set_unsafe(1, (cmd & RSX_METHOD_NEW_JUMP_CMD_MASK) == RSX_METHOD_NEW_JUMP_CMD)
+			.any())
+		{
+			const u32 offs = cmd & (jump_type.test_unsafe(0) ? RSX_METHOD_OLD_JUMP_OFFSET_MASK : RSX_METHOD_NEW_JUMP_OFFSET_MASK);
+
+			if (offs == fifo_ctrl->get_pos())
+			{
+				// Jump to self: the guest is being waited for
+				return false;
+			}
+
+			rsx::geometry_sync::point(rsx::geometry_sync::jump);
+			last_known_code_start = offs;
+			fifo_ctrl->set_get(offs, cmd);
+			return true;
+		}
+
+		if ((cmd & RSX_METHOD_CALL_CMD_MASK) == RSX_METHOD_CALL_CMD)
+		{
+			if (fifo_ret_addr != RSX_CALL_STACK_EMPTY)
+			{
+				return false;
+			}
+
+			rsx::geometry_sync::point(rsx::geometry_sync::call);
+			const u32 offs = cmd & RSX_METHOD_CALL_OFFSET_MASK;
+			fifo_ret_addr = fifo_ctrl->get_pos() + 4;
+			fifo_ctrl->set_get(offs);
+			last_known_code_start = offs;
+			return true;
+		}
+
+		if ((cmd & RSX_METHOD_RETURN_MASK) == RSX_METHOD_RETURN_CMD)
+		{
+			if (fifo_ret_addr == RSX_CALL_STACK_EMPTY)
+			{
+				return false;
+			}
+
+			rsx::geometry_sync::point(rsx::geometry_sync::ret);
+
+			// Returning to another CALL, as in run_FIFO
+			if ((ctrl->put & ~3) != fifo_ret_addr)
+			{
+				if (u32 addr = iomap_table.get_addr(fifo_ret_addr); addr != umax)
+				{
+					const u32 cmd0 = vm::read32(addr);
+
+					if ((cmd0 & RSX_METHOD_CALL_CMD_MASK) == RSX_METHOD_CALL_CMD && cpu_flag::dbg_step - state)
+					{
+						fifo_ctrl->set_get(cmd0 & RSX_METHOD_CALL_OFFSET_MASK);
+						last_known_code_start = ctrl->get;
+						fifo_ret_addr += 4;
+						return true;
+					}
+				}
+			}
+
+			fifo_ctrl->set_get(std::exchange(fifo_ret_addr, RSX_CALL_STACK_EMPTY));
+			last_known_code_start = fifo_ctrl->get_pos();
+			return true;
+		}
+
+		return false;
+	}
+
 	void thread::run_FIFO()
 	{
 		FIFO::register_pair command;
@@ -673,6 +907,8 @@ namespace rsx
 			{
 			case FIFO::FIFO_NOP:
 			{
+				if (FIFO::s_idle_trace_enabled)
+					FIFO::get_idle_trace().transition(FIFO::idle_trace::stage::nop, *fifo_ctrl, *ctrl);
 				if (performance_counters.state == FIFO::state::running)
 				{
 					performance_counters.FIFO_idle_timestamp = get_system_time();
@@ -683,6 +919,9 @@ namespace rsx
 			}
 			case FIFO::FIFO_EMPTY:
 			{
+				rsx::geometry_sync::point(rsx::geometry_sync::fifo_empty);
+				if (FIFO::s_idle_trace_enabled)
+					FIFO::get_idle_trace().empty(*fifo_ctrl, *ctrl);
 				if (performance_counters.state == FIFO::state::running)
 				{
 					performance_counters.FIFO_idle_timestamp = get_system_time();
@@ -697,11 +936,15 @@ namespace rsx
 			}
 			case FIFO::FIFO_BUSY:
 			{
+				if (FIFO::s_idle_trace_enabled)
+					FIFO::get_idle_trace().transition(FIFO::idle_trace::stage::busy, *fifo_ctrl, *ctrl);
 				// Do something else
 				return;
 			}
 			case FIFO::FIFO_ERROR:
 			{
+				if (FIFO::s_idle_trace_enabled)
+					FIFO::get_idle_trace().transition(FIFO::idle_trace::stage::error, *fifo_ctrl, *ctrl);
 				rsx_log.error("FIFO error: possible desync event (last cmd = 0x%x)", get_fifo_cmd());
 				recover_fifo();
 				return;
@@ -715,8 +958,11 @@ namespace rsx
 				.any())
 			{
 				const u32 offs = cmd & (jump_type.test_unsafe(0) ? RSX_METHOD_OLD_JUMP_OFFSET_MASK : RSX_METHOD_NEW_JUMP_OFFSET_MASK);
+				rsx::geometry_sync::point(offs == fifo_ctrl->get_pos() ? rsx::geometry_sync::self_jump : rsx::geometry_sync::jump);
 				if (offs == fifo_ctrl->get_pos())
 				{
+					if (FIFO::s_idle_trace_enabled)
+						FIFO::get_idle_trace().transition(FIFO::idle_trace::stage::self_jump, *fifo_ctrl, *ctrl);
 					//Jump to self. Often preceded by NOP
 					if (performance_counters.state == FIFO::state::running)
 					{
@@ -728,6 +974,8 @@ namespace rsx
 				}
 				else
 				{
+					if (FIFO::s_idle_trace_enabled)
+						FIFO::get_idle_trace().transition(FIFO::idle_trace::stage::flow_control, *fifo_ctrl, *ctrl);
 					last_known_code_start = offs;
 				}
 
@@ -737,6 +985,8 @@ namespace rsx
 			}
 			if ((cmd & RSX_METHOD_CALL_CMD_MASK) == RSX_METHOD_CALL_CMD)
 			{
+				if (FIFO::s_idle_trace_enabled)
+					FIFO::get_idle_trace().transition(FIFO::idle_trace::stage::flow_control, *fifo_ctrl, *ctrl);
 				if (fifo_ret_addr != RSX_CALL_STACK_EMPTY)
 				{
 					// Only one layer is allowed in the call stack.
@@ -745,6 +995,7 @@ namespace rsx
 					return;
 				}
 
+				rsx::geometry_sync::point(rsx::geometry_sync::call);
 				const u32 offs = cmd & RSX_METHOD_CALL_OFFSET_MASK;
 				fifo_ret_addr = fifo_ctrl->get_pos() + 4;
 				fifo_ctrl->set_get(offs);
@@ -753,12 +1004,16 @@ namespace rsx
 			}
 			if ((cmd & RSX_METHOD_RETURN_MASK) == RSX_METHOD_RETURN_CMD)
 			{
+				if (FIFO::s_idle_trace_enabled)
+					FIFO::get_idle_trace().transition(FIFO::idle_trace::stage::flow_control, *fifo_ctrl, *ctrl);
 				if (fifo_ret_addr == RSX_CALL_STACK_EMPTY)
 				{
 					rsx_log.error("FIFO: RET found without corresponding CALL (last cmd = 0x%x)", get_fifo_cmd());
 					recover_fifo();
 					return;
 				}
+
+				rsx::geometry_sync::point(rsx::geometry_sync::ret);
 
 				// Optimize returning to another CALL
 				if ((ctrl->put & ~3) != fifo_ret_addr)
@@ -786,6 +1041,9 @@ namespace rsx
 			// If we reached here, this is likely an error
 			fmt::throw_exception("Unexpected command 0x%x (last cmd: 0x%x)", cmd, fifo_ctrl->last_cmd());
 		}
+
+		if (FIFO::s_idle_trace_enabled)
+			FIFO::get_idle_trace().transition(FIFO::idle_trace::stage::running, *fifo_ctrl, *ctrl);
 
 		if (const auto state = performance_counters.state;
 			state != FIFO::state::running)
@@ -904,6 +1162,22 @@ namespace rsx
 
 			const u32 reg = (command.reg & 0xffff) >> 2;
 			const u32 value = command.value;
+
+			if (rsx::geometry_sync::fifo_log) [[unlikely]]
+			{
+				rsx::geometry_sync::fifo_log->emplace_back(reg << 2, value);
+			}
+
+			if (rsx::geometry_sync::track_methods) [[unlikely]]
+			{
+				const bool consumable = (reg >= NV4097_SET_VERTEX_DATA_ARRAY_OFFSET && reg < NV4097_SET_VERTEX_DATA_ARRAY_OFFSET + 16) ||
+					reg == NV4097_SET_INDEX_ARRAY_ADDRESS || reg == NV4097_SET_INDEX_ARRAY_DMA ||
+					(reg >= NV4097_SET_TRANSFORM_CONSTANT_LOAD && reg < NV4097_SET_TRANSFORM_CONSTANT + 32) ||
+					reg == NV4097_SET_BEGIN_END || reg == NV4097_DRAW_INDEX_ARRAY ||
+					(reg >= NV4097_SET_VERTEX_DATA_ARRAY_FORMAT && reg < NV4097_SET_VERTEX_DATA_ARRAY_FORMAT + 16) ||
+					reg == NV4097_SET_SEMAPHORE_OFFSET || reg == NV4097_TEXTURE_READ_SEMAPHORE_RELEASE || reg == NV4097_NO_OPERATION;
+				rsx::geometry_sync::other_methods += !consumable;
+			}
 
 			m_ctx->register_state->decode(reg, value);
 

@@ -7,7 +7,13 @@ namespace vk
 
 	dma_mapping_handle map_dma(u32 local_address, u32 length);
 	void load_dma(u32 local_address, u32 length);
-	void flush_dma(u32 local_address, u32 length);
+	struct dma_source_observer
+	{
+		void* context = nullptr;
+		void (*observe)(void*, const void*, const buffer*, u32, u32, u32) = nullptr;
+	};
+	void flush_dma(u32 local_address, u32 length, const dma_source_observer* observer = nullptr);
+	void mark_dma_gpu_written(u32 local_address, u32 length);
 	void unmap_dma(u32 local_address, u32 length);
 
 	void clear_dma_resources();
@@ -24,6 +30,7 @@ namespace vk
 
 		u32 base_address = 0;
 		u8* memory_mapping = nullptr;
+		bool m_gpu_written = false;
 		std::unique_ptr<buffer> allocated_memory;
 
 		virtual void allocate(const render_device& dev, usz size);
@@ -38,8 +45,9 @@ namespace vk
 
 		virtual void init(const render_device& dev, u32 addr, usz size);
 		virtual void init(dma_block* parent, u32 addr, usz size);
-		virtual void flush(const utils::address_range32& range);
+		virtual void flush(const utils::address_range32& range, const dma_source_observer* observer = nullptr);
 		virtual void load(const utils::address_range32& range);
+		void mark_gpu_written();
 		std::pair<u32, buffer*> get(const utils::address_range32& range);
 
 		u32 start() const;
@@ -60,7 +68,7 @@ namespace vk
 		void unmap() override;
 
 	public:
-		void flush(const utils::address_range32& range) override;
+		void flush(const utils::address_range32& range, const dma_source_observer* observer = nullptr) override;
 		void load(const utils::address_range32& range) override;
 	};
 }

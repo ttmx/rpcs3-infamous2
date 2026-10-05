@@ -50,6 +50,8 @@ namespace vk
 		u32 persistent_window_offset;
 		u32 volatile_window_offset;
 		std::optional<std::tuple<VkDeviceSize, VkIndexType>> index_info;
+		bool static_vertices = false;  // Persistent stream is in the geometry cache's buffer, not the ring
+		bool static_indices = false;   // Same for the index data
 	};
 
 	struct command_buffer_chunk : public vk::command_buffer

@@ -1,6 +1,9 @@
 #include "stdafx.h"
 #include "Emu/RSX/VK/VKGSRenderTypes.hpp"
+#include "VKNativeSSAO.h"
+#include "VKNativeLighting.h"
 #include "VKTextureCache.h"
+#include "VKGSRender.h"
 #include "VKCompute.h"
 #include "VKAsyncScheduler.h"
 #include "vkutils/data_heap.h"
@@ -66,12 +69,31 @@ namespace vk
 
 	void cached_texture_section::dma_transfer(vk::command_buffer& cmd, vk::image* src, const areai& src_area, const utils::address_range32& valid_range, u32 pitch)
 	{
+		if(rsx::readback_chain_trace::configured)m_chain_transfer_cookie=rsx::readback_chain_trace::next_id();
+		rsx::readback_chain_trace::scope chain_dma("readback_record",true);
+		chain_dma.command(cmd);chain_dma.image(src);chain_dma.range(valid_range.start,valid_range.length());
+		chain_dma.auxiliary((static_cast<u64>(src_area.width())<<32)|static_cast<u32>(src_area.height()),pitch);
+        static const bool draw_attribution = []()
+        {
+            const auto* flag = std::getenv("RPCS3_VK_B_DRAW_ATTRIBUTION");
+            return flag && std::strcmp(flag, "1") == 0;
+        }();
+        if (draw_attribution)
+        {
+            if (auto* renderer = static_cast<VKGSRender*>(rsx::get_current_renderer()))
+                renderer->diagnostic_readback_begin(cmd, valid_range.start, valid_range.length(),
+                    static_cast<u32>(src_area.width()), static_cast<u32>(src_area.height()), pitch,
+                    m_chain_transfer_cookie, src, static_cast<bool>(chain_dma));
+        }
+
 		ensure(src->samples() == 1);
 
 		if (!m_device)
 		{
 			m_device = &cmd.get_command_pool().get_owner();
 		}
+
+		vk::native_lighting::on_readback(valid_range.start);
 
 		if (dma_fence)
 		{
@@ -99,6 +121,28 @@ namespace vk
 		const bool require_tiling = !!tiled_region;
 		const bool require_gpu_transform = require_format_conversion || pack_unpack_swap_bytes || require_tiling;
 
+		// Default-off structural metadata only; the existing armed CHAIN owns
+		// bounded storage and deferred output. No new GPU/VM access or command.
+		static const bool readback_variant_trace = []()
+		{
+			const auto* flag = std::getenv("RPCS3_VK_READBACK_VARIANT_TRACE");
+			return flag && std::strcmp(flag, "1") == 0;
+		}();
+		u32 diagnostic_shuffle_quantum = 0;
+
+		if (m_readback_phase) vk::get_resource_manager()->dispose(m_readback_phase);
+		if (m_readback_shadow) vk::get_resource_manager()->dispose(m_readback_shadow);
+		if (!require_format_conversion && pack_unpack_swap_bytes && !require_tiling &&
+			(src->aspect() & VK_IMAGE_ASPECT_COLOR_BIT) && internal_bpp == 4 &&
+			vk::get_format_element_size(src->format()).first == 4 &&
+			transfer_width == 1280 && transfer_height == 720 && rsx_pitch == real_pitch)
+		{
+			m_readback_phase = vk::readback_phase_sample::create(*m_device, cmd,
+				static_cast<bool>(chain_dma), m_chain_transfer_cookie, valid_range.start, valid_range.length());
+		}
+
+		vk::cs_shuffle_base* deferred_stock_shuffle = nullptr;
+		bool oop_compute_written = false;
 		auto dma_sync_region = valid_range;
 		dma_mapping_handle dma_mapping = { 0, nullptr };
 
@@ -106,10 +150,14 @@ namespace vk
 		{
 			if (dma_mapping.second && !force)
 			{
+				vk::mark_dma_gpu_written(dma_sync_region.start, dma_sync_region.length());
 				return;
 			}
 
 			dma_mapping = vk::map_dma(dma_sync_region.start, dma_sync_region.length());
+			// Every mapping in this readback function is subsequently written by GPU,
+			// including pitched readback that first uploads the surrounding bytes.
+			vk::mark_dma_gpu_written(dma_sync_region.start, dma_sync_region.length());
 			if (load)
 			{
 				vk::load_dma(dma_sync_region.start, dma_sync_region.length());
@@ -145,7 +193,9 @@ namespace vk
 			bool require_rw_barrier = true;
 			image_readback_options_t xfer_options{};
 			xfer_options.swap_bytes = require_format_conversion && pack_unpack_swap_bytes;
+			if (m_readback_phase) m_readback_phase->stamp(cmd, 0, VK_PIPELINE_STAGE_TRANSFER_BIT);
 			vk::copy_image_to_buffer(cmd, src, working_buffer, region, xfer_options);
+			if (m_readback_phase) m_readback_phase->stamp(cmd, 1, VK_PIPELINE_STAGE_TRANSFER_BIT);
 
 			// NOTE: For depth/stencil formats, copying to buffer and byteswap are combined into one step above
 			if (pack_unpack_swap_bytes && !require_format_conversion)
@@ -174,13 +224,34 @@ namespace vk
 						VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
 						VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
 
-					shuffle_kernel->run(cmd, working_buffer, task_length);
+					const bool defer_shadow = ((vk::readback_oop_shadow::available() && chain_dma) || vk::readback_oop_enabled()) &&
+						get_context() == rsx::texture_upload_context::framebuffer_storage && !require_tiling &&
+						src->format() == VK_FORMAT_B8G8R8A8_UNORM && elem_size == 4 &&
+						transfer_width == 1280 && transfer_height == 720 && rsx_pitch == real_pitch &&
+						valid_range.length() == 3686400 &&
+						(valid_range.start == 0x37400b80 || valid_range.start == 0x37784b80);
+					if (defer_shadow)
+					{
+						deferred_stock_shuffle = shuffle_kernel;
+					}
+					else
+					{
+						shuffle_kernel->run(cmd, working_buffer, task_length);
+						if (m_readback_phase) m_readback_phase->stamp(cmd, 2, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+					}
+					if (readback_variant_trace && chain_dma)
+					{
+						diagnostic_shuffle_quantum = shuffle_kernel->optimal_group_size * shuffle_kernel->kernel_size * 4;
+					}
 
 					if (!require_tiling)
 					{
-						vk::insert_buffer_memory_barrier(cmd, working_buffer->value, 0, task_length,
-							VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-							VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+						if (!deferred_stock_shuffle)
+						{
+							vk::insert_buffer_memory_barrier(cmd, working_buffer->value, 0, task_length,
+								VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+								VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+						}
 
 						require_rw_barrier = false;
 					}
@@ -296,12 +367,40 @@ namespace vk
 			if (rsx_pitch == real_pitch) [[likely]]
 			{
 				dma_sync(false);
+				if (deferred_stock_shuffle)
+				{
+					oop_compute_written = vk::readback_oop_fusion::run(*m_device, cmd, working_buffer, 0,
+						dma_mapping.second, dma_mapping.first, valid_range.start, task_length, m_chain_transfer_cookie);
+					if (oop_compute_written)
+					{
+						if (m_readback_phase)
+						{
+							m_readback_phase->stamp(cmd, 2, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+							m_readback_phase->stamp(cmd, 3, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+						}
+					}
+					else
+					{
+						// Diagnostic shadow reads untouched scratch before stock mutation.
+						m_readback_shadow = vk::readback_oop_shadow::record(*m_device, cmd, working_buffer, 0, dma_mapping.second,
+							m_chain_transfer_cookie, valid_range.start, dma_mapping.first, task_length);
+						deferred_stock_shuffle->run(cmd, working_buffer, task_length);
+						if (m_readback_phase) m_readback_phase->stamp(cmd, 2, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+						vk::insert_buffer_memory_barrier(cmd, working_buffer->value, 0, task_length,
+							VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+							VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+					}
+				}
 
-				VkBufferCopy copy = {};
-				copy.srcOffset = result_offset;
-				copy.dstOffset = dma_mapping.first;
-				copy.size = dma_sync_region.length();
-				vkCmdCopyBuffer(cmd, working_buffer->value, dma_mapping.second->value, 1, &copy);
+				if (!oop_compute_written)
+				{
+					VkBufferCopy copy = {};
+					copy.srcOffset = result_offset;
+					copy.dstOffset = dma_mapping.first;
+					copy.size = dma_sync_region.length();
+					vkCmdCopyBuffer(cmd, working_buffer->value, dma_mapping.second->value, 1, &copy);
+					if (m_readback_phase) m_readback_phase->stamp(cmd, 3, VK_PIPELINE_STAGE_TRANSFER_BIT);
+				}
 			}
 			else
 			{
@@ -337,12 +436,15 @@ namespace vk
 			vkCmdCopyImageToBuffer(cmd, src->value, src->current_layout, dma_mapping.second->value, 1, &region);
 		}
 
+		const bool shadow_compute_written = m_readback_shadow != nullptr || oop_compute_written;
 		// Post-transfer barrier on dma layer
 		vk::insert_buffer_memory_barrier(
 			cmd, dma_mapping.second->value,
 			dma_mapping.first, dma_sync_region.length(),
-			VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-			VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT
+			VK_PIPELINE_STAGE_TRANSFER_BIT | (shadow_compute_written ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT : 0),
+			VK_PIPELINE_STAGE_TRANSFER_BIT | (shadow_compute_written ? VK_PIPELINE_STAGE_HOST_BIT : 0),
+			VK_ACCESS_TRANSFER_WRITE_BIT | (shadow_compute_written ? VK_ACCESS_SHADER_WRITE_BIT : 0),
+			VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | (shadow_compute_written ? VK_ACCESS_HOST_READ_BIT : 0)
 		);
 
 		src->pop_layout(cmd);
@@ -350,10 +452,10 @@ namespace vk
 		VkBufferMemoryBarrier2KHR mem_barrier =
 		{
 			.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2_KHR,
-			.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT_KHR,      // Finish all transfer...
-			.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT_KHR,
-			.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT_KHR,  // ...before proceeding with any command
-			.dstAccessMask = 0,
+			.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT_KHR | (shadow_compute_written ? VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR : 0),
+			.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT_KHR | (shadow_compute_written ? VK_ACCESS_2_SHADER_WRITE_BIT_KHR : 0),
+			.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT_KHR | (shadow_compute_written ? VK_PIPELINE_STAGE_2_HOST_BIT_KHR : 0),
+			.dstAccessMask = shadow_compute_written ? VK_ACCESS_2_HOST_READ_BIT_KHR : 0,
 			.buffer = dma_mapping.second->value,
 			.offset = dma_mapping.first,
 			.size = valid_range.length()
@@ -361,6 +463,32 @@ namespace vk
 
 		// Create event object for this transfer and queue signal op
 		dma_fence = std::make_unique<vk::event>(*m_device, sync_domain::host);
+		if (readback_variant_trace && chain_dma)
+		{
+			const auto element_bytes = vk::get_format_element_size(src->format()).first;
+			const u64 variant = static_cast<u64>(require_format_conversion) |
+				(static_cast<u64>(pack_unpack_swap_bytes) << 1) |
+				(static_cast<u64>(require_tiling) << 2) |
+				(static_cast<u64>(require_gpu_transform) << 3) |
+				(static_cast<u64>(get_context() == rsx::texture_upload_context::framebuffer_storage) << 4) |
+				(static_cast<u64>((src->aspect() & VK_IMAGE_ASPECT_COLOR_BIT) != 0) << 5) |
+				(static_cast<u64>(internal_bpp) << 8) |
+				(static_cast<u64>(element_bytes) << 16) |
+				(static_cast<u64>(src->format()) << 32);
+			const auto& limits = m_device->gpu().get_limits();
+			rsx::readback_chain_trace::scope layout("readback_variant");
+			layout.command(cmd); layout.event(m_chain_transfer_cookie, dma_fence.get()); layout.image(src);
+			layout.range(valid_range.start, valid_range.length());
+			layout.auxiliary(variant, static_cast<u64>(limits.minStorageBufferOffsetAlignment));
+			rsx::readback_chain_trace::scope shader("readback_shuffle_geometry");
+			shader.command(cmd); shader.event(m_chain_transfer_cookie, dma_fence.get()); shader.image(dma_mapping.second);
+			shader.range(valid_range.start, valid_range.length());
+			shader.auxiliary(diagnostic_shuffle_quantum, limits.maxStorageBufferRange);
+		}
+		chain_dma.event(m_chain_transfer_cookie,dma_fence.get());
+		{rsx::readback_chain_trace::scope chain_dst("readback_destination_buffer");
+		 chain_dst.command(cmd);chain_dst.event(m_chain_transfer_cookie,dma_fence.get());chain_dst.image(dma_mapping.second);
+		 chain_dst.range(valid_range.start,valid_range.length());chain_dst.auxiliary(dma_mapping.first,dma_sync_region.length());}
 		dma_fence->signal(cmd,
 		{
 			.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
@@ -392,6 +520,7 @@ namespace vk
 
 	void texture_cache::on_section_destroyed(cached_texture_section& tex)
 	{
+		++material_release_tag;
 		if (tex.is_managed() && tex.exists())
 		{
 			auto disposable = vk::disposable_t::make(new cached_image_reference_t(this, tex.get_texture()));
@@ -413,6 +542,8 @@ namespace vk
 
 	void texture_cache::copy_transfer_regions_impl(vk::command_buffer& cmd, vk::image* dst, const rsx::simple_array<copy_region_descriptor>& sections_to_transfer) const
 	{
+		rsx::readback_chain_trace::scope chain_copy("temporary_copy_record",true);
+		chain_copy.command(cmd);chain_copy.image(dst);chain_copy.auxiliary(sections_to_transfer.size());
 		const auto dst_aspect = dst->aspect();
 		const auto dst_bpp = vk::get_format_texel_width(dst->format());
 
@@ -463,6 +594,10 @@ namespace vk
 			{
 				continue;
 			}
+
+			rsx::readback_chain_trace::scope chain_region("temporary_copy_requested_source");
+			chain_region.command(cmd);chain_region.image(section.src);
+			chain_region.auxiliary((static_cast<u64>(section.src_w)<<32)|section.src_h,(static_cast<u64>(section.dst_w)<<32)|section.dst_h);
 
 			const bool typeless = section.src->aspect() != dst_aspect ||
 				!formats_are_bitcast_compatible(dst, section.src);
@@ -1426,6 +1561,7 @@ namespace vk
 
 	void texture_cache::cleanup_after_dma_transfers(vk::command_buffer& cmd)
 	{
+		rsx::readback_chain_trace::scope chain_cleanup("readback_cleanup");chain_cleanup.command(cmd);
 		bool occlusion_query_active = !!(cmd.flags & vk::command_buffer::cb_has_open_query);
 		if (occlusion_query_active)
 		{
@@ -1470,7 +1606,9 @@ namespace vk
 			}
 
 			cmd.submit(submit_info, VK_TRUE);
-			vk::wait_for_fence(&submit_fence, GENERAL_WAIT_TIMEOUT);
+			{rsx::readback_chain_trace::scope chain_fence("readback_primary_fence_wait");chain_fence.command(cmd);
+		 chain_fence.auxiliary(reinterpret_cast<std::uintptr_t>(&submit_fence));
+		 vk::wait_for_fence(&submit_fence, GENERAL_WAIT_TIMEOUT);}
 
 			cmd.reset();
 			cmd.begin();
@@ -1689,7 +1827,42 @@ namespace vk
 		{
 			if (reply.dst_range.valid())
 			{
-				flush_if_cache_miss_likely(cmd, reply.dst_range);
+				// inFamous 2 hands its finished G-buffer to the SPU jobs by blitting two 1280x720 images to main memory,
+				// each as a 1024 pixel wide piece followed by the remaining 256. Give the image to the GPU ambient
+				// occlusion and lighting passes when the piece that completes it arrives, whether or not the guest ever
+				// reads the memory.
+				const u32 piece_offset = dst.rsx_address - reply.dst_range.start;
+
+				if (vk::native_lighting::is_gbuffer(reply.dst_range.start) && dst.pitch == 1280 * 4 &&
+					(piece_offset % dst.pitch) / 4 + dst.clip_width == 1280 && piece_offset / dst.pitch + dst.clip_height == 720) [[unlikely]]
+				{
+					vk::image* image = nullptr;
+					{
+						reader_lock lock(m_cache_mutex);
+
+						for (auto& region : m_storage.block_for(reply.dst_range))
+						{
+							if (!region.is_dirty() && region.is_flushable() && region.matches(reply.dst_range))
+							{
+								image = region.get_readback_source();
+								break;
+							}
+						}
+					}
+
+					if (image)
+					{
+						const areai area{ 0, 0, static_cast<s32>(image->width()), static_cast<s32>(image->height()) };
+						vk::native_ssao::on_gbuffer(cmd, image, area, reply.dst_range.start);
+						vk::native_lighting::on_gbuffer(cmd, image, area, reply.dst_range.start);
+					}
+				}
+
+				// No speculative readback of those two while no SPU job loads them; an unexpected reader still faults and flushes
+				if (!vk::native_lighting::readback_unneeded(reply.dst_range.start))
+				{
+					flush_if_cache_miss_likely(cmd, reply.dst_range);
+				}
 			}
 
 			return true;
