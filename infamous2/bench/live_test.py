@@ -2,7 +2,7 @@
 RPCS3 configuration folder laid out as profile/rpcs3) with keyboard input, and sends keys / takes screenshots.
 
   live_test.py launch <session dir> [NAME=VALUE | CFG:setting=value ...]
-  live_test.py status | stop | shot <out.png> | key <keys> [hold_s]
+  live_test.py status | stop | accept | shot <out.png> | key <keys> [hold_s]
 """
 import fcntl
 import hashlib
@@ -36,7 +36,7 @@ def game_window(record):
     if not verified(record): return None,None
     tree=subprocess.run(['xwininfo','-root','-tree'],capture_output=True,text=True,check=True).stdout
     for line in tree.splitlines():
-        m=re.match(r'\s*(0x[0-9a-f]+) "(.*)": \("rpcs3" "RPCS3"\)',line)
+        m=re.match(r'\s*(0x[0-9a-f]+) "(.*)": \("[^"]*" "RPCS3"\)',line)
         if not m: continue
         prop=subprocess.run(['xprop','-id',m[1],'_NET_WM_PID'],capture_output=True,text=True).stdout
         if re.search(r'=\s*'+str(record['pid'])+r'\b',prop): return m[1],m[2]
@@ -107,7 +107,11 @@ def serve(label, extra=()):
                 if not proc.name.isdigit(): continue
                 try:
                     rec=pid_record(int(proc.name))
-                    if rec['exe'] != str(binary): continue
+                    if rec['exe'] != str(binary):
+                        # An AppImage runs the emulator from its mount; the runtime names the image in APPIMAGE.
+                        if b'APPIMAGE='+str(binary).encode()+b'\0' not in (proc/'environ').read_bytes(): continue
+                        if Path(rec['exe']).name not in ('rpcs3','AppRun.wrapped'): continue
+                    elif binary.suffix=='.AppImage': continue
                 except (OSError,IndexError): continue
                 gpu=run.gpu_device()
                 rec.update(binary_sha256=digest,label=label,config_sha256=sha(cfg),cache=str(cache),profile=str(profile),
@@ -152,6 +156,13 @@ def main():
     if cmd=='launch': return launch(sys.argv[2],sys.argv[3:])
     record=json.loads((ROOT/'state.json').read_text())
     if cmd=='stop': return stop(record)
+    if cmd=='accept':
+        # Builds made outside upstream's master branch ask at every start whether to run an unofficial build: answer Yes.
+        tree=subprocess.run(['xwininfo','-root','-tree'],capture_output=True,text=True,check=True).stdout
+        for m in re.finditer(r'(0x[0-9a-f]+) "Experimental Build Warning": \("[^"]*" "RPCS3"\)',tree):
+            run.window=lambda pid=None:(m[1],'')
+            run.key('Alt_L,y')
+        return
     win,title=game_window(record)
     if cmd=='status': print(json.dumps(dict(verified=verified(record),window=win,title=title,record=record),indent=2))
     elif cmd=='shot':

@@ -35,7 +35,9 @@ It is not affiliated with or endorsed by the RPCS3 team.
 
 ## Using it
 
-Build as upstream describes in [BUILDING.md](BUILDING.md), then:
+Build as upstream describes in [BUILDING.md](BUILDING.md), or download the AppImage from the
+[releases page](https://github.com/ttmx/rpcs3-infamous2/releases) and pass it with `--rpcs3 path/to/rpcs3.AppImage`
+(you still need this repository for the launcher and its configuration). Then:
 
 ```sh
 infamous2/launch.py /path/to/inFamous2          # the disc folder that contains PS3_GAME
@@ -48,6 +50,8 @@ checkout by itself, uses your normal RPCS3 profile (firmware, saves, controller)
 `--set RPCS3_NATIVE_LIGHTING=0` to get the game's own lighting back.
 
 Requirements and limits:
+- The AppImage asks at every start whether to run an unofficial build. That is RPCS3's own warning for builds made
+  outside its master branch; answer Yes.
 - Linux, Vulkan. Nothing was tried on Windows, macOS, the OpenGL renderer, or Nvidia and Intel drivers.
 - The exact game version above (European disc, BCES01143, patched to 1.04). The GPU lighting and occlusion passes
   only switch on for that title ID, so other regional releases run the game's own SPU jobs and get only the general

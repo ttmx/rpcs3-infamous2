@@ -22,7 +22,7 @@ os.environ.setdefault('DISPLAY', ':0')
 def window(pid=None):
     out = subprocess.run(['xwininfo', '-root', '-tree'], capture_output=True, text=True).stdout
     for line in out.splitlines():
-        m = re.match(r'\s*(0x[0-9a-f]+) "(.*)": \("rpcs3" "RPCS3"\)', line)
+        m = re.match(r'\s*(0x[0-9a-f]+) "(.*)": \("[^"]*" "RPCS3"\)', line)
         if m and ('inFamous' in m.group(2) or 'FPS' in m.group(2)):
             return m.group(1), m.group(2)
     return None, None

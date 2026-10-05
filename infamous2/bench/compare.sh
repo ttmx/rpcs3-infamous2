@@ -10,9 +10,9 @@ label="$1"; flags="$2"; scene="$3"; arms="${4:-3}"
 case "$scene" in pier) state=pier-kb ;; dock) state=dock ;; city|street) state=city ;; *) echo "unknown scene"; exit 1 ;; esac
 extra=(); [ "$flags" = stock-nostrict ] && extra=("CFG:Strict Rendering Mode='false'")
 [ -n "$UNCAPPED" ] && extra+=("CFG:Frame limit='Off'" "CFG:Vblank Rate='120'")
-export LIVE_TEST_FLAGS="${flags%%-*}" LIVE_TEST_BOOT="$PWD/states/$state.SAVESTAT.zst" LIVE_TEST_CACHE=cache-geom
+export LIVE_TEST_FLAGS="${flags%%-*}" LIVE_TEST_BOOT="$PWD/states/$state.SAVESTAT.zst" LIVE_TEST_CACHE="${LIVE_TEST_CACHE:-cache-geom}"
 python3 live_test.py launch "sessions/$label" "${extra[@]}" >/dev/null || exit 1
-t=0; until python3 live_test.py status 2>/dev/null | grep -q 'FPS: [1-9]' || [ $t -ge 600 ]; do sleep 1; t=$((t+1)); done
+t=0; until python3 live_test.py status 2>/dev/null | grep -q 'FPS: [1-9]' || [ $t -ge 600 ]; do python3 live_test.py accept; sleep 1; t=$((t+1)); done
 python3 live_test.py status 2>/dev/null | grep -q 'FPS: [1-9]' || { echo 'game did not start'; python3 live_test.py stop; exit 1; }
 sleep "${SETTLE:-45}"
 [ "$scene" = street ] && { python3 live_test.py key Next 0.30; sleep 6; }
