@@ -26,6 +26,18 @@ Stock with Strict Rendering off on the left, this build uncapped on the right (F
 
 ![City street: 31.7 FPS stock, 62.0 FPS with this build](infamous2/docs/images/street-before-after.jpg)
 
+## The other two games
+
+- **inFamous: Festival of Blood** (NPEA00322) runs the same two SPU jobs as inFamous 2 at other guest addresses, so
+  both GPU passes now cover it: 29.5 to 89.2 FPS uncapped in its opening catacombs, 60 FPS at the cap with 2.3 SPU
+  cores. See [`festival/`](festival/README.md).
+- **inFamous** (BCES00609) has neither job; it is a forward renderer limited by draw calls and by its SPU threads.
+  The draw submission changes apply as they are (title screen city 54 to 76 FPS, first gameplay 47 to 66 uncapped),
+  and one new change makes RPCS3's accurate SPU float mode, which this game needs, about a tenth faster where the
+  SPUs are the limit. See [`infamous1/`](infamous1/README.md) for the whole list, change by change.
+
+Both were tested for an evening each, in their first minutes (and one open-city district of inFamous).
+
 These are software changes. The two host tuning steps that were also tried (a GPU clock floor and a power profile)
 are kept apart in [`infamous2/hardware/`](infamous2/hardware/) and are off unless you ask for them.
 
@@ -69,7 +81,7 @@ Requirements and limits:
 Each line is one change, with its switch in parentheses. The ones listed here are on by default: the emulator sets
 them itself at startup (`rpcs3/Emu/infamous2_defaults.h`) unless the variable is already in the environment, so
 `RPCS3_VK_FAST_DRAWS=0 rpcs3` turns one off, and the launcher still sets them explicitly. These switches are not
-specific to the game (only the two GPU passes check the title ID), so they are on for every title, and nothing but
+specific to the game (only the two GPU passes and the material binding default check the title ID), so they are on for every title, and nothing but
 inFamous 2 was tested with them. Figures are
 from the machine above and are not additive: they were measured at different stages and scenes.
 
@@ -148,6 +160,11 @@ the SPUs, and uploads the results as textures. Emulated, that round trip was mos
   added to the SPU pipeline, with its own object cache suffix.
 - **Native SPU kernel** (`RPCS3_SPU_NATIVE_RWV`): one hot kernel of the game is replaced by a hand-written AVX-512
   version, matched by its exact bytes.
+- **Accurate xfloat without doubles** (`RPCS3_SPU_XFLOAT_FAST`, acts only with `SPU XFloat Accuracy: Accurate`):
+  add, subtract, multiply, multiply-add and the compares run in single precision, which gives the same bits because
+  SPU threads already truncate and treat denormals as zero; operands and results outside the host float range take
+  the regular double code. inFamous, burning street: 71.2 to 80.9 FPS; 2.8 billion results checked against the
+  double code without a difference (`RPCS3_SPU_XFLOAT_FAST=2`). inFamous 2 runs Approximate and is not affected.
 - **Savestates**: creating one retries the SPU thread lock 60 times instead of 15. Savestates still crash with
   InstCombine on; `--config infamous2/bench/cfg-nostrict-compat.yml --set RPCS3_EXPERIMENT_SPU_INSTCOMBINE=0 --set
   RPCS3_SPU_NATIVE_RWV=0` makes them work, and states made that way load under the normal settings.

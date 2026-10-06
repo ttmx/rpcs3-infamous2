@@ -1,0 +1,251 @@
+diff --git a/rpcs3/Emu/Cell/PPUInfamousJobWait.h b/rpcs3/Emu/Cell/PPUInfamousJobWait.h
+new file mode 100644
+index 000000000..159b49908
+--- /dev/null
++++ b/rpcs3/Emu/Cell/PPUInfamousJobWait.h
+@@ -0,0 +1,27 @@
++#pragma once
++
++#include "util/types.hpp"
++
++class ppu_thread;
++
++// inFamous (BCES00609 v1.00): the function at 0x41fc38 waits for the game's worker threads in a spin loop. It calls
++// the function at 0x41d028 until that returns true: the smallest of seven 16-bit counters, one per worker, has
++// reached a target. On the console the loop has a core to itself; here it keeps a host core at full speed for about
++// a third of every frame.
++//
++// The nop at 0x41fc70, right after the poll, calls wait(): if the poll said no, the thread waits for a write to the
++// cache line of the counters (MONITORX/MWAITX), or a short time, and then the loop polls again as before. While it
++// waits the thread counts as paused, like in a system call, so that other threads' memory locks do not wait for it.
++// The other three callers of the poll do work between polls and are left alone.
++// RPCS3_INFAMOUS1_JOB_WAIT: 0 = off, otherwise the longest single wait in microseconds (default 50).
++namespace infamous1_job_wait
++{
++	constexpr u32 hook_address = 0x41fc70;
++
++	// The title, the switch and the bytes of both functions all match
++	bool enabled();
++
++	// object: the first argument of the waiting function (r30), target: the count to reach (r31), result: what the
++	// poll returned (r3)
++	void wait(ppu_thread& ppu, u32 object, u32 target, u32 result);
++}
+diff --git a/rpcs3/Emu/Cell/PPUThread.cpp b/rpcs3/Emu/Cell/PPUThread.cpp
+index fcd17f53a..1668edaa3 100644
+--- a/rpcs3/Emu/Cell/PPUThread.cpp
++++ b/rpcs3/Emu/Cell/PPUThread.cpp
+@@ -1,5 +1,6 @@
+ #include "stdafx.h"
+ #include "Utilities/JIT.h"
++#include "PPUInfamousJobWait.h"
+ #include "Utilities/StrUtil.h"
+ #include "util/serialization.hpp"
+ #include "Crypto/sha1.h"
+@@ -4964,6 +4965,7 @@ bool ppu_initialize(const ppu_module<lv2_obj>& info, bool check_only, u64 file_s
+ 			{ "__resupdate", reinterpret_cast<u64>(vm::reservation_update) },
+ 			{ "__resinterp", reinterpret_cast<u64>(ppu_reservation_fallback) },
+ 			{ "__escape", reinterpret_cast<u64>(+ppu_escape) },
++			{ "__infamous1_job_wait", reinterpret_cast<u64>(&infamous1_job_wait::wait) },
+ 			{ "__read_maybe_mmio32", reinterpret_cast<u64>(+ppu_read_mmio_aware_u32) },
+ 			{ "__write_maybe_mmio32", reinterpret_cast<u64>(+ppu_write_mmio_aware_u32) },
+ 		};
+@@ -5586,7 +5588,9 @@ bool ppu_initialize(const ppu_module<lv2_obj>& info, bool check_only, u64 file_s
+ 				settings += ppu_settings::daz_and_ftz;
+ 
+ 			// Write version, hash, CPU, settings
+-			fmt::append(obj_name, "v8-kusa-%s-%s-%s.obj", fmt::base57(output, 16), fmt::base57(settings), jit_compiler::cpu(g_cfg.core.llvm_cpu.to_string()));
++			// The job wait hook changes the code of one function of one title; that title gets object names of its own
++			fmt::append(obj_name, "v8-kusa-%s-%s-%s%s.obj", fmt::base57(output, 16), fmt::base57(settings), jit_compiler::cpu(g_cfg.core.llvm_cpu.to_string()),
++				infamous1_job_wait::enabled() ? "-jobwait1" : "");
+ 		}
+ 
+ 		if (cpu ? cpu->state.all_of(cpu_flag::exit) : Emu.IsStopped())
+@@ -6146,3 +6150,160 @@ static void ppu_initialize2(jit_compiler& jit, const ppu_module<lv2_obj>& module
+ 	jit.add(std::move(_module), cache_path);
+ #endif // LLVM_AVAILABLE
+ }
++
++// See PPUInfamousJobWait.h
++namespace infamous1_job_wait
++{
++	constexpr u32 poll_address = 0x41d028;
++	constexpr u32 loop_address = 0x41fc38;
++
++	// The two functions as the executable has them
++	constexpr u32 poll_code[]
++	{
++		0x80030000, 0x54842036, 0x7c840214, 0x38840040, 0x78840020, 0xa0040002, 0x7c2004ac, 0x5400043e,
++		0xa1240004, 0x7f890040, 0x409c0008, 0x7d204b78, 0xa1240006, 0x7f804840, 0x409d0008, 0x7d204b78,
++		0xa1240008, 0x7f804840, 0x409d0008, 0x7d204b78, 0xa124000a, 0x7f804840, 0x409d0008, 0x7d204b78,
++		0xa164000c, 0x7c090378, 0x7f805840, 0x409d0008, 0x7d695b78, 0xa004000e, 0x7f804840, 0x419c0008,
++		0x7d204b78, 0x7f802840, 0x38600000, 0x419c0008, 0x38600001, 0x7c6307b4, 0x4e800020,
++	};
++
++	constexpr u32 loop_code[]
++	{
++		0xf821ff71, 0x7c0802a6, 0xfba10078, 0xf80100a0, 0xfbc10080, 0xfbe10088, 0x7c7d1b78, 0xa3e3002a,
++		0x787e0020, 0x60000000, 0x7fc3f378, 0x38800003, 0x7fe5fb78, 0x4bffd3bd, 0x60000000, 0x5463063e,
++		0x2f830000, 0x419effe4, 0x7ba30020, 0x4bffdf7d, 0x60000000, 0xe80100a0, 0xeba10078, 0xebc10080,
++		0x7c0803a6, 0xebe10088, 0x38210090, 0x4e800020,
++	};
++
++	static u32 max_wait_us()
++	{
++		static const u32 value = []() -> u32
++		{
++			const char* option = std::getenv("RPCS3_INFAMOUS1_JOB_WAIT");
++			return option ? static_cast<u32>(std::strtoul(option, nullptr, 10)) : 50;
++		}();
++		return value;
++	}
++
++	static bool matches(u32 address, std::span<const u32> code)
++	{
++		if (!vm::check_addr(address, vm::page_readable, ::size32(code) * 4))
++		{
++			return false;
++		}
++
++		for (u32 i = 0; i < code.size(); i++)
++		{
++			if (vm::read32(address + i * 4) != code[i])
++			{
++				return false;
++			}
++		}
++
++		return true;
++	}
++
++	bool enabled()
++	{
++		return max_wait_us() && Emu.GetTitleID() == "BCES00609" && matches(poll_address, poll_code) && matches(loop_address, loop_code);
++	}
++
++	// What the poll computes: the smallest of the seven counters has reached the target
++	static bool reached(const be_t<u16>* counters, u32 target)
++	{
++		u32 lowest = counters[1];
++
++		for (u32 i = 2; i < 8; i++)
++		{
++			lowest = std::min<u32>(lowest, counters[i]);
++		}
++
++		return lowest >= target;
++	}
++
++#if defined(ARCH_X64)
++#if defined(_MSC_VER)
++#define infamous1_mwaitx_func
++#else
++#define infamous1_mwaitx_func __attribute__((__target__("mwaitx")))
++#endif
++	// Returns when the cache line of the counters is written, or after the given number of TSC cycles
++	infamous1_mwaitx_func static void monitor_wait(const be_t<u16>* counters, u32 target, u32 cycles)
++	{
++		_mm_monitorx(const_cast<be_t<u16>*>(counters), 0, 0);
++
++		if (!reached(counters, target))
++		{
++			// Timer enabled, C1
++			_mm_mwaitx(2, 0, cycles);
++		}
++	}
++#endif
++
++	void wait(ppu_thread& ppu, u32 object, u32 target, u32 result)
++	{
++		if (result & 0xff)
++		{
++			return;
++		}
++
++		// The poll's own address arithmetic for record 3
++		const u32 entry = vm::read32(object) + 3 * 16 + 0x40;
++
++		if (!vm::check_addr(entry, vm::page_readable, 16)) [[unlikely]]
++		{
++			return;
++		}
++
++		const auto counters = vm::_ptr<const be_t<u16>>(entry);
++
++		// Paused from here until check_state(): nothing below writes guest memory or depends on its layout
++		ppu.state += cpu_flag::wait;
++
++		const auto resume = [&]()
++		{
++			ppu.check_state();
++		};
++
++#if defined(ARCH_X64)
++		if (utils::has_waitx())
++		{
++			static const u32 cycles = ::narrow<u32>(max_wait_us() * (utils::get_tsc_freq() / 1000000ULL));
++
++			// RPCS3_INFAMOUS1_JOB_WAIT_STATS=1: how the waits end, logged every 65536 of them
++			static const bool stats = !!std::getenv("RPCS3_INFAMOUS1_JOB_WAIT_STATS");
++
++			if (!stats) [[likely]]
++			{
++				monitor_wait(counters, target, cycles);
++				resume();
++				return;
++			}
++
++			static atomic_t<u64> s_waits{0}, s_timeouts{0}, s_cycles{0}, s_done{0};
++			const u64 start = utils::get_tsc();
++			monitor_wait(counters, target, cycles);
++			const u64 elapsed = utils::get_tsc() - start;
++			s_cycles += elapsed;
++			if (elapsed >= cycles) s_timeouts++;
++			if (reached(counters, target)) s_done++;
++
++			if (!(++s_waits & 0xffff))
++			{
++				ppu_log.notice("inFamous job wait: %u waits, %u ran to the time limit, %u found the target reached, %.1f us on average",
++					s_waits.load(), s_timeouts.load(), s_done.load(), s_cycles.load() * 1e6 / utils::get_tsc_freq() / s_waits.load());
++			}
++
++			resume();
++			return;
++		}
++#endif
++		// No monitor: leave the core to the sibling thread for a moment
++		for (u32 i = 0; i < 64 && !reached(counters, target); i++)
++		{
++			utils::pause();
++		}
++
++		resume();
++	}
++}
+diff --git a/rpcs3/Emu/Cell/PPUTranslator.cpp b/rpcs3/Emu/Cell/PPUTranslator.cpp
+index b3fa92ed3..131de2788 100644
+--- a/rpcs3/Emu/Cell/PPUTranslator.cpp
++++ b/rpcs3/Emu/Cell/PPUTranslator.cpp
+@@ -4,6 +4,7 @@
+ #include "Emu/Cell/Common.h"
+ #include "Emu/Cell/lv2/sys_sync.h"
+ #include "PPUTranslator.h"
++#include "PPUInfamousJobWait.h"
+ #include "PPUThread.h"
+ #include "SPUThread.h"
+ 
+@@ -2583,6 +2584,14 @@ void PPUTranslator::RLWNM(ppu_opcode_t op)
+ 
+ void PPUTranslator::ORI(ppu_opcode_t op)
+ {
++	if (op.opcode == 0x60000000 && m_addr + (m_reloc ? m_reloc->addr : 0) == infamous1_job_wait::hook_address && infamous1_job_wait::enabled()) [[unlikely]]
++	{
++		// The nop after the poll in the spin loop: r30 = the object, r31 = the target, r3 = what the poll returned
++		Call(GetType<void>(), "__infamous1_job_wait", m_thread, m_ir->CreateTrunc(GetGpr(30), GetType<u32>()), m_ir->CreateTrunc(GetGpr(31), GetType<u32>()),
++			m_ir->CreateTrunc(GetGpr(3), GetType<u32>()));
++		return;
++	}
++
+ 	Value* imm = m_ir->getInt64(op.uimm16);
+ 
+ 	if (m_rel && (m_rel->type >= 4u && m_rel->type <= 6u))

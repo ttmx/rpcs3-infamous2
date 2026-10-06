@@ -1,0 +1,185 @@
+diff --git a/rpcs3/Emu/Cell/SPULLVMRecompiler.cpp b/rpcs3/Emu/Cell/SPULLVMRecompiler.cpp
+index f0dcd2a28..abb25bf3d 100644
+--- a/rpcs3/Emu/Cell/SPULLVMRecompiler.cpp
++++ b/rpcs3/Emu/Cell/SPULLVMRecompiler.cpp
+@@ -82,6 +82,10 @@ const extern spu_decoder<spu_iflag> g_spu_iflag;
+ #pragma GCC diagnostic pop
+ #endif
+ 
++// Counters of the check mode of g_spu_xfloat_shuffle (RPCS3_SPU_XFLOAT_SHUFFLE=2), reported by the renderer
++u64 g_spu_xfloat_shuffle_checks = 0;
++u64 g_spu_xfloat_shuffle_mismatches = 0;
++
+ namespace
+ {
+ 	const bool g_spu_04ac8_contribution_trace = []
+@@ -396,6 +400,21 @@ namespace
+ 		return value && std::string_view(value) == "1";
+ 	}();
+ 
++	// Accurate xfloat: values held as doubles stay doubles through whole-word shuffles, rotations and register moves
++	// instead of being converted to the SPU format and back (RPCS3_SPU_XFLOAT_SHUFFLE=0 turns it off)
++	const bool g_spu_xfloat_shuffle = []
++	{
++		const char* value = std::getenv("RPCS3_SPU_XFLOAT_SHUFFLE");
++		return !value || std::string_view(value) != "0";
++	}();
++
++	// RPCS3_SPU_XFLOAT_SHUFFLE=2: every such operation is also done the regular way and the two results are compared
++	const bool g_spu_xfloat_shuffle_check = []
++	{
++		const char* value = std::getenv("RPCS3_SPU_XFLOAT_SHUFFLE");
++		return value && std::string_view(value) == "2";
++	}();
++
+ 	const bool g_spu_native_rwv_experiment = []
+ 	{
+ 		const char* value = std::getenv("RPCS3_SPU_NATIVE_RWV");
+@@ -2392,6 +2411,7 @@ public:
+ 			+ ((m_trace_06c30 || m_trace_06c30_return) ? "-trace-06c30-EGC0gjYw3PwftJbtb6hXj7Xby6m5-wall-v1" : "")
+ 			+ (g_spu_04ac8_contribution_trace ? "-trace-04ac8-Hc9ev2Q8JGX0Fcwtuv18zKbed58C-tree-v4" : "")
+ 			+ (g_spu_native_rwv_experiment ? "-native-rwv-v1" : "")
++			+ (g_spu_xfloat_shuffle && g_cfg.core.spu_xfloat_accuracy == xfloat_accuracy::accurate ? (g_spu_xfloat_shuffle_check ? "-xfloat-shuffle-check-v1" : "-xfloat-shuffle-v1") : "")
+ 			+ (g_spu_native_sxe_experiment ? "-native-sxe-v1" : "")
+ 			+ (g_spu_native_07170_experiment ? "-native-07170-zero-v1" : "")
+ 			+ (g_spu_rsqrte_lut_experiment ? "-rsqrte-lut-v1" : "")
+@@ -6369,8 +6389,50 @@ public:
+ 		set_vr(op.rt, get_vr(op.rb) - get_vr(op.ra));
+ 	}
+ 
++	// The register's value, if it is held as doubles at this point (accurate xfloat)
++	llvm::Value* get_reg_xfloat_doubles(u32 index)
++	{
++		if (!g_spu_xfloat_shuffle || g_cfg.core.spu_xfloat_accuracy != xfloat_accuracy::accurate)
++		{
++			return nullptr;
++		}
++
++		const auto raw = get_reg_raw(index);
++		return raw && raw->getType() == get_type<f64[4]>() ? raw : nullptr;
++	}
++
++	// Check mode: count the operation, and a mismatch if the doubles do not convert to what the regular path gives
++	void check_xfloat_shuffle(llvm::Value* doubles, llvm::Value* regular)
++	{
++		if (!g_spu_xfloat_shuffle_check)
++		{
++			return;
++		}
++
++		const auto differs = m_ir->CreateICmpNE(m_ir->CreateBitCast(double_to_xfloat(doubles), get_type<u128>()), m_ir->CreateBitCast(regular, get_type<u128>()));
++		const auto count = [&](u64* counter, llvm::Value* amount)
++		{
++			const auto ptr = m_ir->CreateIntToPtr(m_ir->getInt64(reinterpret_cast<u64>(counter)), get_type<u64*>());
++			m_ir->CreateStore(m_ir->CreateAdd(m_ir->CreateLoad(get_type<u64>(), ptr), amount), ptr);
++		};
++
++		count(&g_spu_xfloat_shuffle_checks, m_ir->getInt64(1));
++		count(&g_spu_xfloat_shuffle_mismatches, m_ir->CreateZExt(differs, get_type<u64>()));
++	}
++
+ 	void OR(spu_opcode_t op)
+ 	{
++		if (op.ra == op.rb)
++		{
++			if (const auto doubles = get_reg_xfloat_doubles(op.ra))
++			{
++				// A register move
++				check_xfloat_shuffle(doubles, double_to_xfloat(doubles));
++				set_reg_fixed(op.rt, doubles, false);
++				return;
++			}
++		}
++
+ 		set_vr(op.rt, get_vr(op.ra) | get_vr(op.rb));
+ 	}
+ 
+@@ -7447,6 +7509,23 @@ public:
+ 
+ 	void ROTQBYI(spu_opcode_t op)
+ 	{
++		if (const auto doubles = (op.i7 & 3) ? nullptr : get_reg_xfloat_doubles(op.ra))
++		{
++			// By whole words: result word w is source word w + n, which is element (j - n) & 3 for element j
++			const int n = (op.i7 >> 2) & 3;
++			const auto rotated = m_ir->CreateShuffleVector(doubles, llvm::ArrayRef<int>{(0 - n) & 3, (1 - n) & 3, (2 - n) & 3, (3 - n) & 3});
++
++			if (g_spu_xfloat_shuffle_check)
++			{
++				const auto a = value<u8[16]>(m_ir->CreateBitCast(double_to_xfloat(doubles), get_type<u8[16]>()));
++				const auto sh = (rotqby_forward_base() - get_imm<u8[16]>(op.i7, false)) & 0xf;
++				check_xfloat_shuffle(rotated, eval(pshufb_for_x86_and_tbl_for_aarch64(a, sh)).value);
++			}
++
++			set_reg_fixed(op.rt, rotated, false);
++			return;
++		}
++
+ 		const auto a = get_vr<u8[16]>(op.ra);
+ 		const auto sc = rotqby_forward_base();
+ 		const auto sh = (sc - get_imm<u8[16]>(op.i7, false)) & 0xf;
+@@ -8349,6 +8428,38 @@ public:
+ 			// Adjusted shuffle mask
+ 			v128 smask = ~mask & v128::from8p(op.ra == op.rb ? 0xf : 0x1f);
+ 
++			if (!((mask._u64[0] | mask._u64[1]) & 0x8080808080808080))
++			{
++				// Whole words of two registers that are both held as doubles: shuffle the doubles
++				const auto a_doubles = get_reg_xfloat_doubles(op.ra);
++				const auto b_doubles = get_reg_xfloat_doubles(op.rb);
++				int words[4]{};
++				bool whole_words = a_doubles && b_doubles;
++
++				for (u32 j = 0; j < 4 && whole_words; j++)
++				{
++					const u8 first = smask._bytes[j * 4];
++					whole_words = !(first & 3) && smask._bytes[j * 4 + 1] == first + 1 && smask._bytes[j * 4 + 2] == first + 2 && smask._bytes[j * 4 + 3] == first + 3;
++					words[j] = first / 4;
++				}
++
++				if (whole_words)
++				{
++					// Element order as in the byte shuffle below: rb first, then ra
++					const auto shuffled = m_ir->CreateShuffleVector(b_doubles, a_doubles, llvm::ArrayRef<int>{words[0], words[1], words[2], words[3]});
++
++					if (g_spu_xfloat_shuffle_check)
++					{
++						const auto a_bytes = m_ir->CreateBitCast(double_to_xfloat(a_doubles), get_type<u8[16]>());
++						const auto b_bytes = m_ir->CreateBitCast(double_to_xfloat(b_doubles), get_type<u8[16]>());
++						check_xfloat_shuffle(shuffled, m_ir->CreateShuffleVector(b_bytes, a_bytes, m_ir->CreateZExt(make_const_vector(smask, get_type<u8[16]>()), get_type<u32[16]>())));
++					}
++
++					set_reg_fixed(op.rt4, shuffled, false);
++					return;
++				}
++			}
++
+ 			// Blend mask for encoded constants
+ 			v128 bmask{};
+ 
+diff --git a/rpcs3/Emu/RSX/VK/VKPresent.cpp b/rpcs3/Emu/RSX/VK/VKPresent.cpp
+index 1021bc432..f9e39e8f9 100644
+--- a/rpcs3/Emu/RSX/VK/VKPresent.cpp
++++ b/rpcs3/Emu/RSX/VK/VKPresent.cpp
+@@ -17,6 +17,9 @@
+ #include "util/asm.hpp"
+ #include "util/video_provider.h"
+ 
++extern u64 g_spu_xfloat_shuffle_checks;
++extern u64 g_spu_xfloat_shuffle_mismatches;
++
+ extern atomic_t<bool> g_user_asked_for_screenshot;
+ extern atomic_t<recording_mode> g_recording_mode;
+ 
+@@ -204,6 +207,11 @@ void VKGSRender::advance_queued_frames()
+ 	// Texture cache is also double buffered to prevent use-after-free
+ 	m_texture_cache.on_frame_end();
+ 	m_samplers_dirty.store(true);
++	if (g_spu_xfloat_shuffle_checks && vk::get_current_frame_id() % 600 == 0)
++	{
++		rsx_log.notice("SPU xfloat shuffles: %u checked, %u mismatches (since start)", g_spu_xfloat_shuffle_checks, g_spu_xfloat_shuffle_mismatches);
++	}
++
+ 	if (vk::live_ctl::get(11) && vk::get_current_frame_id() % 600 == 0)
+ 	{
+ 		rsx_log.notice("Pipeline reuse: %u clean reuses checked, %u mismatches, %u unchanged dirty states cleared (600 frames)",
