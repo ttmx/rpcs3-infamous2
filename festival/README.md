@@ -94,5 +94,8 @@ Fix: Festival of Blood runs with `Relaxed ZCULL Sync: false`. `infamous2/play-co
 `NPEA00322`. Cost in the hall: 87.7 to 72.2 FPS uncapped; at the cap 60.0 FPS with the render thread at
 0.84 of a core instead of 0.56.
 
-Not checked: inFamous 2 uses the same engine and still runs with the relaxed setting. inFamous 1 in the `street` state is steady with the relaxed setting (50 captures, no
-change in brightness).
+inFamous 2 was checked the same way on the fork at the cap (dock, city street and swamp pier savestates, 20 s of
+captures each, relaxed against precise): no difference. The dock and the pier give the same brightness range in
+both settings, and the street lamps of the city glow in both. It keeps the relaxed setting. These are three daylight
+scenes; nothing like the candle-lit hall was tried there. inFamous 1 in the `street` state is steady with the
+relaxed setting (50 captures, no change in brightness).
