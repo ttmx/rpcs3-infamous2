@@ -235,6 +235,11 @@ void VKGSRender::update_draw_state()
 		}
 	}
 
+	if (vk::dynamic_face_state())
+	{
+		set_dynamic_face_state(!!(m_current_command_buffer->flags & vk::command_buffer::cb_reload_dynamic_state));
+	}
+
 	// The remaining dynamic state should only be set once and we have signals to enable/disable mid-renderpass
 	if (!(m_current_command_buffer->flags & vk::command_buffer::cb_reload_dynamic_state))
 	{
@@ -1192,6 +1197,45 @@ bool VKGSRender::bind_interpreter_texture_env()
 	return out_of_memory;
 }
 
+// Starts the host query for the report that became active before this draw
+void VKGSRender::load_occlusion_task()
+{
+	u32 occlusion_id = m_occlusion_query_manager->allocate_query(*m_current_command_buffer);
+	if (occlusion_id == umax)
+	{
+		// Force flush
+		rsx_log.warning("[Performance Warning] Out of free occlusion slots. Forcing hard sync.");
+		ZCULL_control::sync(this);
+
+		occlusion_id = m_occlusion_query_manager->allocate_query(*m_current_command_buffer);
+		if (occlusion_id == umax)
+		{
+			//rsx_log.error("Occlusion pool overflow");
+			if (m_current_task) m_current_task->result = 1;
+		}
+	}
+
+	// Before starting a query, we need to match RP scope (VK_1_0 rules).
+	// We always want our queries to start outside a renderpass whenever possible.
+	// We ignore this for performance reasons whenever possible of course and only do this for sensitive drivers.
+	if (vk::use_strict_query_scopes() &&
+		vk::is_renderpass_open(*m_current_command_buffer))
+	{
+		vk::end_renderpass(*m_current_command_buffer);
+		emergency_query_cleanup(m_current_command_buffer);
+	}
+
+	// Begin query
+	m_occlusion_query_manager->begin_query(*m_current_command_buffer, occlusion_id);
+
+	auto& data = m_occlusion_map[m_active_query_info->driver_handle];
+	data.indices.push_back(occlusion_id);
+	data.set_sync_command_buffer(m_current_command_buffer);
+
+	m_current_command_buffer->flags &= ~vk::command_buffer::cb_load_occluson_task;
+	m_current_command_buffer->flags |= (vk::command_buffer::cb_has_occlusion_task | vk::command_buffer::cb_has_open_query);
+}
+
 void VKGSRender::emit_geometry(u32 sub_index)
 {
 	auto &draw_call = rsx::method_registers.current_draw_clause;
@@ -1252,40 +1296,7 @@ void VKGSRender::emit_geometry(u32 sub_index)
 	// Queries are spawned and closed outside render pass scope for consistency reasons.
 	if (m_current_command_buffer->flags & vk::command_buffer::cb_load_occluson_task)
 	{
-		u32 occlusion_id = m_occlusion_query_manager->allocate_query(*m_current_command_buffer);
-		if (occlusion_id == umax)
-		{
-			// Force flush
-			rsx_log.warning("[Performance Warning] Out of free occlusion slots. Forcing hard sync.");
-			ZCULL_control::sync(this);
-
-			occlusion_id = m_occlusion_query_manager->allocate_query(*m_current_command_buffer);
-			if (occlusion_id == umax)
-			{
-				//rsx_log.error("Occlusion pool overflow");
-				if (m_current_task) m_current_task->result = 1;
-			}
-		}
-
-		// Before starting a query, we need to match RP scope (VK_1_0 rules).
-		// We always want our queries to start outside a renderpass whenever possible.
-		// We ignore this for performance reasons whenever possible of course and only do this for sensitive drivers.
-		if (vk::use_strict_query_scopes() &&
-			vk::is_renderpass_open(*m_current_command_buffer))
-		{
-			vk::end_renderpass(*m_current_command_buffer);
-			emergency_query_cleanup(m_current_command_buffer);
-		}
-
-		// Begin query
-		m_occlusion_query_manager->begin_query(*m_current_command_buffer, occlusion_id);
-
-		auto& data = m_occlusion_map[m_active_query_info->driver_handle];
-		data.indices.push_back(occlusion_id);
-		data.set_sync_command_buffer(m_current_command_buffer);
-
-		m_current_command_buffer->flags &= ~vk::command_buffer::cb_load_occluson_task;
-		m_current_command_buffer->flags |= (vk::command_buffer::cb_has_occlusion_task | vk::command_buffer::cb_has_open_query);
+		load_occlusion_task();
 	}
 
 	VkDescriptorBufferViewEx persistent_buffer = upload_info.static_vertices ? *m_geometry_cache.vertex_heap.view :
@@ -1768,6 +1779,7 @@ u32 VKGSRender::fast_draw_run_blocker() const
 	// The complete path revalidates every sampled texture for every draw. That is skipped only for plain textures:
 	// anything backed by a render target can expire or need a barrier between two draws.
 	if (current_vp_metadata.referenced_textures_mask) return 13;
+	if (m_pipeline_properties.renderpass_key != m_current_renderpass_key) return 16;
 
 	return fast_draw_textures_plain() ? 0 : 14;
 }
@@ -1808,7 +1820,9 @@ bool VKGSRender::fast_draw_rebind_textures()
 	// Lookup (or upload) of the textures that changed, and their samplers
 	load_texture_env();
 
-	if (!bound() || !fast_draw_textures_plain())
+	// The texture lookup regenerates the render pass key when a texture of the previous draw was one of the bound
+	// surfaces; the bound pipeline belongs to the old key then
+	if (!bound() || !fast_draw_textures_plain() || m_pipeline_properties.renderpass_key != m_current_renderpass_key)
 	{
 		return false;
 	}
@@ -1869,7 +1883,7 @@ bool VKGSRender::fast_draw_rebind_textures()
 }
 
 // Checked for every draw: state that other code, or the upload of the previous draw, may have changed
-u32 VKGSRender::fast_draw_blocker(u32 handled_state) const
+u32 VKGSRender::fast_draw_blocker(u32 handled_state, u32 handled_flags) const
 {
 	if (!fast_draw_enabled()) return 1;
 	if (m_samplers_dirty) return 12;
@@ -1900,7 +1914,7 @@ u32 VKGSRender::fast_draw_blocker(u32 handled_state) const
 		return 7;
 	}
 
-	if (m_current_command_buffer->flags & (vk::command_buffer::cb_reload_dynamic_state | vk::command_buffer::cb_load_occluson_task | vk::command_buffer::cb_has_conditional_render)) return 9;
+	if (m_current_command_buffer->flags & ~handled_flags & (vk::command_buffer::cb_reload_dynamic_state | vk::command_buffer::cb_load_occluson_task | vk::command_buffer::cb_has_conditional_render)) return 9;
 	return 0;
 }
 
@@ -1955,6 +1969,16 @@ void VKGSRender::fast_draw_batch()
 
 	const bool delegate = vk::live_ctl::get(9) != 5;
 
+	// Front face and culling changes stay inside a run while they are dynamic state: their handlers only flag the
+	// pipeline configuration, which then decodes to the same pipeline, and the state is set again before the draw
+	const bool dynamic_face = vk::dynamic_face_state();
+
+	// Occlusion reports (Ratchet & Clank: Tools of Destruction asks for one after every few draws): the commands go
+	// through their handlers, which end the host query and arm the next one; that one is started before the draw as
+	// the complete path starts it. Not where queries have to begin outside of a render pass.
+	const bool reports = delegate && !vk::use_strict_query_scopes();
+	const u32 query_flags = reports ? u32{vk::command_buffer::cb_load_occluson_task} : 0u;
+
 	// Vertex formats and the texture read semaphore (live control 9 == 6 leaves them out)
 	const bool extended = delegate && vk::live_ctl::get(9) != 6;
 
@@ -1967,7 +1991,8 @@ void VKGSRender::fast_draw_batch()
 		if (!delegate) return false;
 		const auto within = [&](u32 first, u32 length) { return reg >= first && reg + count <= first + length; };
 		return within(NV4097_SET_TEXTURE_OFFSET, 8 * 16) || within(NV4097_SET_TEXTURE_CONTROL3, 16) || within(NV4097_SET_TEXTURE_CONTROL2, 16) ||
-			within(NV4097_SET_POLY_OFFSET_FILL_ENABLE, 1) || within(NV4097_SET_POLYGON_OFFSET_SCALE_FACTOR, 2);
+			within(NV4097_SET_POLY_OFFSET_FILL_ENABLE, 1) || within(NV4097_SET_POLYGON_OFFSET_SCALE_FACTOR, 2) ||
+			(dynamic_face && (within(NV4097_SET_FRONT_FACE, 1) || within(NV4097_SET_CULL_FACE, 1) || within(NV4097_SET_CULL_FACE_ENABLE, 1)));
 	};
 
 	// The complete path for a draw whose clause is already set up
@@ -1984,7 +2009,20 @@ void VKGSRender::fast_draw_batch()
 		m_fast_draw.fallbacks++;
 	};
 
+	// Registers written with the value they hold. Without a handler the FIFO loop does nothing for such a write;
+	// the handler of the two face registers returns at once for it.
+	const auto rewrites_registers = [&](u32 reg, u32 count) -> bool
+	{
+		for (u32 i = 0; i < count; i++)
+		{
+			const u32 r = reg + i;
+			if (r >= std::size(regs.registers) || regs.registers[r] != words[i] || (rsx::methods[r] && r != NV4097_SET_FRONT_FACE && r != NV4097_SET_CULL_FACE)) return false;
+		}
+		return true;
+	};
+
 	u32 flow_commands = 0;
+	u32 empty_commands = 0;
 
 	for (u32 draws = 0; draws < 1024;)
 	{
@@ -2024,7 +2062,11 @@ void VKGSRender::fast_draw_batch()
 		const u32 count = (cmd >> 18) & 0x7ff;
 		const bool non_increment = (cmd & RSX_METHOD_NON_INCREMENT_CMD_MASK) == RSX_METHOD_NON_INCREMENT_CMD;
 
-		if (extended && reg == NV4097_NO_OPERATION && count && (non_increment || count == 1) && !rsx::methods[reg] && !rsx::state_signals[reg])
+		// The vertex file invalidations are what libgcm emits after a vertex array setup (Ratchet & Clank: Tools of
+		// Destruction has one, repeated three times, before most draws)
+		const bool stored_only = (extended && reg == NV4097_NO_OPERATION) || (reg >= NV4097_INVALIDATE_VERTEX_CACHE_FILE && reg <= NV4097_PIPE_NOP);
+
+		if (stored_only && count && (non_increment || count == 1) && !rsx::methods[reg] && !rsx::state_signals[reg])
 		{
 			// Data the game carries in the command stream: every word is stored in the one register, nothing else happens
 			bool complete = true;
@@ -2051,6 +2093,15 @@ void VKGSRender::fast_draw_batch()
 			continue;
 		}
 
+		if (!count && empty_commands < 1024)
+		{
+			// An empty command (a zero word most of the time, as padding): the FIFO loop steps over it
+			pos += 4;
+			fifo.fast_forward(pos - 4);
+			empty_commands++;
+			continue;
+		}
+
 		if (!count || count > 33 || non_increment)
 		{
 			stop = unusual_packet;
@@ -2061,8 +2112,10 @@ void VKGSRender::fast_draw_batch()
 		{
 			// Setup commands, applied the way their handlers apply them outside BEGIN/END
 			// Neither the vertex formats nor the semaphore offset has a handler or signals state: the layout is
-			// analysed again for every draw anyway
+			// analysed again for every draw anyway. The base offset and base index (Ratchet & Clank: Tools of Destruction
+			// sets them before most draws) only act through their handlers inside BEGIN/END
 			if ((reg >= NV4097_SET_VERTEX_DATA_ARRAY_OFFSET && reg + count <= NV4097_SET_VERTEX_DATA_ARRAY_OFFSET + 16) ||
+				(reg >= NV4097_SET_VERTEX_DATA_BASE_OFFSET && reg + count <= NV4097_SET_VERTEX_DATA_BASE_INDEX + 1) ||
 				(extended && reg >= NV4097_SET_VERTEX_DATA_ARRAY_FORMAT && reg + count <= NV4097_SET_VERTEX_DATA_ARRAY_FORMAT + 16) ||
 				(semaphores && reg == NV4097_SET_SEMAPHORE_OFFSET && count == 1))
 			{
@@ -2161,6 +2214,20 @@ void VKGSRender::fast_draw_batch()
 				rsx::methods[reg](m_ctx, reg, words[0]);
 				m_fast_draw.semaphores++;
 			}
+			else if (reports && count == 1 && (reg == NV4097_GET_REPORT || reg == NV4097_CLEAR_REPORT_VALUE))
+			{
+				if (!fetch(pos + 4, 1))
+				{
+					stop = fifo_end;
+					break;
+				}
+
+				// As the FIFO loop dispatches them. A handler that had to flush leaves another command buffer, which is
+				// checked before the draw.
+				regs.decode(reg, words[0]);
+				rsx::methods[reg](m_ctx, reg, words[0]);
+				m_fast_draw.reports++;
+			}
 			else if (delegated(reg, count))
 			{
 				if (!fetch(pos + 4, count))
@@ -2183,6 +2250,11 @@ void VKGSRender::fast_draw_batch()
 						m_graphics_state |= rsx::state_signals[reg + i];
 					}
 				}
+			}
+			else if (fetch(pos + 4, count) && rewrites_registers(reg, count))
+			{
+				// State the game sets again to what it is (front face, culling, depth and blend switches between the
+				// draws of Ratchet & Clank: Tools of Destruction): nothing changes
 			}
 			else
 			{
@@ -2276,7 +2348,7 @@ void VKGSRender::fast_draw_batch()
 			break;
 		}
 
-		if (const u32 blocker = fast_draw_blocker(texture_state | depth_bias_state))
+		if (const u32 blocker = fast_draw_blocker(texture_state | depth_bias_state, query_flags))
 		{
 			m_fast_draw.not_armed[blocker]++;
 			stop = blocked;
@@ -2359,7 +2431,13 @@ void VKGSRender::fast_draw_batch()
 			// The upload can fault and flush, and ring buffers can be replaced: both need the complete path
 			m_vertex_layout_dynamic_offset = m_vertex_layout_ring_info.alloc<8>(168);
 
-			if (m_current_command_buffer == initial_cb && !fast_draw_blocker(depth_bias_state) && vk::is_renderpass_open(*m_current_command_buffer) &&
+			if (query_flags & m_current_command_buffer->flags)
+			{
+				// Can flush when the query pool is exhausted, so before the checks
+				load_occlusion_task();
+			}
+
+			if (m_current_command_buffer == initial_cb && !fast_draw_blocker(depth_bias_state, query_flags) && vk::is_renderpass_open(*m_current_command_buffer) &&
 				bound_buffers() == initial_buffers)
 			{
 				if (m_graphics_state & depth_bias_state)
@@ -2368,6 +2446,11 @@ void VKGSRender::fast_draw_batch()
 					set_depth_bias_state();
 					m_graphics_state.clear(depth_bias_state);
 					m_fast_draw.depth_bias_updates++;
+				}
+
+				if (dynamic_face)
+				{
+					set_dynamic_face_state(false);
 				}
 
 				update_vertex_env(0, upload_info);

@@ -34,6 +34,10 @@ VK_FUNC(vkGetDeviceFaultInfoEXT);
 VK_FUNC(vkCmdDrawMultiEXT);
 VK_FUNC(vkCmdDrawMultiIndexedEXT);
 
+// EXT_extended_dynamic_state
+VK_FUNC(vkCmdSetFrontFaceEXT);
+VK_FUNC(vkCmdSetCullModeEXT);
+
 // EXT_external_memory_host
 VK_FUNC(vkGetMemoryHostPointerPropertiesEXT);
 

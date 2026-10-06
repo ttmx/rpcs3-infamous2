@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Test emulator for inFamous (BCES00609) or, with INFAMOUS_TITLE=NPEA00322, Festival of Blood, on an isolated profile
+"""Test emulator for inFamous (BCES00609) or, with INFAMOUS_TITLE=NPEA00322 or BCES00052, Festival of Blood or
+Ratchet & Clank Future: Tools of Destruction, on an isolated profile
 (never the real saves), driven through X11.
 
 Set up next to this file: profile/rpcs3 (a copy of an RPCS3 configuration folder with firmware, the game data of the
@@ -44,7 +45,7 @@ DEFAULT_SWITCHES = ['RPCS3_EXPERIMENT_SPU_INSTCOMBINE', 'RPCS3_SPU_NATIVE_RWV', 
                     'RPCS3_VK_READBACK_COMPRESSED_HITS', 'RPCS3_VK_READBACK_STREAM_COPY', 'RPCS3_VK_READBACK_OOP', 'RPCS3_VK_SEMAPHORE_PIPELINE_PREFETCH',
                     'RPCS3_VK_PERIODIC_SUBMIT_US', 'RPCS3_VK_STREAM_DMA_LOAD_MIN', 'RPCS3_EXPERIMENT_BLIT_COMPLEMENT', 'RPCS3_FIFO_INLINE_CACHE',
                     'RPCS3_EXPERIMENT_LAST_IMAGE_VIEW', 'RPCS3_NATIVE_SSAO', 'RPCS3_NATIVE_LIGHTING', 'RPCS3_VK_GEOMETRY_CACHE', 'RPCS3_VK_FAST_DRAWS',
-                    'RPCS3_VK_PIPELINE_REUSE', 'RPCS3_VK_DESCRIPTOR_REUSE', 'RPCS3_SPU_XFLOAT_FAST']
+                    'RPCS3_VK_PIPELINE_REUSE', 'RPCS3_VK_DESCRIPTOR_REUSE', 'RPCS3_SPU_XFLOAT_FAST', 'RPCS3_VK_DYNAMIC_FACE']
 
 
 def alive(rec):
@@ -170,7 +171,8 @@ def save(name):
     folder = W / 'profile/rpcs3/savestates'
     before = {p: p.stat().st_mtime for p in folder.rglob('*.SAVESTAT*')} if folder.exists() else {}
     hotkey = HERE.parents[1] / 'infamous2/bench/x11_hotkey.py'
-    subprocess.run([sys.executable, str(hotkey), win, 's', '--state', '4', '--activate', '--expected-title', TITLE], check=True)
+    # The window was found by its title above; the helper's own title read returns nothing for a title with a trademark sign
+    subprocess.run([sys.executable, str(hotkey), win, 's', '--state', '4', '--activate', '--expected-title', ''], check=True)
     end = time.time() + 90
     while time.time() < end:
         new = [p for p in folder.rglob('*.SAVESTAT*') if before.get(p) != p.stat().st_mtime] if folder.exists() else []

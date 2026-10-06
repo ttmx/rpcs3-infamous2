@@ -279,7 +279,7 @@ void VKGSRender::advance_queued_frames()
 		{
 			const f64 frames = frame - fast.report_frame;
 			std::string stops, blockers;
-			for (u32 i = 0; i < 16; i++)
+			for (u32 i = 0; i < 17; i++)
 			{
 				if (i < 12 && fast.stops[i]) fmt::append(stops, " %u:%.0f", i, fast.stops[i] / frames);
 				if (fast.not_armed[i]) fmt::append(blockers, " %u:%.0f", i, fast.not_armed[i] / frames);
@@ -287,9 +287,9 @@ void VKGSRender::advance_queued_frames()
 
 			rsx_log.notice("Fast draws: per frame: %.0f draws in %.0f runs, %.1f sent to the complete path; run ends by reason:%s; blocked by reason:%s (state bits 0x%x)",
 				fast.draws / frames, fast.batches / frames, fast.fallbacks / frames, stops, blockers, fast.blocking_state_bits);
-			rsx_log.notice("Fast draws: per frame: %.0f with textures set up again, %.1f of those needed another shader variant, %.0f depth bias updates, %.0f semaphore releases, %.0f jumps/calls/returns; "
+			rsx_log.notice("Fast draws: per frame: %.0f with textures set up again, %.1f of those needed another shader variant, %.0f depth bias updates, %.0f semaphore releases, %.0f jumps/calls/returns, %.0f report commands; "
 				"program checks in the interval: %u, mismatches %u",
-				fast.texture_rebinds / frames, fast.texture_program_changes / frames, fast.depth_bias_updates / frames, fast.semaphores / frames, fast.flow_commands / frames,
+				fast.texture_rebinds / frames, fast.texture_program_changes / frames, fast.depth_bias_updates / frames, fast.semaphores / frames, fast.flow_commands / frames, fast.reports / frames,
 				static_cast<u32>(fast.texture_checks), static_cast<u32>(fast.texture_check_mismatches));
 
 			if (m_fast_draw_stop_methods)

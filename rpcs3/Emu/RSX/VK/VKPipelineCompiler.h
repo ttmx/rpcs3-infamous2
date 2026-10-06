@@ -8,6 +8,10 @@ namespace vk
 {
 	class render_device;
 
+	// Front face and cull mode are set per draw instead of being part of the pipeline (RPCS3_VK_DYNAMIC_FACE=1 and
+	// VK_EXT_extended_dynamic_state): draws that differ only in them share a pipeline
+	bool dynamic_face_state();
+
 	struct pipeline_props
 	{
 		graphics_pipeline_state state;

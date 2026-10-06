@@ -268,7 +268,13 @@ namespace vk
 
 		// Rasterizer state
 		properties.state.set_attachment_count(num_draw_buffers);
-		properties.state.set_front_face(vk::get_front_face(REGS(ctx)->front_face_mode()));
+		const bool dynamic_face = vk::dynamic_face_state();
+
+		if (!dynamic_face)
+		{
+			properties.state.set_front_face(vk::get_front_face(REGS(ctx)->front_face_mode()));
+		}
+
 		properties.state.enable_depth_clamp(REGS(ctx)->depth_clamp_enabled() || !REGS(ctx)->depth_clip_enabled());
 		properties.state.enable_depth_bias(true);
 		properties.state.enable_depth_bounds_test(depth_bounds_support);
@@ -280,7 +286,7 @@ namespace vk
 			properties.state.enable_depth_test(vk::get_compare_func(REGS(ctx)->depth_func()));
 		}
 
-		if (REGS(ctx)->cull_face_enabled())
+		if (!dynamic_face && REGS(ctx)->cull_face_enabled())
 		{
 			properties.state.enable_cull_face(vk::get_cull_face(REGS(ctx)->cull_face_mode()));
 		}
@@ -399,10 +405,30 @@ namespace vk
 			// A problem observed on multiple GPUs is that interior geometry edges can resolve 0 samples unless we force shading rate of 1.
 			// For whatever reason, the way MSAA images are 'resolved' on PS3 bypasses this issue.
 			// NOTE: We do not do image resolve at all, the output is merely 'exploded' and the guest application is responsible for doing the resolve in software as it is on real hardware.
-			properties.state.set_multisample_shading_rate(1.f);
+			// RPCS3_VK_MSAA_PIXEL_SHADING=1: one shader run per pixel, as the console does it, instead of one per sample
+			static const bool pixel_shading = [] { const char* flag = std::getenv("RPCS3_VK_MSAA_PIXEL_SHADING"); return flag && std::atoi(flag) == 1; }();
+
+			if (!pixel_shading)
+			{
+				properties.state.set_multisample_shading_rate(1.f);
+			}
 		}
 
 		return properties;
+	}
+}
+
+void VKGSRender::set_dynamic_face_state(bool reload)
+{
+	const auto front_face = vk::get_front_face(rsx::method_registers.front_face_mode());
+	const VkCullModeFlags cull_mode = rsx::method_registers.cull_face_enabled() ? vk::get_cull_face(rsx::method_registers.cull_face_mode()) : VkCullModeFlags{VK_CULL_MODE_NONE};
+	const u32 state = static_cast<u32>(front_face) | (static_cast<u32>(cull_mode) << 8);
+
+	if (reload || state != m_dynamic_face_state)
+	{
+		_vkCmdSetFrontFaceEXT(*m_current_command_buffer, front_face);
+		_vkCmdSetCullModeEXT(*m_current_command_buffer, cull_mode);
+		m_dynamic_face_state = state;
 	}
 }
 
@@ -433,6 +459,13 @@ VKGSRender::VKGSRender(utils::serial* ar) noexcept : GSRender(ar)
 	if (const char* mode = std::getenv("RPCS3_VK_FAST_DRAWS"))
 	{
 		vk::live_ctl::values[9] = std::strtoull(mode, nullptr, 10);
+
+		if (vk::live_ctl::values[9] == 6 && Emu.GetTitleID() == "BCES00052")
+		{
+			// Ratchet & Clank: Tools of Destruction chains its draws with jumps and calls (570 runs per frame end at
+			// one): the default scope becomes the wide one, +2%. 0 and 5 still select no fast draws and the narrow scope.
+			vk::live_ctl::values[9] = 2;
+		}
 	}
 	if (const char* mode = std::getenv("RPCS3_VK_MATERIAL_BINDINGS"))
 	{

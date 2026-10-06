@@ -322,7 +322,8 @@ private:
 		u64 depth_bias_updates = 0;
 		u64 semaphores = 0;
 		u64 flow_commands = 0;
-		u64 not_armed[16]{};
+		u64 reports = 0;
+		u64 not_armed[17]{};
 		u64 stops[12]{};
 		u32 report_frame = 0;
 		mutable u32 blocking_state_bits = 0;
@@ -352,7 +353,8 @@ private:
 	// Diagnostic: which method ended a run of fast draws (per register)
 	std::unique_ptr<u32[]> m_fast_draw_stop_methods;
 
-	u32 fast_draw_blocker(u32 handled_state = 0) const;
+	u32 fast_draw_blocker(u32 handled_state = 0, u32 handled_flags = 0) const;
+	void load_occlusion_task();
 	u32 fast_draw_run_blocker() const;
 	bool fast_draw_textures_plain() const;
 	bool fast_draw_rebind_textures();
@@ -360,6 +362,10 @@ private:
 	void update_transform_constants_buffer();
 	void update_fragment_texture_params_buffer();
 	void set_depth_bias_state();
+
+	// Front face and cull mode as set in the current command buffer while they are dynamic state (umax = not set)
+	u32 m_dynamic_face_state = umax;
+	void set_dynamic_face_state(bool reload);
 
 	// Live control 9: 2 = on, 4 = on with the program of every texture change checked against a full lookup,
 	// 5 = on without texture and polygon offset changes inside a run (for comparisons)

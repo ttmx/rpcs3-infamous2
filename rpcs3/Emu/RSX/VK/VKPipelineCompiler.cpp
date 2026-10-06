@@ -9,6 +9,12 @@
 
 namespace vk
 {
+	bool dynamic_face_state()
+	{
+		static const bool requested = [] { const char* flag = std::getenv("RPCS3_VK_DYNAMIC_FACE"); return flag && std::atoi(flag) == 1; }();
+		return requested && g_render_device && g_render_device->get_extended_dynamic_state_support();
+	}
+
 	// Global list of worker threads
 	std::unique_ptr<named_thread_group<pipe_compiler>> g_pipe_compilers;
 	int g_num_pipe_compilers = 0;
@@ -108,6 +114,12 @@ namespace vk
 		dynamic_state_descriptors.push_back(VK_DYNAMIC_STATE_STENCIL_WRITE_MASK);
 		dynamic_state_descriptors.push_back(VK_DYNAMIC_STATE_STENCIL_REFERENCE);
 		dynamic_state_descriptors.push_back(VK_DYNAMIC_STATE_DEPTH_BIAS);
+
+		if (dynamic_face_state())
+		{
+			dynamic_state_descriptors.push_back(VK_DYNAMIC_STATE_FRONT_FACE_EXT);
+			dynamic_state_descriptors.push_back(VK_DYNAMIC_STATE_CULL_MODE_EXT);
+		}
 
 		auto pdss = &create_info.state.ds;
 		VkPipelineDepthStencilStateCreateInfo ds2;

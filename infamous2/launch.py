@@ -102,7 +102,10 @@ def command(args):
     game = pathlib.Path(args.game).expanduser().resolve()
     if not game.exists():
         sys.exit(f'Game folder not found: {game}')
-    config = pathlib.Path(args.config).resolve() if args.config else root / ('play-config-strict.yml' if args.strict else 'play-config.yml')
+    # Festival of Blood shows and hides its light glows by occlusion reports: with Relaxed ZCULL Sync they arrive too
+    # late about every other frame and the glows flicker, so that game gets a configuration with the setting off
+    festival = game.name == 'NPEA00322' and not args.strict
+    config = pathlib.Path(args.config).resolve() if args.config else root / ('play-config-strict.yml' if args.strict else 'play-config-festival.yml' if festival else 'play-config.yml')
     env = base_env(cache=args.cache, profile=args.profile)
     env.update(item.split('=', 1) for item in args.set)
     extra = args.extra[1:] if args.extra[:1] == ['--'] else args.extra

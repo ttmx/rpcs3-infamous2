@@ -1,0 +1,12 @@
+Version: 1.2
+
+PPU-c4e26433d1eed9166eb0c67b6f66b2268f3704e2:
+  "Unlock frame rate":
+    Games:
+      "Ratchet & Clank Future: Tools of Destruction":
+        BCES00052: [ 01.00 ]
+    Author: local
+    Notes: The game clamps its time step to at least 1/75 s and holds every frame for 0.9 times that, so it stops at 81 FPS and would run fast above 75. This sets the minimum time step to 1/300 s.
+    Patch Version: 1.0
+    Patch:
+      - [ bef32, 0x008aa558, 0.0033333333 ]

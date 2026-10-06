@@ -71,3 +71,28 @@ normal profile: 60 FPS, both passes active.
 ## inFamous 2 after the change
 
 The dock savestate on this build: 60.00 FPS at the cap, both passes active (mode 61), no fatal error.
+
+## Flickering light glows (2026-10-06, night)
+
+Reported while the hall state was on screen: the glows around the candles and lanterns came and went from frame to
+frame. They are drawn when the game's occlusion reports say the light is visible, and the game reads the reports
+during the same frame.
+
+| configuration, hall at the 60 FPS cap | glows |
+|---|---|
+| RPCS3 paths, `Relaxed ZCULL Sync: true` | absent, except for a moment about every 20 s |
+| fork, `Relaxed ZCULL Sync: true` | on in roughly every other capture: the flicker |
+| either, `Relaxed ZCULL Sync: false` | on in every capture (187 of 187 over 30 s on the fork) |
+
+With the relaxed setting a report is written whenever the GPU happens to be done. Without periodic command
+submission that is nearly always too late (so stock shows no glows at all); with it, about half the time. The
+switch that makes the difference is periodic submission alone (live control 0), not the GPU passes, the fast draws
+or the dynamic face state. Delivering all reports at the end of the frame instead (tried) does not help: still
+flickering.
+
+Fix: Festival of Blood runs with `Relaxed ZCULL Sync: false`. `infamous2/play-config-festival.yml` has it, and `infamous2/launch.py` picks that file when the game folder is
+`NPEA00322`. Cost in the hall: 87.7 to 72.2 FPS uncapped; at the cap 60.0 FPS with the render thread at
+0.84 of a core instead of 0.56.
+
+Not checked: inFamous 2 uses the same engine and still runs with the relaxed setting. inFamous 1 in the `street` state is steady with the relaxed setting (50 captures, no
+change in brightness).

@@ -26,7 +26,7 @@ Stock with Strict Rendering off on the left, this build uncapped on the right (F
 
 ![City street: 31.7 FPS stock, 62.0 FPS with this build](infamous2/docs/images/street-before-after.jpg)
 
-## The other two games
+## Other games
 
 - **inFamous: Festival of Blood** (NPEA00322) runs the same two SPU jobs as inFamous 2 at other guest addresses, so
   both GPU passes now cover it: 29.5 to 89.2 FPS uncapped in its opening catacombs, 60 FPS at the cap with 2.3 SPU
@@ -36,7 +36,13 @@ Stock with Strict Rendering off on the left, this build uncapped on the right (F
   and one new change makes RPCS3's accurate SPU float mode, which this game needs, about a tenth faster where the
   SPUs are the limit. See [`infamous1/`](infamous1/README.md) for the whole list, change by change.
 
-Both were tested for an evening each, in their first minutes (and one open-city district of inFamous).
+- **Ratchet & Clank Future: Tools of Destruction** (BCES00052) is another engine altogether: about 7,700 draws per
+  frame into one pass, every one of them inside an occlusion query. Periodic command submission and the geometry
+  cache carry it from 31 to 58 FPS in its opening view; fast repeat draws did nothing until the path learned the
+  commands this game puts between draws, and front face and cull mode became dynamic state (65 to 67 FPS now,
+  60 at the cap). A one-value game patch lifts the game's own 81 FPS ceiling. See [`ratchet/`](ratchet/README.md).
+
+All three were tested for an evening each, in their first minutes (and one open-city district of inFamous).
 
 These are software changes. The two host tuning steps that were also tried (a GPU clock floor and a power profile)
 are kept apart in [`infamous2/hardware/`](infamous2/hardware/) and are off unless you ask for them.
@@ -128,6 +134,10 @@ the SPUs, and uploads the results as textures. Emulated, that round trip was mos
   bound; city +10%.
 - **Texture and polygon offset changes inside fast runs**: those commands no longer end a run when the shader variant
   stays the same; city 55.5 to 58.8 FPS at the cap.
+- **Front face and cull mode as dynamic state** (`RPCS3_VK_DYNAMIC_FACE=1`, needs `VK_EXT_extended_dynamic_state`):
+  both are set per draw instead of being part of the pipeline, so draws that differ only in them share a pipeline and
+  stay inside fast runs. Ratchet & Clank flips the front face 425 times a frame: +6% there, nothing either way in the
+  inFamous games. The first start of a game after this compiles the shader interpreter's pipelines again.
 - **Descriptor set reuse** (`RPCS3_VK_DESCRIPTOR_REUSE=1`): a descriptor set already written with the same textures,
   samplers and buffers is bound again instead of allocating and writing a new one; city +2%.
 - **Pipeline state reuse** (`RPCS3_VK_PIPELINE_REUSE=1`): pipeline properties that a full decode found unchanged are

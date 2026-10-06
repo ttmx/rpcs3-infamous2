@@ -34,6 +34,7 @@ namespace vk
 		VkPhysicalDeviceCustomBorderColorFeaturesEXT custom_border_color_info{};
 		VkPhysicalDeviceBorderColorSwizzleFeaturesEXT border_color_swizzle_info{};
 		VkPhysicalDeviceFaultFeaturesEXT device_fault_info{};
+		VkPhysicalDeviceExtendedDynamicStateFeaturesEXT extended_dynamic_state_info{};
 		VkPhysicalDeviceMultiDrawFeaturesEXT multidraw_info{};
 		VkPhysicalDeviceProvokingVertexFeaturesEXT provoking_vertex_info{};
 
@@ -82,6 +83,13 @@ namespace vk
 			features2.pNext         = &device_fault_info;
 		}
 
+		if (device_extensions.is_supported(VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME))
+		{
+			extended_dynamic_state_info.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT;
+			extended_dynamic_state_info.pNext = features2.pNext;
+			features2.pNext                   = &extended_dynamic_state_info;
+		}
+
 		if (device_extensions.is_supported(VK_EXT_MULTI_DRAW_EXTENSION_NAME))
 		{
 			multidraw_info.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTI_DRAW_FEATURES_EXT;
@@ -107,6 +115,7 @@ namespace vk
 		custom_border_color_support.require_border_color_remap = !border_color_swizzle_info.borderColorSwizzleFromImage;
 
 		multidraw_support.supported = !!multidraw_info.multiDraw;
+		extended_dynamic_state_support = !!extended_dynamic_state_info.extendedDynamicState;
 		multidraw_support.max_batch_size = 65536;
 
 		optional_features_support.barycentric_coords  = !!shader_barycentric_info.fragmentShaderBarycentric;
@@ -544,6 +553,11 @@ namespace vk
 			requested_extensions.push_back(VK_EXT_MULTI_DRAW_EXTENSION_NAME);
 		}
 
+		if (pgpu->extended_dynamic_state_support)
+		{
+			requested_extensions.push_back(VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME);
+		}
+
 		if (pgpu->optional_features_support.conditional_rendering)
 		{
 			requested_extensions.push_back(VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME);
@@ -775,6 +789,15 @@ namespace vk
 			custom_border_color_features.customBorderColorWithoutFormat = VK_TRUE;
 			custom_border_color_features.pNext = const_cast<void*>(device.pNext);
 			device.pNext = &custom_border_color_features;
+		}
+
+		VkPhysicalDeviceExtendedDynamicStateFeaturesEXT extended_dynamic_state_features{};
+		if (pgpu->extended_dynamic_state_support)
+		{
+			extended_dynamic_state_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT;
+			extended_dynamic_state_features.extendedDynamicState = VK_TRUE;
+			extended_dynamic_state_features.pNext = const_cast<void*>(device.pNext);
+			device.pNext = &extended_dynamic_state_features;
 		}
 
 		VkPhysicalDeviceMultiDrawFeaturesEXT multidraw_features{};

@@ -1172,10 +1172,12 @@ namespace rsx
 			{
 				const bool consumable = (reg >= NV4097_SET_VERTEX_DATA_ARRAY_OFFSET && reg < NV4097_SET_VERTEX_DATA_ARRAY_OFFSET + 16) ||
 					reg == NV4097_SET_INDEX_ARRAY_ADDRESS || reg == NV4097_SET_INDEX_ARRAY_DMA ||
+					(reg >= NV4097_INVALIDATE_VERTEX_CACHE_FILE && reg <= NV4097_SET_VERTEX_DATA_BASE_INDEX) ||
 					(reg >= NV4097_SET_TRANSFORM_CONSTANT_LOAD && reg < NV4097_SET_TRANSFORM_CONSTANT + 32) ||
 					reg == NV4097_SET_BEGIN_END || reg == NV4097_DRAW_INDEX_ARRAY ||
 					(reg >= NV4097_SET_VERTEX_DATA_ARRAY_FORMAT && reg < NV4097_SET_VERTEX_DATA_ARRAY_FORMAT + 16) ||
-					reg == NV4097_SET_SEMAPHORE_OFFSET || reg == NV4097_TEXTURE_READ_SEMAPHORE_RELEASE || reg == NV4097_NO_OPERATION;
+					reg == NV4097_SET_SEMAPHORE_OFFSET || reg == NV4097_TEXTURE_READ_SEMAPHORE_RELEASE || reg == NV4097_NO_OPERATION ||
+					(m_ctx->register_state->registers[reg] == value && (!methods[reg] || reg == NV4097_SET_FRONT_FACE || reg == NV4097_SET_CULL_FACE));
 				rsx::geometry_sync::other_methods += !consumable;
 			}
 

@@ -77,6 +77,12 @@ namespace vk
 				m_dynamic_state_descriptors.push_back(VK_DYNAMIC_STATE_DEPTH_BOUNDS);
 			}
 
+			if (vk::dynamic_face_state())
+			{
+				m_dynamic_state_descriptors.push_back(VK_DYNAMIC_STATE_FRONT_FACE_EXT);
+				m_dynamic_state_descriptors.push_back(VK_DYNAMIC_STATE_CULL_MODE_EXT);
+			}
+
 			m_dynamic_state_info.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
 			m_dynamic_state_info.pDynamicStates = m_dynamic_state_descriptors.data();
 			m_dynamic_state_info.dynamicStateCount = ::size32(m_dynamic_state_descriptors);

@@ -89,6 +89,9 @@ namespace vk
 
 		multidraw_features multidraw_support{};
 
+		// VK_EXT_extended_dynamic_state (front face and cull mode outside of the pipeline)
+		bool extended_dynamic_state_support = false;
+
 		struct
 		{
 			bool barycentric_coords = false;
@@ -176,6 +179,7 @@ namespace vk
 		const gpu_shader_types_support& get_shader_types_support() const { return pgpu->shader_types_support; }
 		const custom_border_color_features& get_custom_border_color_support() const { return pgpu->custom_border_color_support; }
 		const multidraw_features get_multidraw_support() const { return pgpu->multidraw_support; }
+		bool get_extended_dynamic_state_support() const { return pgpu->extended_dynamic_state_support; }
 
 		bool get_shader_stencil_export_support() const { return pgpu->optional_features_support.shader_stencil_export; }
 		bool get_depth_bounds_support() const { return pgpu->features.depthBounds != VK_FALSE; }
