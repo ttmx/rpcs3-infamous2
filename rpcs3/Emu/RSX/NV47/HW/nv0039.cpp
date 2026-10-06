@@ -1,4 +1,5 @@
 #include "stdafx.h"
+#include "Emu/roundtrip_survey.h"
 #include "nv0039.h"
 
 #include "Emu/RSX/RSXThread.h"
@@ -73,6 +74,11 @@ namespace rsx
 			const u32 line_length = REGS(ctx)->nv0039_line_length();  // Number of columns per row
 			const u32 line_count = REGS(ctx)->nv0039_line_count();    // Number of rows to copy
 			const u8 out_format = REGS(ctx)->nv0039_output_format();  // Column stride in bytes. Only the first byte is actually written to.
+
+			if (roundtrip_survey::enabled()) [[unlikely]]
+			{
+				roundtrip_survey::note_blit(1, get_address(REGS(ctx)->nv0039_output_offset(), REGS(ctx)->nv0039_output_location()), line_length, line_count);
+			}
 			const u8 in_format = REGS(ctx)->nv0039_input_format();    // Column stride in bytes. Only the first byte is actually read from.
 			const u32 notify = arg;
 

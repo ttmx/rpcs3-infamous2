@@ -1,4 +1,5 @@
 #include "stdafx.h"
+#include "Emu/roundtrip_survey.h"
 #include "nv3089.h"
 
 #include "Emu/RSX/RSXThread.h"
@@ -575,6 +576,11 @@ namespace rsx
 			if (!success)
 			{
 				return;
+			}
+
+			if (roundtrip_survey::enabled()) [[unlikely]]
+			{
+				roundtrip_survey::note_blit(0, dst.rsx_address, dst.width, dst.height);
 			}
 
 			// Decode extra params before locking

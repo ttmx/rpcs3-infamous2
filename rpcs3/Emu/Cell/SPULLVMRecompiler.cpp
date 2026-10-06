@@ -82,6 +82,30 @@ const extern spu_decoder<spu_iflag> g_spu_iflag;
 #pragma GCC diagnostic pop
 #endif
 
+// Counters of the check mode of the fast accurate xfloat paths (RPCS3_SPU_XFLOAT_FAST=2), reported by the renderer
+u64 g_spu_xfloat_fast_checks = 0;
+u64 g_spu_xfloat_fast_mismatches = 0;
+u64 g_spu_xfloat_fast_slow = 0;
+
+// Check mode: operands (up to three), the result and the regular result of the operation last checked. Shared by all
+// SPU threads without a lock: a report can mix two operations.
+alignas(16) u32 g_spu_xfloat_fast_values[5][4]{};
+
+static void spu_xfloat_fast_report(u32 differs, u32 pc, u32 operands)
+{
+	static atomic_t<u32> s_reports{0};
+
+	if (!differs || s_reports++ >= 40)
+	{
+		return;
+	}
+
+	const auto& v = g_spu_xfloat_fast_values;
+	spu_log.error("Fast xfloat mismatch at 0x%05x, %u operands: a=%08x %08x %08x %08x b=%08x %08x %08x %08x c=%08x %08x %08x %08x result=%08x %08x %08x %08x regular=%08x %08x %08x %08x",
+		pc, operands, v[0][3], v[0][2], v[0][1], v[0][0], v[1][3], v[1][2], v[1][1], v[1][0], v[2][3], v[2][2], v[2][1], v[2][0],
+		v[3][3], v[3][2], v[3][1], v[3][0], v[4][3], v[4][2], v[4][1], v[4][0]);
+}
+
 namespace
 {
 	const bool g_spu_04ac8_contribution_trace = []
@@ -395,6 +419,19 @@ namespace
 		const char* value = std::getenv("RPCS3_SPU_RSQRT_LUT");
 		return value && std::string_view(value) == "1";
 	}();
+
+	// Accurate xfloat without doubles (RPCS3_SPU_XFLOAT_FAST, 0 = off, 1 = on, 2 = on with every result checked against
+	// the regular accurate code). See spu_llvm_recompiler::xfloat_fast_op.
+	// Read at first use, not at program start: main() sets the default before anything is compiled
+	u32 spu_xfloat_fast_mode()
+	{
+		static const u32 mode = []() -> u32
+		{
+			const char* value = std::getenv("RPCS3_SPU_XFLOAT_FAST");
+			return value ? static_cast<u32>(std::strtoul(value, nullptr, 10)) : 0;
+		}();
+		return mode;
+	}
 
 	const bool g_spu_native_rwv_experiment = []
 	{
@@ -1555,12 +1592,187 @@ class spu_llvm_recompiler : public spu_recompiler_base, public cpu_translator
 		}
 	}
 
+	// Accurate xfloat with register values kept in the SPU format instead of as doubles (RPCS3_SPU_XFLOAT_FAST)
+	bool xfloat_fast() const
+	{
+		return spu_xfloat_fast_mode() && g_cfg.core.spu_xfloat_accuracy == xfloat_accuracy::accurate;
+	}
+
+	// One float operation of that mode. The SPU threads run with truncation and with denormals as zero, as the SPU
+	// has them, so the host's single precision operation gives the accurate result bit for bit, except for:
+	// - an operand with the largest exponent (no infinities or NaNs on the SPU: those are numbers up to 2^129),
+	// - a result that reached the largest host float (the SPU result may be larger),
+	// - a zero result, which is always positive on the SPU.
+	// The operations are built as constrained ones with the rounding mode stated, so that LLVM folds constant operands
+	// with truncation as well.
+	// The first two are tested for and such a vector is computed again the regular way, with doubles; the third is
+	// corrected in place. args: the operands as u32[4]. fast() and slow() return the result as u32[4].
+	template <typename F, typename S>
+	llvm::Value* xfloat_fast_op(std::initializer_list<llvm::Value*> args, bool arithmetic, F&& fast, S&& slow)
+	{
+		const auto type = get_type<u32[4]>();
+		const auto limit = llvm::ConstantInt::get(type, 0xff000000);
+		llvm::Value* special = nullptr;
+
+		for (const auto arg : args)
+		{
+			const auto large = m_ir->CreateICmpUGE(m_ir->CreateShl(arg, 1), limit);
+			special = special ? m_ir->CreateOr(special, large) : large;
+		}
+
+		llvm::Value* result = fast();
+
+		if (arithmetic)
+		{
+			const auto magnitude = m_ir->CreateShl(result, 1);
+			special = m_ir->CreateOr(special, m_ir->CreateICmpEQ(magnitude, llvm::ConstantInt::get(type, 0xfefffffe)));
+			// Exponent 0: zero of either sign, or an operand that LLVM passed through unchanged (x * 1) and that the
+			// SPU takes for zero
+			result = m_ir->CreateSelect(m_ir->CreateICmpULT(magnitude, llvm::ConstantInt::get(type, 0x01000000)), llvm::ConstantInt::get(type, 0), result);
+		}
+
+		const auto any = m_ir->CreateICmpNE(m_ir->CreateBitCast(special, m_ir->getIntNTy(4)), m_ir->getIntN(4, 0));
+		const auto fast_block = m_ir->GetInsertBlock();
+		const auto slow_block = llvm::BasicBlock::Create(m_context, "", m_function);
+		const auto done = llvm::BasicBlock::Create(m_context, "", m_function);
+		llvm::Value* reference = nullptr;
+
+		const auto count = [&](u64* counter, llvm::Value* amount)
+		{
+			const auto ptr = m_ir->CreateIntToPtr(m_ir->getInt64(reinterpret_cast<u64>(counter)), get_type<u64*>());
+			m_ir->CreateStore(m_ir->CreateAdd(m_ir->CreateLoad(get_type<u64>(), ptr), amount), ptr);
+		};
+
+		if (spu_xfloat_fast_mode() == 2)
+		{
+			// Check mode: the regular result of every operation, for the comparison below
+			reference = slow();
+		}
+
+		m_ir->CreateCondBr(any, slow_block, done, m_md_unlikely);
+		m_ir->SetInsertPoint(slow_block);
+		const auto slow_result = reference ? reference : slow();
+
+		if (reference)
+		{
+			count(&g_spu_xfloat_fast_slow, m_ir->getInt64(1));
+		}
+
+		const auto slow_end = m_ir->GetInsertBlock();
+		m_ir->CreateBr(done);
+		m_ir->SetInsertPoint(done);
+		const auto phi = m_ir->CreatePHI(type, 2);
+		phi->addIncoming(result, fast_block);
+		phi->addIncoming(slow_result, slow_end);
+
+		if (reference)
+		{
+			const auto differs = m_ir->CreateICmpNE(m_ir->CreateBitCast(phi, get_type<u128>()), m_ir->CreateBitCast(reference, get_type<u128>()));
+			count(&g_spu_xfloat_fast_checks, m_ir->getInt64(1));
+			count(&g_spu_xfloat_fast_mismatches, m_ir->CreateZExt(differs, get_type<u64>()));
+
+			u32 slot = 0;
+			const auto record = [&](llvm::Value* vector, u32 at)
+			{
+				m_ir->CreateStore(vector, m_ir->CreateIntToPtr(m_ir->getInt64(reinterpret_cast<u64>(&g_spu_xfloat_fast_values[at])), get_type<u32(*)[4]>()));
+			};
+
+			for (const auto arg : args) record(arg, slot++);
+			record(phi, 3);
+			record(reference, 4);
+			call("spu_xfloat_fast_report", &spu_xfloat_fast_report, m_ir->CreateZExt(differs, get_type<u32>()), m_ir->getInt32(m_pos), m_ir->getInt32(slot));
+		}
+
+		return phi;
+	}
+
+	// The regular accurate result of a float operation on operands in the SPU format, in the SPU format
+	template <typename F>
+	llvm::Value* xfloat_slow_result(F&& op)
+	{
+		return double_to_xfloat(xfloat_in_double(op()));
+	}
+
+	llvm::Value* xfloat_as_float(llvm::Value* value)
+	{
+		return m_ir->CreateBitCast(value, get_type<f32[4]>());
+	}
+
+	llvm::Value* float_as_xfloat(llvm::Value* value)
+	{
+		return m_ir->CreateBitCast(value, get_type<u32[4]>());
+	}
+
+	// rt = ra (op) rb for FA, FS and FM
+	void xfloat_fast_binary(spu_opcode_t op, llvm::Instruction::BinaryOps opcode)
+	{
+		const auto a = get_vr<u32[4]>(op.ra).value;
+		const auto b = get_vr<u32[4]>(op.rb).value;
+
+		set_vr(op.rt, value<u32[4]>(xfloat_fast_op({a, b}, true,
+			[&]()
+			{
+				const auto id = opcode == llvm::Instruction::FAdd ? llvm::Intrinsic::experimental_constrained_fadd :
+					opcode == llvm::Instruction::FSub ? llvm::Intrinsic::experimental_constrained_fsub : llvm::Intrinsic::experimental_constrained_fmul;
+				return float_as_xfloat(m_ir->CreateConstrainedFPBinOp(id, xfloat_as_float(a), xfloat_as_float(b), nullptr, "", nullptr,
+					llvm::RoundingMode::TowardZero, llvm::fp::ebIgnore));
+			},
+			[&]() { return xfloat_slow_result([&]() { return m_ir->CreateBinOp(opcode, xfloat_to_double(a), xfloat_to_double(b)); }); })));
+	}
+
+	// rt4 = (+-ra) * rb + (+-rc) for FMA, FNMS and FMS
+	void xfloat_fast_fma(spu_opcode_t op, bool negate_a, bool negate_c)
+	{
+		const auto a = get_vr<u32[4]>(op.ra).value;
+		const auto b = get_vr<u32[4]>(op.rb).value;
+		const auto c = get_vr<u32[4]>(op.rc).value;
+
+		const auto signs = [&](llvm::Value* x, bool negate) { return negate ? m_ir->CreateFNeg(x) : x; };
+
+		set_vr(op.rt4, value<u32[4]>(xfloat_fast_op({a, b, c}, true,
+			[&]()
+			{
+				const auto fa = signs(xfloat_as_float(a), negate_a);
+				const auto fc = signs(xfloat_as_float(c), negate_c);
+				return float_as_xfloat(m_ir->CreateConstrainedFPCall(llvm::Intrinsic::getOrInsertDeclaration(m_module, llvm::Intrinsic::experimental_constrained_fma, {get_type<f32[4]>()}),
+					{fa, xfloat_as_float(b), fc}, "", llvm::RoundingMode::TowardZero, llvm::fp::ebIgnore));
+			},
+			[&]()
+			{
+				return xfloat_slow_result([&]()
+				{
+					const auto da = signs(xfloat_to_double(a), negate_a);
+					const auto dc = signs(xfloat_to_double(c), negate_c);
+					return m_ir->CreateIntrinsic(llvm::Intrinsic::fmuladd, {get_type<f64[4]>()}, {da, xfloat_to_double(b), dc});
+				});
+			})));
+	}
+
+	// rt = ra (compare) rb for FCGT, FCMGT, FCEQ and FCMEQ; magnitudes compares the absolute values
+	void xfloat_fast_compare(spu_opcode_t op, llvm::CmpInst::Predicate predicate, bool magnitudes)
+	{
+		const auto a = get_vr<u32[4]>(op.ra).value;
+		const auto b = get_vr<u32[4]>(op.rb).value;
+
+		const auto operand = [&](llvm::Value* x) { return magnitudes ? m_ir->CreateAnd(x, llvm::ConstantInt::get(get_type<u32[4]>(), 0x7fffffff)) : x; };
+
+		set_vr(op.rt, value<u32[4]>(xfloat_fast_op({a, b}, false,
+			[&]() { return m_ir->CreateSExt(m_ir->CreateFCmp(predicate, xfloat_as_float(operand(a)), xfloat_as_float(operand(b))), get_type<u32[4]>()); },
+			[&]() { return m_ir->CreateSExt(m_ir->CreateFCmp(predicate, xfloat_to_double(operand(a)), xfloat_to_double(operand(b))), get_type<u32[4]>()); })));
+	}
+
 	void set_reg_fixed(u32 index, llvm::Value* value, bool fixup = true)
 	{
 		llvm::StoreInst* dummy{};
 
 		// Check
 		ensure(!m_block || m_regmod[m_pos / 4] == index);
+
+		if (value->getType() == get_type<f64[4]>() && xfloat_fast())
+		{
+			// No register is kept as doubles in this mode
+			value = double_to_xfloat(fixup ? xfloat_in_double(value) : value);
+		}
 
 		// Test for special case
 		const bool is_xfloat = value->getType() == get_type<f64[4]>();
@@ -2392,6 +2604,7 @@ public:
 			+ ((m_trace_06c30 || m_trace_06c30_return) ? "-trace-06c30-EGC0gjYw3PwftJbtb6hXj7Xby6m5-wall-v1" : "")
 			+ (g_spu_04ac8_contribution_trace ? "-trace-04ac8-Hc9ev2Q8JGX0Fcwtuv18zKbed58C-tree-v4" : "")
 			+ (g_spu_native_rwv_experiment ? "-native-rwv-v1" : "")
+			+ (spu_xfloat_fast_mode() && g_cfg.core.spu_xfloat_accuracy == xfloat_accuracy::accurate ? (spu_xfloat_fast_mode() == 2 ? "-xfloat-fast-check-v3" : "-xfloat-fast-v2") : "")
 			+ (g_spu_native_sxe_experiment ? "-native-sxe-v1" : "")
 			+ (g_spu_native_07170_experiment ? "-native-07170-zero-v1" : "")
 			+ (g_spu_rsqrte_lut_experiment ? "-rsqrte-lut-v1" : "")
@@ -3307,7 +3520,7 @@ public:
 						if (src > 0x40000)
 						{
 							// Use the xfloat hint to create 256-bit (4x double) PHI
-							llvm::Type* type = g_cfg.core.spu_xfloat_accuracy == xfloat_accuracy::accurate && bb.reg_maybe_xf.test_unsafe(i) ? get_type<f64[4]>() : get_reg_type(i);
+							llvm::Type* type = g_cfg.core.spu_xfloat_accuracy == xfloat_accuracy::accurate && !xfloat_fast() && bb.reg_maybe_xf.test_unsafe(i) ? get_type<f64[4]>() : get_reg_type(i);
 
 							const auto _phi = m_ir->CreatePHI(type, ::size32(bb.preds), fmt::format("phi0x%05x_r%u", baddr, i));
 							m_block->phi[i] = _phi;
@@ -3718,7 +3931,7 @@ public:
 				{
 					for (u32 i = 0; i < s_reg_max; i++)
 					{
-						llvm::Type* type = g_cfg.core.spu_xfloat_accuracy == xfloat_accuracy::accurate && bb.reg_maybe_xf.test_unsafe(i) ? get_type<f64[4]>() : get_reg_type(i);
+						llvm::Type* type = g_cfg.core.spu_xfloat_accuracy == xfloat_accuracy::accurate && !xfloat_fast() && bb.reg_maybe_xf.test_unsafe(i) ? get_type<f64[4]>() : get_reg_type(i);
 
 						if (i < m_reduced_loop_info->loop_dicts.size() && (m_reduced_loop_info->loop_dicts.test(i) || m_reduced_loop_info->loop_writes.test(i)))
 						{
@@ -8904,6 +9117,12 @@ public:
 
 	void FCGT(spu_opcode_t op)
 	{
+		if (xfloat_fast() && !m_interp_magn)
+		{
+			xfloat_fast_compare(op, llvm::CmpInst::FCMP_OGT, false);
+			return;
+		}
+
 		if (g_cfg.core.spu_xfloat_accuracy == xfloat_accuracy::accurate)
 		{
 			set_vr(op.rt, sext<s32[4]>(fcmp_ord(get_vr<f64[4]>(op.ra) > get_vr<f64[4]>(op.rb))));
@@ -9000,6 +9219,12 @@ public:
 
 	void FCMGT(spu_opcode_t op)
 	{
+		if (xfloat_fast() && !m_interp_magn)
+		{
+			xfloat_fast_compare(op, llvm::CmpInst::FCMP_OGT, true);
+			return;
+		}
+
 		if (g_cfg.core.spu_xfloat_accuracy == xfloat_accuracy::accurate)
 		{
 			set_vr(op.rt, sext<s32[4]>(fcmp_ord(fabs(get_vr<f64[4]>(op.ra)) > fabs(get_vr<f64[4]>(op.rb)))));
@@ -9067,6 +9292,12 @@ public:
 
 	void FA(spu_opcode_t op)
 	{
+		if (xfloat_fast() && !m_interp_magn)
+		{
+			xfloat_fast_binary(op, llvm::Instruction::FAdd);
+			return;
+		}
+
 		if (g_cfg.core.spu_xfloat_accuracy == xfloat_accuracy::accurate)
 		{
 			set_vr(op.rt, get_vr<f64[4]>(op.ra) + get_vr<f64[4]>(op.rb));
@@ -9086,6 +9317,12 @@ public:
 
 	void FS(spu_opcode_t op)
 	{
+		if (xfloat_fast() && !m_interp_magn)
+		{
+			xfloat_fast_binary(op, llvm::Instruction::FSub);
+			return;
+		}
+
 		if (g_cfg.core.spu_xfloat_accuracy == xfloat_accuracy::accurate)
 		{
 			set_vr(op.rt, get_vr<f64[4]>(op.ra) - get_vr<f64[4]>(op.rb));
@@ -9116,6 +9353,12 @@ public:
 
 	void FM(spu_opcode_t op)
 	{
+		if (xfloat_fast() && !m_interp_magn)
+		{
+			xfloat_fast_binary(op, llvm::Instruction::FMul);
+			return;
+		}
+
 		if (g_cfg.core.spu_xfloat_accuracy == xfloat_accuracy::accurate)
 		{
 			set_vr(op.rt, get_vr<f64[4]>(op.ra) * get_vr<f64[4]>(op.rb));
@@ -9278,6 +9521,12 @@ public:
 
 	void FCEQ(spu_opcode_t op)
 	{
+		if (xfloat_fast() && !m_interp_magn)
+		{
+			xfloat_fast_compare(op, llvm::CmpInst::FCMP_OEQ, false);
+			return;
+		}
+
 		if (g_cfg.core.spu_xfloat_accuracy == xfloat_accuracy::accurate)
 		{
 			set_vr(op.rt, sext<s32[4]>(fcmp_ord(get_vr<f64[4]>(op.ra) == get_vr<f64[4]>(op.rb))));
@@ -9327,6 +9576,12 @@ public:
 
 	void FCMEQ(spu_opcode_t op)
 	{
+		if (xfloat_fast() && !m_interp_magn)
+		{
+			xfloat_fast_compare(op, llvm::CmpInst::FCMP_OEQ, true);
+			return;
+		}
+
 		if (g_cfg.core.spu_xfloat_accuracy == xfloat_accuracy::accurate)
 		{
 			set_vr(op.rt, sext<s32[4]>(fcmp_ord(fabs(get_vr<f64[4]>(op.ra)) == fabs(get_vr<f64[4]>(op.rb)))));
@@ -9417,6 +9672,12 @@ public:
 
 	void FNMS(spu_opcode_t op)
 	{
+		if (xfloat_fast() && !m_interp_magn)
+		{
+			xfloat_fast_fma(op, true, false);
+			return;
+		}
+
 		// See FMA.
 		if (g_cfg.core.spu_xfloat_accuracy == xfloat_accuracy::accurate)
 		{
@@ -9459,6 +9720,12 @@ public:
 
 	void FMA(spu_opcode_t op)
 	{
+		if (xfloat_fast() && !m_interp_magn)
+		{
+			xfloat_fast_fma(op, false, false);
+			return;
+		}
+
 		// Hardware FMA produces the same result as multiple + add on the limited double range (xfloat).
 		if (g_cfg.core.spu_xfloat_accuracy == xfloat_accuracy::accurate)
 		{
@@ -9776,6 +10043,12 @@ public:
 
 	void FMS(spu_opcode_t op)
 	{
+		if (xfloat_fast() && !m_interp_magn)
+		{
+			xfloat_fast_fma(op, false, true);
+			return;
+		}
+
 		// See FMA.
 		if (g_cfg.core.spu_xfloat_accuracy == xfloat_accuracy::accurate)
 		{

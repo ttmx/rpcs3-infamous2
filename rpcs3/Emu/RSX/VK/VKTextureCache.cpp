@@ -3,6 +3,7 @@
 #include "VKNativeSSAO.h"
 #include "VKNativeLighting.h"
 #include "VKGpuPassProfile.hpp"
+#include "Emu/roundtrip_survey.h"
 #include "VKTextureCache.h"
 #include "VKGSRender.h"
 #include "VKCompute.h"
@@ -88,6 +89,11 @@ namespace vk
         }
 
 		ensure(src->samples() == 1);
+
+		if (roundtrip_survey::enabled()) [[unlikely]]
+		{
+			roundtrip_survey::note_readback(valid_range.start, valid_range.length(), src_area.width(), src_area.height(), pitch);
+		}
 
 		if (!m_device)
 		{
@@ -1367,6 +1373,11 @@ namespace vk
 	cached_texture_section* texture_cache::upload_image_from_cpu(vk::command_buffer& cmd, const utils::address_range32& rsx_range, u16 width, u16 height, u16 depth, u16 mipmaps, u32 pitch, u32 gcm_format,
 		rsx::texture_upload_context context, const std::vector<rsx::subresource_layout>& subresource_layout, rsx::texture_dimension_extended type, bool swizzled)
 	{
+		if (roundtrip_survey::enabled()) [[unlikely]]
+		{
+			roundtrip_survey::note_upload(rsx_range.start, width, height, pitch, gcm_format, vm::base(rsx_range.start));
+		}
+
 		if (context != rsx::texture_upload_context::shader_read)
 		{
 			if (vk::is_renderpass_open(cmd))

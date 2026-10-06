@@ -978,7 +978,7 @@
                   <item>
                    <widget class="QCheckBox" name="infamous2FullResParticles">
                     <property name="text">
-                     <string>inFamous 2: Full Resolution Particles</string>
+                     <string>inFamous: Full Resolution Particles</string>
                     </property>
                    </widget>
                   </item>

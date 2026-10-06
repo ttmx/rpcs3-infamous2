@@ -12,6 +12,7 @@
 #include "vkutils/buffer_object.h"
 #include "Emu/Memory/vm.h"
 #include "Emu/System.h"
+#include "Emu/infamous_titles.h"
 #include "Emu/RSX/RSXThread.h"
 
 #include <bit>
@@ -41,7 +42,6 @@ namespace vk::native_lighting
 	namespace
 	{
 		// Guest memory of the two images: normals in, diffuse light out / depth in, specular light out
-		constexpr u32 normals_address = 0x37400b80, depth_address = 0x37784b80;
 		constexpr u32 guest_width = 1280, guest_height = 720;
 
 		// Shader limits (VKNativeLightingShaders.hpp): MASK_WORDS * 32 lights, 40x18 tiles, five blocks of pixels per tile
@@ -332,7 +332,7 @@ void main()
 			}
 
 			auto& s = *g_state;
-			const u32 i = address == normals_address ? 0 : 1;
+			const u32 i = address == infamous_native::current().normals ? 0 : 1;
 
 			if (src->width() != s.width || src->height() != s.height)
 			{
@@ -528,13 +528,13 @@ void main()
 
 	bool is_gbuffer(u32 address)
 	{
-		return address == normals_address || address == depth_address;
+		return address == infamous_native::current().normals || address == infamous_native::current().depth;
 	}
 
 	u32 gbuffer_containing(u32 address)
 	{
 		constexpr u32 bytes = guest_width * guest_height * 4;
-		return address - normals_address < bytes ? normals_address : address - depth_address < bytes ? depth_address : 0;
+		return address - infamous_native::current().normals < bytes ? infamous_native::current().normals : address - infamous_native::current().depth < bytes ? infamous_native::current().depth : 0;
 	}
 
 	bool blits_unneeded()
@@ -544,7 +544,7 @@ void main()
 
 	vk::image* on_gbuffer_target(vk::command_buffer& cmd, vk::image* src, u32 address)
 	{
-		const bool depth = address == depth_address;
+		const bool depth = address == infamous_native::current().depth;
 
 		if (!is_gbuffer(address) || src->width() < guest_width / 4 || src->height() < guest_height / 4 || src->samples() != 1 ||
 			(depth ? !(src->aspect() & VK_IMAGE_ASPECT_DEPTH_BIT) : src->format() != VK_FORMAT_B8G8R8A8_UNORM) ||
@@ -571,7 +571,7 @@ void main()
 
 	void on_gbuffer(vk::command_buffer& cmd, vk::image* src, const areai& area, u32 address)
 	{
-		if (!mode() || !is_gbuffer(address) || Emu.GetTitleID() != "BCES01143")
+		if (!mode() || !is_gbuffer(address))
 		{
 			return;
 		}
@@ -624,7 +624,7 @@ void main()
 		}
 
 		// The output has the same channels under the same names as the game's texture, so its component mapping applies as it is
-		const u32 i = address == normals_address ? 0 : 1;
+		const u32 i = address == infamous_native::current().normals ? 0 : 1;
 		const auto& map = original->info.components;
 		const u32 key = (map.r & 0xff) | ((map.g & 0xff) << 8) | ((map.b & 0xff) << 16) | ((map.a & 0xff) << 24);
 		auto& result = s.views[i][key];

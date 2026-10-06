@@ -10,6 +10,7 @@
 #include "vkutils/device.h"
 #include "Emu/Memory/vm.h"
 #include "Emu/System.h"
+#include "Emu/infamous_titles.h"
 #include "Emu/RSX/RSXThread.h"
 
 #include <cmath>
@@ -35,11 +36,6 @@ namespace vk::native_ssao
 	namespace
 	{
 		// Guest memory: the two G-buffer copies, the job's output texture, its half-resolution depth, its camera matrix
-		constexpr u32 normals_address = 0x37400b80;
-		constexpr u32 depth_address = 0x37784b80;
-		constexpr u32 output_address = 0xcf800000;
-		constexpr u32 half_depth_address = 0x37b08b80;
-		constexpr u32 matrix_address = 0x00a94a20;
 		// Sizes of the game's own textures
 		constexpr u32 guest_w = 1280, guest_h = 720, guest_half_w = 640, guest_half_h = 360;
 
@@ -295,7 +291,7 @@ void main()
 			f32 m[16];
 			for (u32 i = 0; i < 16; ++i)
 			{
-				m[i] = vm::_ref<be_t<f32>>(matrix_address + i * 4);
+				m[i] = vm::_ref<be_t<f32>>(infamous_native::current().matrix + i * 4);
 				if (!std::isfinite(m[i])) return;
 			}
 			for (u32 col = 0; col < 3; ++col)
@@ -337,7 +333,7 @@ void main()
 
 	void on_gbuffer(vk::command_buffer& cmd, vk::image* src, const areai& src_area, u32 dst_address)
 	{
-		if (!mode() || (dst_address != normals_address && dst_address != depth_address) || Emu.GetTitleID() != "BCES01143") return;
+		if (!mode() || (dst_address != infamous_native::current().normals && dst_address != infamous_native::current().depth)) return;
 		if (src_area.x1 != 0 || src_area.y1 != 0 || src_area.width() != static_cast<s32>(src->width()) || src_area.height() != static_cast<s32>(src->height()) ||
 			src->width() < guest_w / 4 || src->height() < guest_h / 4 || src->samples() != 1)
 		{
@@ -348,7 +344,7 @@ void main()
 		auto& s = *g_state;
 
 		if (src->format() != VK_FORMAT_B8G8R8A8_UNORM || !rsx::get_current_renderer()->is_current_thread()) return;
-		(dst_address == normals_address ? s.normals : s.depth) = src;
+		(dst_address == infamous_native::current().normals ? s.normals : s.depth) = src;
 
 		if (s.normals && s.depth)
 		{
@@ -363,7 +359,7 @@ void main()
 
 	bool is_half_depth(u32 texture_address)
 	{
-		return texture_address == half_depth_address;
+		return texture_address == infamous_native::current().half_depth;
 	}
 
 	vk::image_view* half_depth_view()
@@ -373,10 +369,10 @@ void main()
 
 	vk::image_view* substitute(vk::command_buffer& /*cmd*/, vk::image_view* original, u32 texture_address)
 	{
-		if ((texture_address != output_address && texture_address != half_depth_address) || !g_state || !g_state->valid || !original) return nullptr;
+		if ((texture_address != infamous_native::current().occlusion && texture_address != infamous_native::current().half_depth) || !g_state || !g_state->valid || !original) return nullptr;
 		auto& s = *g_state;
 
-		if (texture_address == half_depth_address)
+		if (texture_address == infamous_native::current().half_depth)
 		{
 			// The downsample pass output is what the job's first kernel stores there
 			if (!(mode() & 1) || original->format() != VK_FORMAT_R32_SFLOAT || original->image()->width() != guest_half_w || original->image()->height() != guest_half_h)

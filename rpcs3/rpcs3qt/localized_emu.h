@@ -253,7 +253,7 @@ private:
 		case localized_string_id::HOME_MENU_SETTINGS_VIDEO_RESOLUTION_SCALE_PERCENT: return tr("Resolution Scale", "Video");
 		case localized_string_id::HOME_MENU_SETTINGS_VIDEO_RESOLUTION_SCALE_THRESHOLD: return tr("Resolution Scale Threshold", "Video");
 		case localized_string_id::HOME_MENU_SETTINGS_VIDEO_STRETCH_TO_DISPLAY: return tr("Stretch To Display Area", "Video");
-		case localized_string_id::HOME_MENU_SETTINGS_VIDEO_INFAMOUS2_FULL_RES_PARTICLES: return tr("inFamous 2: Full Resolution Particles", "Video");
+		case localized_string_id::HOME_MENU_SETTINGS_VIDEO_INFAMOUS2_FULL_RES_PARTICLES: return tr("inFamous: Full Resolution Particles", "Video");
 		case localized_string_id::HOME_MENU_SETTINGS_VIDEO_STEREO_MODE: return tr("Stereo Mode", "Video");
 		case localized_string_id::HOME_MENU_SETTINGS_INPUT: return tr("Input");
 		case localized_string_id::HOME_MENU_SETTINGS_INPUT_BACKGROUND_INPUT: return tr("Background Input Enabled", "Input");

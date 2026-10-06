@@ -46,6 +46,8 @@
 #include "util/simd.hpp"
 #include "util/sysinfo.hpp"
 #include "util/serialization.hpp"
+#include "Emu/roundtrip_survey.h"
+#include "Emu/infamous_titles.h"
 
 #if defined(ARCH_X64)
 #ifdef _MSC_VER
@@ -2189,7 +2191,7 @@ namespace spu_buffer_access_diag
 	static const bool s_enabled = []
 	{
 		const char* option = std::getenv("RPCS3_SPU_BUFFER_ACCESS_DIAG");
-		return option && (option[0] == '1' || option[0] == '2') && !option[1];
+		return roundtrip_survey::enabled() || (option && (option[0] == '1' || option[0] == '2') && !option[1]);
 	}();
 
 	struct stat_t
@@ -2287,6 +2289,12 @@ namespace spu_buffer_access_diag
 
 	static void observe(spu_thread* spu, const spu_mfc_cmd& args, const u8* ls, u32 kind) // 0 PUT, 1 GET, 2 PUTLLUC, 3 PUTLLC
 	{
+		if (roundtrip_survey::enabled())
+		{
+			roundtrip_survey::note_spu(ls, kind, args.eal, args.size, spu ? spu->pc : 0);
+			return;
+		}
+
 		if (s_map_all)
 		{
 			observe_all(spu, args, ls, kind);
@@ -2395,8 +2403,7 @@ void spu_thread::do_dma_transfer(spu_thread* _this, const spu_mfc_cmd& args, u8*
 
 	// inFamous 2 ambient occlusion is computed on the GPU (RPCS3_NATIVE_SSAO bit 2): each of the job's five
 	// kernels is loaded as usual, then made to return at its entry point so the SPU does no pixel work.
-	if (native_ssao_skips_spu_work() && is_get && args.lsa == 0x6c00 && args.size >= 784 &&
-		(args.eal == 0x0087d500 || args.eal == 0x0087d880 || args.eal == 0x0087e480 || args.eal == 0x0087ec80 || args.eal == 0x0087f880)) [[unlikely]]
+	if (native_ssao_skips_spu_work() && is_get && args.lsa == 0x6c00 && args.size >= 784 && infamous_native::current().is_kernel(args.eal)) [[unlikely]]
 	{
 		std::memcpy(ls + args.lsa, vm::_ptr<const u8>(args.eal), args.size);
 		const be_t<u32> return_to_caller = 0x35000000; // BI $lr
@@ -3285,7 +3292,7 @@ static void native_lighting_job_hook(spu_thread& spu, u32 table, u32 table_bytes
 		loaded = hash == 0x01f9aa7f;
 	}
 
-	const bool gpu = native_lighting_job_start(vm::get_super_ptr<const u8>(0x00a93c80), table, table_bytes);
+	const bool gpu = native_lighting_job_start(vm::get_super_ptr<const u8>(infamous_native::current().lighting_params), table, table_bytes);
 	const bool skip = gpu && loaded && (native_lighting_mode() & 4);
 
 	if (loaded && std::memcmp(entry, skip ? stub : code, 4))
@@ -3336,7 +3343,8 @@ static bool native_gbuffer_list_skip(spu_thread& spu, const spu_mfc_cmd& args)
 		return false;
 	}
 
-	const u32 dead_bytes = occlusion ? 0x37c22480u - 0x37400b80u : 0x708000u;
+	const auto& game = infamous_native::current();
+	const u32 dead_bytes = occlusion ? game.scratch_end - game.normals : game.gbuffer_bytes;
 
 	const auto element = [&](u32 off, u32& ea, u32& size)
 	{
@@ -3348,7 +3356,7 @@ static bool native_gbuffer_list_skip(spu_thread& spu, const spu_mfc_cmd& args)
 
 	const auto dead = [&](u32 ea, u32 size)
 	{
-		return ea - 0x37400b80u < dead_bytes && size <= dead_bytes - (ea - 0x37400b80u);
+		return ea - game.normals < dead_bytes && size <= dead_bytes - (ea - game.normals);
 	};
 
 	u32 lsa = args.lsa & 0x3fff0;
@@ -3762,12 +3770,12 @@ NEVER_INLINE static bool do_list_transfer_diagnostic(spu_thread& self, spu_mfc_c
 		}
 
 		// Try to inline the transfer
-		if (size && addr - 0xcf800000u < 0xe1000u && native_ssao_skips_spu_work()) [[unlikely]]
+		if (size && infamous_native::current().in_occlusion(addr) && native_ssao_skips_spu_work()) [[unlikely]]
 		{
 			// Ambient occlusion output image: produced on the GPU instead, leave the guest texture untouched
 			arg_lsa += utils::align<u32>(size, 16);
 		}
-		else if (size && addr - 0x37400b80u < 0x708000u && optimization_compatible == MFC_PUT_CMD && g_native_lighting_skip_puts.load(std::memory_order_relaxed)) [[unlikely]]
+		else if (size && infamous_native::current().in_gbuffer(addr) && optimization_compatible == MFC_PUT_CMD && g_native_lighting_skip_puts.load(std::memory_order_relaxed)) [[unlikely]]
 		{
 			// Lighting output images: produced on the GPU instead
 			arg_lsa += utils::align<u32>(size, 16);
@@ -3982,8 +3990,9 @@ bool spu_thread::do_list_transfer(spu_mfc_cmd& args)
 	if (native_lighting_mode()) [[unlikely]]
 	{
 		const u8* first = this->ls + (args.eal & 0x3fff8);
-		if (first[2] == 1 && first[3] == 0 && first[4] == 0x00 && first[5] == 0xa9 && first[6] == 0x3c && first[7] == 0x80 &&
-			(args.cmd & ~(MFC_BARRIER_MASK | MFC_FENCE_MASK | MFC_START_MASK)) == MFC_GETL_CMD && Emu.GetTitleID() == "BCES01143")
+		const u32 first_ea = (u32{first[4]} << 24) | (u32{first[5]} << 16) | (u32{first[6]} << 8) | first[7];
+		if (first[2] == 1 && first[3] == 0 && first_ea == infamous_native::current().lighting_params &&
+			(args.cmd & ~(MFC_BARRIER_MASK | MFC_FENCE_MASK | MFC_START_MASK)) == MFC_GETL_CMD)
 		{
 			// Second element: the light table
 			const bool has_table = args.size >= 16;
@@ -3991,7 +4000,7 @@ bool spu_thread::do_list_transfer(spu_mfc_cmd& args)
 			const u32 table_bytes = (u32{first[10]} << 8) | first[11];
 			native_lighting_job_hook(*this, has_table ? table : 0u, has_table ? table_bytes : 0u);
 		}
-		else if ((native_lighting_mode() & 16) && first[4] == 0x37 && native_gbuffer_list_skip(*this, args))
+		else if ((native_lighting_mode() & 16) && first[4] == 0x37 && infamous_native::active() && native_gbuffer_list_skip(*this, args))
 		{
 			return true;
 		}
@@ -4467,12 +4476,12 @@ bool spu_thread::do_list_transfer(spu_mfc_cmd& args)
 		const u32 addr = items[index].ea;
 
 		// Try to inline the transfer
-		if (size && addr - 0xcf800000u < 0xe1000u && native_ssao_skips_spu_work()) [[unlikely]]
+		if (size && infamous_native::current().in_occlusion(addr) && native_ssao_skips_spu_work()) [[unlikely]]
 		{
 			// Ambient occlusion output image: produced on the GPU instead, leave the guest texture untouched
 			arg_lsa += utils::align<u32>(size, 16);
 		}
-		else if (size && addr - 0x37400b80u < 0x708000u && optimization_compatible == MFC_PUT_CMD && g_native_lighting_skip_puts.load(std::memory_order_relaxed)) [[unlikely]]
+		else if (size && infamous_native::current().in_gbuffer(addr) && optimization_compatible == MFC_PUT_CMD && g_native_lighting_skip_puts.load(std::memory_order_relaxed)) [[unlikely]]
 		{
 			// Lighting output images: produced on the GPU instead
 			arg_lsa += utils::align<u32>(size, 16);

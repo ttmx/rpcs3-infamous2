@@ -12,6 +12,7 @@
 #include "VKNativeSSAO.h"
 #include "VKNativeLighting.h"
 #include "VKGSRender.h"
+#include "Emu/infamous_titles.h"
 #include "../Common/RSXTailDemandTrace.hpp"
 #include "VKTimestampDiagnostics.hpp"
 #include "VKHelpers.h"
@@ -426,6 +427,9 @@ VKGSRender::VKGSRender(utils::serial* ar) noexcept : GSRender(ar)
 		vk::live_ctl::values[1] = std::strtoull(length, nullptr, 10);
 	}
 
+	// Guest addresses for the GPU occlusion and lighting passes of this title, if it has them
+	infamous_native::refresh();
+
 	if (const char* mode = std::getenv("RPCS3_VK_FAST_DRAWS"))
 	{
 		vk::live_ctl::values[9] = std::strtoull(mode, nullptr, 10);
@@ -433,6 +437,12 @@ VKGSRender::VKGSRender(utils::serial* ar) noexcept : GSRender(ar)
 	if (const char* mode = std::getenv("RPCS3_VK_MATERIAL_BINDINGS"))
 	{
 		vk::live_ctl::values[10] = std::strtoull(mode, nullptr, 10);
+	}
+	else if (Emu.GetTitleID() == "BCES00609")
+	{
+		// inFamous sets its textures up again for most draws of the picture: +3.5% at the title screen's city, where
+		// inFamous 2 showed no reliable gain
+		vk::live_ctl::values[10] = 5;
 	}
 	if (const char* mode = std::getenv("RPCS3_VK_DESCRIPTOR_REUSE"))
 	{
@@ -2976,10 +2986,10 @@ void VKGSRender::prepare_rtts(rsx::framebuffer_creation_context context)
 		return;
 	}
 
-	// inFamous 2 draws its particles (fire, smoke, sparks) into a 512x288 target and enlarges that over the 1280x720
-	// picture. On request that target and its depth buffer get 2.5 times the scale, the size of the main picture.
+	// inFamous 1 and 2 draw their particles (fire, smoke, sparks) into a 512x288 target and enlarge that over the
+	// 1280x720 picture. On request that target and its depth buffer get 2.5 times the scale, the size of the main picture.
 	const u16 scale_multiplier = (g_cfg.video.infamous2_full_res_particles &&
-		m_framebuffer_layout.width == 512 && m_framebuffer_layout.height == 288 && Emu.GetTitleID() == "BCES01143") ? 250 : 100;
+		m_framebuffer_layout.width == 512 && m_framebuffer_layout.height == 288 && rsx::is_infamous_title()) ? 250 : 100;
 
 	if (scale_multiplier != framebuffer_scale_multiplier_percent)
 	{

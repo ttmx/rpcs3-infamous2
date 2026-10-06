@@ -36,6 +36,7 @@ namespace infamous2
 			{"RPCS3_VK_FAST_DRAWS", "6"},
 			{"RPCS3_VK_PIPELINE_REUSE", "1"},
 			{"RPCS3_VK_DESCRIPTOR_REUSE", "1"},
+			{"RPCS3_SPU_XFLOAT_FAST", "1"},
 		};
 
 		for (const entry& e : defaults)

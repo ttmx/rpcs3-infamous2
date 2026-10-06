@@ -17,6 +17,10 @@
 #include "util/asm.hpp"
 #include "util/video_provider.h"
 
+extern u64 g_spu_xfloat_fast_checks;
+extern u64 g_spu_xfloat_fast_mismatches;
+extern u64 g_spu_xfloat_fast_slow;
+
 extern atomic_t<bool> g_user_asked_for_screenshot;
 extern atomic_t<recording_mode> g_recording_mode;
 
@@ -204,6 +208,11 @@ void VKGSRender::advance_queued_frames()
 	// Texture cache is also double buffered to prevent use-after-free
 	m_texture_cache.on_frame_end();
 	m_samplers_dirty.store(true);
+	if (g_spu_xfloat_fast_checks && vk::get_current_frame_id() % 600 == 0)
+	{
+		rsx_log.notice("SPU fast xfloat: %u operations checked, %u mismatches, %u took the regular path (since start)", g_spu_xfloat_fast_checks, g_spu_xfloat_fast_mismatches, g_spu_xfloat_fast_slow);
+	}
+
 	if (vk::live_ctl::get(11) && vk::get_current_frame_id() % 600 == 0)
 	{
 		rsx_log.notice("Pipeline reuse: %u clean reuses checked, %u mismatches, %u unchanged dirty states cleared (600 frames)",
