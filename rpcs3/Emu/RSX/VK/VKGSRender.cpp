@@ -2988,8 +2988,10 @@ void VKGSRender::prepare_rtts(rsx::framebuffer_creation_context context)
 
 	// inFamous 1 and 2 draw their particles (fire, smoke, sparks) into a 512x288 target and enlarge that over the
 	// 1280x720 picture. On request that target and its depth buffer get 2.5 times the scale, the size of the main picture.
+	// Live control 13 sets another scale, to measure what the size costs
+	const u64 particle_scale_override = vk::live_ctl::get(13);
 	const u16 scale_multiplier = (g_cfg.video.infamous2_full_res_particles &&
-		m_framebuffer_layout.width == 512 && m_framebuffer_layout.height == 288 && rsx::is_infamous_title()) ? 250 : 100;
+		m_framebuffer_layout.width == 512 && m_framebuffer_layout.height == 288 && rsx::is_infamous_title()) ? (particle_scale_override ? static_cast<u16>(particle_scale_override) : 250) : 100;
 
 	if (scale_multiplier != framebuffer_scale_multiplier_percent)
 	{

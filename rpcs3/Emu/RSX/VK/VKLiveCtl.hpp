@@ -25,6 +25,8 @@
 // 10: compressed material image/sampler bindings: 0 = off, 1 = reuse, 2 = full path with every proposed reuse checked
 // 11: clear validated unchanged pipeline state: 0 = stock, 1 = on, 2 = on with a fresh decode for every clean reuse
 // 12: reuse of descriptor sets with identical contents (VKProgramPipeline.cpp, descriptor_table_t::commit): 0 = off, 1 = on
+// 13: scale in percent of the inFamous particle target while the full resolution particles setting is on (0 = 250)
+// 14: 1 = the inFamous particle depth buffer takes over its old contents again before it is filled (VKDraw.cpp, end())
 namespace vk::live_ctl
 {
 	inline std::atomic<std::uint64_t> values[16]{};

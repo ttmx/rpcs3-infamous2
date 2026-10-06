@@ -27,6 +27,9 @@ Scripts:
 - `compare.sh <label> <stock|stock-nostrict|play> <pier|dock|city|street>`: one boot of a scene with RPCS3's own
   paths or with the launcher's settings, three arms of 10 s and a screenshot; `UNCAPPED=1` lifts the 60 FPS cap. This
   produced the table in the top-level README.
+- `particles.sh <label> <reps> <seconds> "<scale> [0|1]" ...`: the dock state uncapped, with the particle target's scale
+  (live control 13) and the old depth buffer path (live control 14) switched inside one boot; `RES=200` sets the
+  resolution scale.
 - `spawn-bench.sh <label> <binary> <state> <capped|uncapped>`: one build at a state's spawn camera, four arms of 10 s.
 - `replace_bench.sh`, `lightning_shots.sh`: dock state standing still and firing lightning, per lighting mode.
 - `roam.sh <rounds>`: walk, turn, jump and fire, for the content-check modes.

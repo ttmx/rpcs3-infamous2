@@ -1629,3 +1629,34 @@ Question: can the depth of field be rendered at native size, as it is said to lo
   mode. Whether the switch was active in that run was not confirmed by a log line.
 - Not adopted; the probe was removed. No cost figures: the machine was on a low battery and throttled.
 - Open: what the reported artefact is. Cutscenes were not tested (no savestate in one).
+
+## What full resolution particles cost
+
+Measured with `bench/particles.sh` (arms switched inside one boot; live control 13 sets the particle target's scale).
+Two separate costs.
+
+Waste, removed. The particle target's depth buffer is filled every frame by one full-screen triangle with depth test
+ALWAYS. Before that draw the surface cache brought in the buffer's old contents: last frame's copy of itself and the
+256x256 shadow map that shares its address, the second as a scaled depth transfer. At a resolution scale of 200% that
+took 0.28 ms of GPU time with the setting off and 1.19 ms with it on, against 0.49 ms for the draw. `VKGSRender::end()`
+now drops the pending transfers for that draw and lets the buffer start cleared (live control 14 = 1 brings the old
+path back). All three games do this.
+
+inFamous 2 dock, uncapped FPS (Radeon 780M):
+
+| resolution scale | setting off | on, before | on, after |
+|---|---|---|---|
+| 100% (CPU bound) | 95.8 | 95.0 | 95.5 |
+| 150% | 75.1 | 68.4 | 70.9 |
+| 200% | 47.9 | 43.4 | 45.2 |
+| 300% | 23.1 | 20.7 | 21.6 |
+
+Fill, unchanged. Where particles cover most of the screen the setting costs far more, because every sprite blends
+6.25 times the pixels. inFamous, a flame jet in front of the camera, uncapped FPS by particle scale:
+
+| resolution scale | 100 (off) | 150 | 200 | 250 (on) |
+|---|---|---|---|---|
+| 100% | 74.5 | 72.4 | | 66.0 |
+| 200% | 41.8 | 36.2 | 30.5 | 25.9 |
+
+If such scenes are too slow, turn the setting off (home menu, Settings, Video). Not tested on NVIDIA or Windows.

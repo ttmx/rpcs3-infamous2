@@ -10,6 +10,7 @@
 #include "VKPassTiming.hpp"
 #include "VKGpuPassProfile.hpp"
 #include "VKLiveCtl.hpp"
+#include "Emu/infamous_titles.h"
 #include "vkutils/buffer_object.h"
 #include "vkutils/chip_class.h"
 #include <vulkan/vulkan_core.h>
@@ -1576,6 +1577,30 @@ void VKGSRender::end()
 	// Apply write memory barriers
 	if (auto ds = std::get<1>(m_rtts.m_bound_depth_stencil))
 	{
+		// The inFamous games fill the depth buffer of their 512x288 particle target with one full-screen triangle that
+		// writes every pixel (depth test ALWAYS). What the barrier would bring into the buffer before that, last frame's
+		// contents and the shadow map that shares the address, is overwritten at once, and bringing it in costs several
+		// times the draw itself (most with full resolution particles). Start from a cleared buffer instead.
+		if (!m_surface_info[0].address && m_framebuffer_layout.width == 512 && m_framebuffer_layout.height == 288 &&
+			!ds->old_contents.empty() && vk::live_ctl::get(14) != 1 && rsx::is_infamous_title()) [[unlikely]]
+		{
+			auto& clause = rsx::method_registers.current_draw_clause;
+			if (clause.command == rsx::draw_command::array && !clause.empty() && clause.pass_count() == 1 &&
+				(clause.begin(), clause.get_elements_count() == 3) &&
+				rsx::method_registers.depth_test_enabled() && rsx::method_registers.depth_write_enabled() &&
+				rsx::method_registers.depth_func() == rsx::comparison_function::always)
+			{
+				if (static bool logged = false; !logged)
+				{
+					logged = true;
+					rsx_log.notice("inFamous particle depth buffer at 0x%x starts cleared, %u pending transfers dropped", m_depth_surface_info.address, ds->old_contents.size());
+				}
+
+				ds->clear_rw_barrier();
+				ds->state_flags |= rsx::surface_state_flags::erase_bkgnd;
+			}
+		}
+
 		ds->write_barrier(*m_current_command_buffer);
 
 		if (m_graphics_state.test(rsx::zeta_address_cyclic_barrier) &&
