@@ -271,9 +271,15 @@ namespace vk
 
 		u32 report_frame = 0;
 
+		// A game whose geometry is written again every frame (God of War III: the SPUs skin everything) gets nothing
+		// from the cache and pays for the lookups and the page scans. While almost no request is answered from it the
+		// cache is suspended; it is tried again after a while, in case another part of the game is different.
+		static inline bool suspended = false;
+		static inline u32 resume_frame = 0;
+
 		static u32 mode()
 		{
-			return static_cast<u32>(vk::live_ctl::get(8));
+			return suspended ? 0 : static_cast<u32>(vk::live_ctl::get(8));
 		}
 
 		// A full heap is replaced, but not more often than every few seconds

@@ -12,6 +12,7 @@
 //  1: minimum byte length for streaming (non-temporal) DMA loads (0 = off)
 //  2: same-frame multi-block vertex cache (0/1)
 //  3: source prefetch bitmask: 1 = vertex copies, 2 = blit complement upload, 4 = streaming DMA loads
+//     and the non-temporal vertex copy (RSXOffload.cpp, RPCS3_RSX_STREAM_VERTEX_COPY): 8 = on, 16 = off
 //  4: minimum bytes for offloading vertex copies to the RSX offload thread (0 = off; needs RPCS3_RSX_COPY_OFFLOAD=1)
 //  5: maximum spin multiplier for the SPU reservation-checking thread's MWAITX/TPAUSE wait (0 = stock 17/10)
 //  6: PPU usleep addend override in microseconds, stored +1 (0 = use the config value)
@@ -27,9 +28,12 @@
 // 12: reuse of descriptor sets with identical contents (VKProgramPipeline.cpp, descriptor_table_t::commit): 0 = off, 1 = on
 // 13: scale in percent of the inFamous particle target while the full resolution particles setting is on (0 = 250)
 // 14: 1 = the inFamous particle depth buffer takes over its old contents again before it is filled (VKDraw.cpp, end())
+// 15: SPU line stores without the full lock (SPUThread.cpp, do_putllc): 0 = as RPCS3_SPU_PUTLLC_PIECEWISE says, 1 = off, 2 = on
+// 16: host kernels of the God of War III geometry job (SPUNativeGeometry.hpp): 1 = they decline, the SPU code runs
+// 17: minimum byte length of a vertex copy done with non-temporal stores (0 = 1024)
 namespace vk::live_ctl
 {
-	inline std::atomic<std::uint64_t> values[16]{};
+	inline std::atomic<std::uint64_t> values[24]{};
 
 	inline std::uint64_t get(unsigned index)
 	{

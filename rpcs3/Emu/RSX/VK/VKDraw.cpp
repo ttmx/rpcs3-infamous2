@@ -5,6 +5,7 @@
 
 #include "VKAsyncScheduler.h"
 #include "VKNativeSSAO.h"
+#include "VKNativeAA.h"
 #include "VKNativeLighting.h"
 #include "VKGSRender.h"
 #include "VKPassTiming.hpp"
@@ -451,6 +452,13 @@ void VKGSRender::load_texture_env()
 		if (vk::native_lighting::mode() && sampler_state->image_handle) [[unlikely]]
 		{
 			if (auto view = vk::native_lighting::substitute(*m_current_command_buffer, sampler_state->image_handle, rsx::get_address(tex.offset(), tex.location())))
+			{
+				sampler_state->image_handle = view;
+			}
+		}
+		if (vk::native_aa::mode() && sampler_state->image_handle) [[unlikely]]
+		{
+			if (auto view = vk::native_aa::substitute(*m_current_command_buffer, sampler_state->image_handle, rsx::get_address(tex.offset(), tex.location())))
 			{
 				sampler_state->image_handle = view;
 			}
@@ -2010,13 +2018,15 @@ void VKGSRender::fast_draw_batch()
 	};
 
 	// Registers written with the value they hold. Without a handler the FIFO loop does nothing for such a write;
-	// the handler of the two face registers returns at once for it.
+	// the handlers of the two face registers, of the vertex program start (God of War III sets it before every
+	// draw) and of the vertex output mask return at once for it.
 	const auto rewrites_registers = [&](u32 reg, u32 count) -> bool
 	{
 		for (u32 i = 0; i < count; i++)
 		{
 			const u32 r = reg + i;
-			if (r >= std::size(regs.registers) || regs.registers[r] != words[i] || (rsx::methods[r] && r != NV4097_SET_FRONT_FACE && r != NV4097_SET_CULL_FACE)) return false;
+			if (r >= std::size(regs.registers) || regs.registers[r] != words[i]) return false;
+			if (rsx::methods[r] && r != NV4097_SET_FRONT_FACE && r != NV4097_SET_CULL_FACE && r != NV4097_SET_TRANSFORM_PROGRAM_START && r != NV4097_SET_VERTEX_ATTRIB_OUTPUT_MASK) return false;
 		}
 		return true;
 	};
@@ -2493,6 +2503,13 @@ void VKGSRender::fast_draw_batch()
 		rsx::thread::end();
 		m_fast_draw.draws++;
 		vk::pass_timing::mark(4);
+
+		// What the FIFO loop does every 64 commands: finished occlusion reports are written, so that a later
+		// synchronisation does not have to wait for all of them at once (God of War III has a report every other draw)
+		if ((draws & 7) == 0)
+		{
+			zcull_ctrl->update(this);
+		}
 
 		if (m_periodic_submit_us)
 		{

@@ -33,11 +33,16 @@ namespace infamous2
 			{"RPCS3_NATIVE_SSAO", "5"},
 			{"RPCS3_NATIVE_LIGHTING", "61"},
 			{"RPCS3_VK_GEOMETRY_CACHE", "1"},
-			{"RPCS3_VK_FAST_DRAWS", "6"},
+			{"RPCS3_VK_FAST_DRAWS", "2"},
 			{"RPCS3_VK_PIPELINE_REUSE", "1"},
 			{"RPCS3_VK_DESCRIPTOR_REUSE", "1"},
 			{"RPCS3_SPU_XFLOAT_FAST", "1"},
 			{"RPCS3_VK_DYNAMIC_FACE", "1"},
+			{"RPCS3_NATIVE_AA", "7"},
+			{"RPCS3_SPU_PUTLLC_BACKOFF", "100"},
+			{"RPCS3_SPU_PUTLLC_PIECEWISE", "1"},
+			{"RPCS3_SPU_NATIVE_GEOMETRY", "1"},
+			{"RPCS3_RSX_STREAM_VERTEX_COPY", "1"},
 		};
 
 		for (const entry& e : defaults)

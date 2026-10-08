@@ -455,6 +455,10 @@ namespace rsx
 		 */
 		virtual void on_semaphore_acquire_wait() {}
 
+		// While the FIFO waits for the guest: with relaxed ZCULL sync nothing else delivers the reports the guest may be
+		// waiting for in turn (God of War III stops at one frame per second without this)
+		void deliver_reports_while_waiting();
+
 		/**
 		 * Load an image from memory with optional scaling and rotation.
 		 * Returns false to tell the HW decoder to perform the operation on the CPU as a fallback when the operation cannot be safely accelerated.

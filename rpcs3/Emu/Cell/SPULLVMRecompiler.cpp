@@ -28,6 +28,7 @@
 #endif
 #ifdef SPU_NATIVE_KERNELS
 #include "SPUNativeRWV.hpp"
+#include "SPUNativeGeometry.hpp"
 #include "SPUNativeSXE.hpp"
 #include "SPUNative07170.hpp"
 #endif
@@ -2604,6 +2605,8 @@ public:
 			+ ((m_trace_06c30 || m_trace_06c30_return) ? "-trace-06c30-EGC0gjYw3PwftJbtb6hXj7Xby6m5-wall-v1" : "")
 			+ (g_spu_04ac8_contribution_trace ? "-trace-04ac8-Hc9ev2Q8JGX0Fcwtuv18zKbed58C-tree-v4" : "")
 			+ (g_spu_native_rwv_experiment ? "-native-rwv-v1" : "")
+			+ (spu_native_geometry::enabled() ? "-native-geometry-v1" : "")
+			+ (spu_native_geometry::region_capture::get().pc ? "-region-capture" : "")
 			+ (spu_xfloat_fast_mode() && g_cfg.core.spu_xfloat_accuracy == xfloat_accuracy::accurate ? (spu_xfloat_fast_mode() == 2 ? "-xfloat-fast-check-v3" : "-xfloat-fast-v2") : "")
 			+ (g_spu_native_sxe_experiment ? "-native-sxe-v1" : "")
 			+ (g_spu_native_07170_experiment ? "-native-07170-zero-v1" : "")
@@ -4189,6 +4192,35 @@ public:
 						continue;
 					}
 					default: break;
+					}
+
+					// A region of a known program that has a host version (SPUNativeGeometry.hpp): call it with every
+					// register in the thread context and leave the chunk for the region's exit address
+					if ((spu_native_geometry::enabled() || spu_native_geometry::region_capture::get().pc) && m_pos + 16 <= end) [[unlikely]]
+					{
+						u32 words[4];
+						for (u32 i = 0; i < 4; i++) words[i] = std::bit_cast<be_t<u32>>(func.data[(m_pos - start) / 4 + i]);
+
+						if (const auto kernel = spu_native_geometry::find(m_pos, words))
+						{
+							// The kernel may decline (returns 0): the SPU code of the region follows as usual
+							ensure_gpr_stores();
+							const auto handled = call(kernel->name, kernel->run, m_thread, m_lsptr);
+							const auto native_done = llvm::BasicBlock::Create(m_context, "", m_function);
+							const auto native_declined = llvm::BasicBlock::Create(m_context, "", m_function);
+							m_ir->CreateCondBr(m_ir->CreateICmpNE(handled, m_ir->getInt32(0)), native_done, native_declined, m_md_likely);
+							m_ir->SetInsertPoint(native_done);
+							if (kernel->exit)
+							{
+								update_pc(kernel->exit);
+								tail_chunk(nullptr);
+							}
+							else
+							{
+								tail_chunk(m_dispatch);
+							}
+							m_ir->SetInsertPoint(native_declined);
+						}
 					}
 
 					// Execute recompiler function (TODO)
@@ -6142,7 +6174,9 @@ public:
 					break;
 				}
 
-				bool must_use_cpp_functions = !!g_cfg.core.spu_accurate_dma;
+				// The transfer diagnostics (SPUThread.cpp) see only transfers that go through the C++ functions
+				static const bool transfer_diagnostics = std::getenv("RPCS3_SPU_JOB_CAPTURE") || std::getenv("RPCS3_SPU_XFER_TRACE");
+				bool must_use_cpp_functions = !!g_cfg.core.spu_accurate_dma || transfer_diagnostics;
 
 				if (u64 cmdh = ci->getZExtValue() & ~(MFC_BARRIER_MASK | MFC_FENCE_MASK | MFC_RESULT_MASK); g_cfg.core.rsx_fifo_accuracy || g_cfg.video.strict_rendering_mode || /*!g_use_rtm*/ true)
 				{

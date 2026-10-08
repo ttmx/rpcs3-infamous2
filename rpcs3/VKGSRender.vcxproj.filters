@@ -19,6 +19,7 @@
     <ClCompile Include="Emu\RSX\VK\VKPresent.cpp" />
     <ClCompile Include="Emu\RSX\VK\VKNativeLighting.cpp" />
     <ClCompile Include="Emu\RSX\VK\VKNativeSSAO.cpp" />
+    <ClCompile Include="Emu\RSX\VK\VKNativeAA.cpp" />
     <ClCompile Include="Emu\RSX\VK\VKProgramPipeline.cpp" />
     <ClCompile Include="Emu\RSX\VK\VKQueryPool.cpp" />
     <ClCompile Include="Emu\RSX\VK\VKRenderPass.cpp" />
@@ -113,6 +114,7 @@
     <ClInclude Include="Emu\RSX\VK\VKTextureCache.h" />
     <ClInclude Include="Emu\RSX\VK\VKNativeLighting.h" />
     <ClInclude Include="Emu\RSX\VK\VKNativeSSAO.h" />
+    <ClInclude Include="Emu\RSX\VK\VKNativeAA.h" />
     <ClInclude Include="Emu\RSX\VK\VKVertexProgram.h" />
     <ClInclude Include="Emu\RSX\VK\VulkanAPI.h" />
     <ClInclude Include="Emu\RSX\VK\VKCommandStream.h" />

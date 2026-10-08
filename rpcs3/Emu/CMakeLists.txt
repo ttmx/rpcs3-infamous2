@@ -656,6 +656,7 @@ if(TARGET 3rdparty_vulkan)
         RSX/VK/VKHelpers.cpp
         RSX/VK/VKMemAlloc.cpp
         RSX/VK/VKNativeSSAO.cpp
+        RSX/VK/VKNativeAA.cpp
         RSX/VK/VKNativeLighting.cpp
         RSX/VK/VKOverlays.cpp
         RSX/VK/VKPipelineCompiler.cpp

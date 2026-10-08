@@ -1,6 +1,7 @@
 #include "stdafx.h"
 #include "Emu/RSX/VK/VKGSRenderTypes.hpp"
 #include "VKNativeSSAO.h"
+#include "VKNativeAA.h"
 #include "VKNativeLighting.h"
 #include "VKGpuPassProfile.hpp"
 #include "Emu/roundtrip_survey.h"
@@ -1832,6 +1833,32 @@ namespace vk
 
 	bool texture_cache::blit(const rsx::blit_src_info& src, const rsx::blit_dst_info& dst, bool interpolate, vk::surface_cache& m_rtts, vk::command_buffer& cmd)
 	{
+		// God of War III with its anti-aliasing on the GPU (RPCS3_NATIVE_AA): the finished picture is blitted to main
+		// memory as a 1024 pixel wide piece and the remaining 256, for the SPU job. Hand the render target to the pass
+		// when the second piece comes and leave the copies out.
+		if (dst.pitch == 1280 * 4 && src.pitch == dst.pitch && src.width == dst.clip_width && src.height == dst.clip_height &&
+			dst.scale_x == 1.f && dst.scale_y == 1.f && vk::native_aa::mode()) [[unlikely]]
+		{
+			const bool first = vk::native_aa::is_piece(dst.rsx_address, dst.pitch, dst.clip_width, dst.clip_height, true);
+
+			if ((first || vk::native_aa::is_piece(dst.rsx_address, dst.pitch, dst.clip_width, dst.clip_height, false)) && vk::native_aa::blits_unneeded())
+			{
+				const u32 piece_offset = dst.rsx_address - vk::native_aa::frame_address();
+				const auto surface = m_rtts.get_surface_at(src.rsx_address - piece_offset);
+
+				if (surface && surface->get_surface_width<rsx::surface_metrics::pixels>() == 1280 && surface->get_surface_height<rsx::surface_metrics::pixels>() == 720)
+				{
+					if (!first)
+					{
+						surface->memory_barrier(cmd, rsx::surface_access::transfer_read);
+						vk::native_aa::on_frame(cmd, surface->get_surface(rsx::surface_access::transfer_read));
+					}
+
+					return true;
+				}
+			}
+		}
+
 		// inFamous 2 with both SPU jobs on the GPU (RPCS3_NATIVE_LIGHTING bit 32): the two G-buffer images the game
 		// blits to main memory, a 1024 pixel wide piece and the remaining 256 each, are used by the GPU passes only.
 		// Hand the render target to the passes when the last piece comes and leave the copies out.

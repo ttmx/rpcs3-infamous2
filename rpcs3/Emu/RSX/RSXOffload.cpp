@@ -1,5 +1,7 @@
 #include "VK/VKLiveCtl.hpp"
 #include "stdafx.h"
+#include "Emu/RSX/VK/VKReadbackCopy.hpp"
+#include "util/sysinfo.hpp"
 
 #include "Emu/Memory/vm.h"
 #include "Common/BufferUtils.h"
@@ -22,6 +24,17 @@ namespace rsx
 		static const bool value = []
 		{
 			const char* option = std::getenv("RPCS3_RSX_COPY_OFFLOAD");
+			return option && option[0] == '1' && !option[1];
+		}();
+		return value;
+	}
+
+	// RPCS3_RSX_STREAM_VERTEX_COPY=1; live control 3 switches it for comparisons (bit 8 = on, bit 16 = off)
+	static bool stream_copy_enabled()
+	{
+		static const bool value = []
+		{
+			const char* option = std::getenv("RPCS3_RSX_STREAM_VERTEX_COPY");
 			return option && option[0] == '1' && !option[1];
 		}();
 		return value;
@@ -141,6 +154,14 @@ namespace rsx
 			{
 				vk::live_ctl::prefetch_range(src, length, 0x40000);
 			}
+			// Vertex data goes to its upload buffer with non-temporal stores: the render thread never reads it back,
+			// and the lines stay out of a cache it shares with the SPU threads
+			if (const u64 ctl = vk::live_ctl::get(3); length >= (vk::live_ctl::get(17) ? vk::live_ctl::get(17) : 1024) && (ctl & 8 || (stream_copy_enabled() && !(ctl & 16))) && utils::has_avx512())
+			{
+				vk::readback_copy::stream(dst, src, length);
+				return;
+			}
+
 			std::memcpy(dst, src, length);
 		}
 		else

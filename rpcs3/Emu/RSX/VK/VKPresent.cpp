@@ -320,6 +320,13 @@ void VKGSRender::advance_queued_frames()
 
 	m_geometry_cache.sequence.end_frame();
 
+	if (vk::geometry_cache::suspended && static_cast<u32>(vk::get_current_frame_id()) - vk::geometry_cache::resume_frame < 0x80000000u)
+	{
+		vk::geometry_cache::suspended = false;
+		m_geometry_cache.stats = {};
+		m_geometry_cache.report_frame = static_cast<u32>(vk::get_current_frame_id());
+	}
+
 	if (vk::geometry_cache::mode())
 	{
 		// Periodic report (per-frame averages over the interval)
@@ -339,6 +346,15 @@ void VKGSRender::advance_queued_frames()
 				st.bytes_reused / frames / 1048576., watch.scans / frames, watch.scan_ns / frames / 1000., watch.written_pages / frames,
 				watch.watched_chunks, cache.vertex_heap.used >> 20, cache.index_heap.used >> 20, static_cast<u32>(st.heap_resets), static_cast<u32>(watch.lost_chunks), static_cast<u32>(st.dynamic_blocks),
 				static_cast<u32>(st.verify_checks), static_cast<u32>(st.verify_mismatches));
+
+			// Under a twentieth of the requests answered: not worth its lookups (mode 2 checks contents and stays on)
+			if (const u64 requests = st.vertex_requests + st.index_requests; vk::geometry_cache::mode() == 1 && requests > 600 * 50 &&
+				(st.vertex_static_hits + st.index_static_hits) * 20 < requests)
+			{
+				vk::geometry_cache::suspended = true;
+				vk::geometry_cache::resume_frame = frame + 6000;
+				rsx_log.notice("Geometry cache: suspended for 6000 frames, %.1f%% of the requests were static", (st.vertex_static_hits + st.index_static_hits) * 100. / requests);
+			}
 
 			cache.stats = {};
 			watch.scans = watch.scan_ns = watch.written_pages = watch.lost_chunks = 0;
@@ -369,7 +385,7 @@ void VKGSRender::queue_swap_request()
 			if (FILE* f = std::fopen(ctl, "r"))
 			{
 				unsigned long long value = 0;
-				for (u32 i = 0; i < 16 && std::fscanf(f, "%llu", &value) == 1; i++)
+				for (u32 i = 0; i < std::size(vk::live_ctl::values) && std::fscanf(f, "%llu", &value) == 1; i++)
 				{
 					if (vk::live_ctl::values[i].exchange(value) != value)
 					{

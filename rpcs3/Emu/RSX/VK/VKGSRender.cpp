@@ -10,6 +10,7 @@
 #include "VKCommonPipelineLayout.h"
 #include "VKCompute.h"
 #include "VKNativeSSAO.h"
+#include "VKNativeAA.h"
 #include "VKNativeLighting.h"
 #include "VKGSRender.h"
 #include "Emu/infamous_titles.h"
@@ -459,13 +460,6 @@ VKGSRender::VKGSRender(utils::serial* ar) noexcept : GSRender(ar)
 	if (const char* mode = std::getenv("RPCS3_VK_FAST_DRAWS"))
 	{
 		vk::live_ctl::values[9] = std::strtoull(mode, nullptr, 10);
-
-		if (vk::live_ctl::values[9] == 6 && Emu.GetTitleID() == "BCES00052")
-		{
-			// Ratchet & Clank: Tools of Destruction chains its draws with jumps and calls (570 runs per frame end at
-			// one): the default scope becomes the wide one, +2%. 0 and 5 still select no fast draws and the narrow scope.
-			vk::live_ctl::values[9] = 2;
-		}
 	}
 	if (const char* mode = std::getenv("RPCS3_VK_MATERIAL_BINDINGS"))
 	{
@@ -936,6 +930,7 @@ VKGSRender::~VKGSRender()
 	}
 
 	vk::native_ssao::destroy();
+	vk::native_aa::destroy();
 	vk::native_lighting::destroy();
 
 	// GC cleanup

@@ -712,6 +712,7 @@ public:
 	u64 rtime = 0;
 	alignas(64) std::byte rdata[128]{};
 	u32 raddr = 0;
+	u32 putllc_fail_streak = 0; // Failed conditional stores in a row (RPCS3_SPU_PUTLLC_BACKOFF)
 	const decltype(rdata)* resrv_mem{};
 
 	// Range Lock pointer

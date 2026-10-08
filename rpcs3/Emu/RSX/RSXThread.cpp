@@ -2857,6 +2857,14 @@ namespace rsx
 		cond_render_ctrl.hw_cond_active = false;
 	}
 
+	void thread::deliver_reports_while_waiting()
+	{
+		if (g_cfg.video.relaxed_zcull_sync && zcull_ctrl && zcull_ctrl->has_pending())
+		{
+			zcull_ctrl->update(this, 0u, true);
+		}
+	}
+
 	void thread::sync()
 	{
 		m_eng_interrupt_mask.clear(rsx::pipe_flush_interrupt);

@@ -42,6 +42,12 @@ Stock with Strict Rendering off on the left, this build uncapped on the right (F
   commands this game puts between draws, and front face and cull mode became dynamic state (65 to 67 FPS now,
   60 at the cap). A one-value game patch lifts the game's own 81 FPS ceiling. See [`ratchet/`](ratchet/README.md).
 
+- **God of War III** (BCES00510) does its anti-aliasing and all of its geometry on the SPUs: one job per draw skins,
+  lights, culls and packs the vertices, about 124,000 jobs a second. The anti-aliasing became a GPU pass, line stores
+  no longer stop every PPU thread, the hot loops of the geometry job run as host code (ten kernels, developed against
+  an offline replay of captured jobs), and vertex uploads use non-temporal stores. The first fight went from 29 to 55
+  to 59 FPS at 30 W; the menu and cutscenes hold 60. See [`gow3/`](gow3/README.md).
+
 All three were tested for an evening each, in their first minutes (and one open-city district of inFamous).
 
 These are software changes. The two host tuning steps that were also tried (a GPU clock floor and a power profile)

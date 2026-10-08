@@ -1,4 +1,5 @@
 #include "Emu/RSX/VK/VKLiveCtl.hpp"
+#include "Emu/RSX/VK/VKNativeAA.h"
 #include "stdafx.h"
 #include "Utilities/JIT.h"
 #include "Utilities/date_time.h"
@@ -2392,6 +2393,137 @@ static void spu_light_capture(spu_thread* spu, bool kernel_load, u32 eal, u32 ls
 	}
 }
 
+// Diagnostic (RPCS3_SPU_XFER_TRACE=file): every transfer of every SPU thread while the file "<file>.go" exists:
+// time in microseconds, thread, program (hash of local store 0x4040..0x4140), pc, G or P, address, local store address,
+// size, and for a GET of at most 128 bytes the data. List transfers are written element by element (L lines).
+static void spu_xfer_trace(spu_thread* spu, const u8* ls, bool is_get, u32 eal, u32 lsa, u32 size, char kind)
+{
+	static const char* const path = std::getenv("RPCS3_SPU_XFER_TRACE");
+	if (!path) [[likely]] return;
+	static std::mutex s_mutex;
+	static FILE* s_file = nullptr;
+	static u64 s_calls = 0;
+	static bool s_on = false;
+	std::lock_guard lock(s_mutex);
+	if (s_calls++ % 512 == 0)
+	{
+		s_on = fs::is_file(std::string(path) + ".go");
+		if (s_on && !s_file) s_file = std::fopen(path, "w");
+		if (!s_on && s_file) std::fflush(s_file);
+	}
+	if (!s_on || !s_file) return;
+	u32 hash = 0x811c9dc5;
+	for (u32 i = 0x4040; i < 0x4140; i++) hash = (hash ^ ls[i]) * 0x01000193;
+	std::fprintf(s_file, "%llu %u %08x %05x %c%c %08x %05x %x", static_cast<unsigned long long>(get_system_time()), spu ? spu->lv2_id >> 24 : 0u, hash, spu ? spu->pc : 0u, kind, is_get ? 'G' : 'P', eal, lsa, size);
+	if (is_get && size <= 128 && kind == 'D' && vm::check_addr(eal, vm::page_readable, size))
+	{
+		std::fputc(' ', s_file);
+		for (u32 i = 0; i < size; i++) std::fprintf(s_file, "%02x", vm::_ref<u8>(eal + i));
+	}
+	std::fputc('\n', s_file);
+}
+
+// Diagnostic (RPCS3_SPU_JOB_CAPTURE=<directory>, RPCS3_SPU_JOB_CAPTURE_HASH=<program hash, hex>): while
+// "<directory>/go" exists, one SPU thread's jobs of that program are written out for offline study: at the job
+// manager's input list GET (pc 0x203c) the registers, the local store and the data of every list element
+// (job-NNNN.bin), and every PUT of that thread from then to its next capture (appended to the same file).
+// Records: "SPUK" pc eal lsa size srr0 interrupts-enabled, 128 registers, local store, then per element "ELEM" ea size data;
+// "PUT " and "GET " pc ea lsa size data; "ATOM" for the atomic commands.
+namespace spu_job_capture
+{
+	static const char* const s_dir = std::getenv("RPCS3_SPU_JOB_CAPTURE");
+	static std::mutex s_mutex;
+	static spu_thread* s_owner = nullptr;
+	static FILE* s_file = nullptr;
+	static u32 s_count = 0;
+
+	static void put32(u32 v) { std::fwrite(&v, 4, 1, s_file); }
+
+	static void on_list(spu_thread& spu, const spu_mfc_cmd& args, bool is_get)
+	{
+		static const u32 want = [] { const char* v = std::getenv("RPCS3_SPU_JOB_CAPTURE_HASH"); return v ? static_cast<u32>(std::strtoul(v, nullptr, 16)) : 0xc5fcd65cu; }();
+		std::lock_guard lock(s_mutex);
+
+		if (is_get && spu.pc == 0x203c && (!s_owner || s_owner == &spu))
+		{
+			if (s_file) { std::fclose(s_file); s_file = nullptr; }
+			u32 hash = 0x811c9dc5;
+			for (u32 i = 0x4040; i < 0x4140; i++) hash = (hash ^ spu.ls[i]) * 0x01000193;
+			// RPCS3_SPU_JOB_CAPTURE_EVERY=<n>: only every n-th job, to cover more of a scene with the same number of files
+			static const u32 every = [] { const char* v = std::getenv("RPCS3_SPU_JOB_CAPTURE_EVERY"); return v ? std::max<u32>(1, std::atoi(v)) : 1u; }();
+			static u32 s_seen = 0;
+			if (hash != want || s_count >= 400 || !fs::is_file(std::string(s_dir) + "/go") || s_seen++ % every) return;
+			s_owner = &spu;
+			s_file = std::fopen(fmt::format("%s/job-%04u.bin", s_dir, s_count++).c_str(), "wb");
+			if (!s_file) return;
+			std::fwrite("SPUK", 4, 1, s_file); put32(spu.pc); put32(args.eal); put32(args.lsa); put32(args.size); put32(spu.srr0); put32(spu.interrupts_enabled ? 1 : 0);
+			std::fwrite(spu.gpr.data(), 16, 128, s_file);
+			std::fwrite(spu.ls, 1, SPU_LS_SIZE, s_file);
+		}
+
+		if (!s_file || s_owner != &spu) return;
+
+		u32 lsa = args.lsa;
+		for (u32 i = 0; i < args.size; i += 8)
+		{
+			const u8* e = spu.ls + ((args.eal + i) & 0x3fff8);
+			const u32 size = (u32{e[2]} << 8) | e[3];
+			const u32 ea = (u32{e[4]} << 24) | (u32{e[5]} << 16) | (u32{e[6]} << 8) | e[7];
+			const u32 base = lsa;
+			lsa = base | (ea & 0xf);
+			if (is_get)
+			{
+				std::fwrite("ELEM", 4, 1, s_file); put32(ea); put32(size);
+				if (size && vm::check_addr(ea, vm::page_readable, size)) std::fwrite(vm::_ptr<const u8>(ea), 1, size, s_file); else for (u32 k = 0; k < size; k++) std::fputc(0, s_file);
+			}
+			else
+			{
+				std::fwrite("PUT ", 4, 1, s_file); put32(spu.pc); put32(ea); put32(lsa); put32(size);
+				std::fwrite(spu.ls + (lsa & 0x3ffff), 1, size, s_file);
+			}
+			lsa = base + utils::align<u32>(size, 16);
+			if (e[0] & 0x80) break;
+		}
+	}
+
+	static void on_transfer(spu_thread* spu, const spu_mfc_cmd& args, const u8* ls, bool is_get)
+	{
+		std::lock_guard lock(s_mutex);
+		if (!s_file || s_owner != spu) return;
+		std::fwrite(is_get ? "GET " : "PUT ", 4, 1, s_file); put32(spu->pc); put32(args.eal); put32(args.lsa); put32(args.size);
+		if (is_get)
+		{
+			if (vm::check_addr(args.eal, vm::page_readable, args.size)) std::fwrite(vm::_ptr<const u8>(args.eal), 1, args.size, s_file);
+			else for (u32 k = 0; k < args.size; k++) std::fputc(0, s_file);
+			return;
+		}
+
+		std::fwrite(ls + (args.lsa & 0x3ffff), 1, args.size, s_file);
+
+		if (static const bool with_ls = !!std::getenv("RPCS3_SPU_JOB_CAPTURE_LS"); with_ls)
+		{
+			// The whole local store and the registers at every PUT, to find where an offline replay goes wrong
+			std::fwrite("LSD ", 4, 1, s_file); std::fwrite(spu->gpr.data(), 16, 128, s_file); std::fwrite(ls, 1, SPU_LS_SIZE, s_file);
+		}
+	}
+
+	// After GETLLAR, PUTLLC or PUTLLUC: "ATOM" pc cmd eal lsa status, then the 128 bytes at lsa
+	struct atomic_scope
+	{
+		spu_thread& spu;
+		const u32 cmd, eal, lsa;
+
+		~atomic_scope()
+		{
+			if (!s_dir || (cmd != MFC_GETLLAR_CMD && cmd != MFC_PUTLLC_CMD && cmd != MFC_PUTLLUC_CMD)) [[likely]] return;
+			std::lock_guard lock(s_mutex);
+			if (!s_file || s_owner != &spu) return;
+			std::fwrite("ATOM", 4, 1, s_file); put32(spu.pc); put32(cmd); put32(eal); put32(lsa); put32(spu.ch_atomic_stat.get_value());
+			std::fwrite(spu.ls + (lsa & 0x3ff80), 1, 128, s_file);
+		}
+	};
+}
+
 static bool native_ssao_skips_spu_work();
 
 void spu_thread::do_dma_transfer(spu_thread* _this, const spu_mfc_cmd& args, u8* ls)
@@ -2401,6 +2533,13 @@ void spu_thread::do_dma_transfer(spu_thread* _this, const spu_mfc_cmd& args, u8*
 
 	const bool is_get = (args.cmd & ~(MFC_BARRIER_MASK | MFC_FENCE_MASK | MFC_START_MASK)) == MFC_GET_CMD;
 
+	spu_xfer_trace(_this, ls, is_get, args.eal, args.lsa, args.size, 'D');
+
+	if (spu_job_capture::s_dir && _this) [[unlikely]]
+	{
+		spu_job_capture::on_transfer(_this, args, ls, is_get);
+	}
+
 	// inFamous 2 ambient occlusion is computed on the GPU (RPCS3_NATIVE_SSAO bit 2): each of the job's five
 	// kernels is loaded as usual, then made to return at its entry point so the SPU does no pixel work.
 	if (native_ssao_skips_spu_work() && is_get && args.lsa == 0x6c00 && args.size >= 784 && infamous_native::current().is_kernel(args.eal)) [[unlikely]]
@@ -2409,6 +2548,109 @@ void spu_thread::do_dma_transfer(spu_thread* _this, const spu_mfc_cmd& args, u8*
 		const be_t<u32> return_to_caller = 0x35000000; // BI $lr
 		std::memcpy(ls + args.lsa + 0x30, &return_to_caller, 4);
 		return;
+	}
+
+	// God of War III anti-aliasing on the GPU (RPCS3_NATIVE_AA bit 2). The SPU side is a SPURS task on five threads
+	// that lives as long as the game: every frame it is resumed inside its main loop (so nothing at its entry point
+	// runs again) and calls two functions that read the picture and write it back. Its program is loaded again at
+	// every resume, in two pieces; both functions are made to return at once there, so the task still takes part in
+	// the frame's hand-shakes but neither reads nor writes the picture. The program is recognised by its first 16
+	// bytes and by the words that are replaced.
+	if (is_get && (args.lsa == 0x3000 || args.lsa == 0x7000) && (vk::native_aa::mode() & 2)) [[unlikely]]
+	{
+		if (vk::native_aa::skip_task_work(ls, args.lsa, vm::_ptr<const u8>(args.eal), args.size))
+		{
+			return;
+		}
+	}
+
+	// The same for a program that is in the local store already: it shows itself by a transfer to or from the picture
+	if (const u32 frame = vk::native_aa::g_frame.load(std::memory_order_relaxed); frame && args.eal - frame < 1280 * 720 * 4 && (vk::native_aa::mode() & 2)) [[unlikely]]
+	{
+		vk::native_aa::skip_task_work(ls, 0, nullptr, 0);
+	}
+
+	// Diagnostic (RPCS3_SPU_SAMPLER=file): where the SPU threads are, sampled 2,000 times a second: the program in the
+	// local store (hash of 0x4040..0x4140, as below), the pc last stored, and whether the thread waits. Written to the
+	// file every two seconds; the PPU threads (id, address, waits) go to <file>.ppu.
+	if (static const char* const sampler_path = std::getenv("RPCS3_SPU_SAMPLER"); sampler_path) [[unlikely]]
+	{
+		static std::once_flag s_once;
+		std::call_once(s_once, []
+		{
+			std::thread([]
+			{
+				std::map<std::tuple<u32, u32, u32>, u64> counts;
+				std::map<std::tuple<u32, u32, u32>, u64> ppu_counts;
+				std::map<std::array<u32, 7>, u64> stack_counts;
+				for (u64 n = 1;; n++)
+				{
+					std::this_thread::sleep_for(std::chrono::microseconds(500));
+					idm::select<named_thread<spu_thread>>([&](u32, spu_thread& spu)
+					{
+						const u8* ls = spu.ls;
+						if (!ls) return;
+						u32 hash = 0x811c9dc5;
+						for (u32 i = 0x4040; i < 0x4140; i++) hash = (hash ^ ls[i]) * 0x01000193;
+						const bool waits = !!(spu.state.load() & (cpu_flag::wait + cpu_flag::suspend + cpu_flag::stop));
+						counts[{hash, spu.pc & 0x3fffc, waits ? 1 : 0}]++;
+					});
+					idm::select<named_thread<ppu_thread>>([&](u32 id, ppu_thread& ppu)
+					{
+						const bool waits = !!(ppu.state.load() & (cpu_flag::wait + cpu_flag::suspend + cpu_flag::stop));
+						ppu_counts[{id, ppu.cia, waits ? 1 : 0}]++;
+						if (id == 0x1000000 && waits)
+						{
+							// Who the main thread waits for: the return addresses up its stack (read while it sleeps)
+							std::array<u32, 7> chain{ppu.cia, static_cast<u32>(ppu.lr)};
+							u32 sp = static_cast<u32>(ppu.gpr[1]);
+							for (u32 i = 2; i < chain.size() && sp && vm::check_addr(sp, vm::page_readable, 24); i++)
+							{
+								sp = vm::_ref<be_t<u32>>(sp + 4);
+								if (!sp || !vm::check_addr(sp, vm::page_readable, 24)) break;
+								chain[i] = vm::_ref<be_t<u32>>(sp + 20);
+							}
+							stack_counts[chain]++;
+						}
+					});
+					if (n % 4000 == 0)
+					{
+						if (FILE* f = std::fopen((std::string(sampler_path) + ".ppu").c_str(), "w"))
+						{
+							for (const auto& [key, count] : ppu_counts) std::fprintf(f, "%08x %08x %u %llu\n", std::get<0>(key), std::get<1>(key), std::get<2>(key), static_cast<unsigned long long>(count));
+							std::fclose(f);
+						}
+						if (FILE* f = std::fopen((std::string(sampler_path) + ".stack").c_str(), "w"))
+						{
+							for (const auto& [key, count] : stack_counts) std::fprintf(f, "%llu %x %x %x %x %x %x %x\n", static_cast<unsigned long long>(count), key[0], key[1], key[2], key[3], key[4], key[5], key[6]);
+							std::fclose(f);
+						}
+						if (FILE* f = std::fopen(sampler_path, "w"))
+						{
+							for (const auto& [key, count] : counts) std::fprintf(f, "%08x %05x %u %llu\n", std::get<0>(key), std::get<1>(key), std::get<2>(key), static_cast<unsigned long long>(count));
+							std::fclose(f);
+						}
+					}
+				}
+			}).detach();
+		});
+	}
+
+	// Diagnostic (RPCS3_SPU_JOB_LOAD_TRACE=1): every distinct program image that a job loader copies to the usual job
+	// address, with the hash the round trip survey prints for it
+	if (static const bool trace_loads = std::getenv("RPCS3_SPU_JOB_LOAD_TRACE") != nullptr; trace_loads && is_get && args.lsa <= 0x4040 && args.lsa + args.size >= 0x4140) [[unlikely]]
+	{
+		static std::mutex s_mutex;
+		static std::set<u64> s_seen;
+		const u8* image = vm::_ptr<const u8>(args.eal) - args.lsa;
+		u32 hash = 0x811c9dc5;
+		for (u32 i = 0x4040; i < 0x4140; i++) hash = (hash ^ image[i]) * 0x01000193;
+		std::lock_guard lock(s_mutex);
+		if (s_seen.emplace(u64{hash} << 32 | args.eal).second)
+		{
+			spu_log.notice("Job load: program %08x from 0x%x to 0x%x, 0x%x bytes, first words %08x %08x %08x %08x, pc 0x%x", hash, args.eal, args.lsa, args.size,
+				+vm::_ref<be_t<u32>>(args.eal), +vm::_ref<be_t<u32>>(args.eal + 4), +vm::_ref<be_t<u32>>(args.eal + 8), +vm::_ref<be_t<u32>>(args.eal + 12), _this ? _this->pc : 0);
+		}
 	}
 
 	// Capture for offline study (RPCS3_SPU_SSAO_STAGE_CAPTURE_DIR): at the first kernel load of each SSAO stage,
@@ -3987,6 +4229,45 @@ NEVER_INLINE static bool do_list_transfer_diagnostic(spu_thread& self, spu_mfc_c
 
 bool spu_thread::do_list_transfer(spu_mfc_cmd& args)
 {
+	// Diagnostic (RPCS3_SPU_JOB_COUNT=1): job manager input fetches (list GET at pc 0x203c) per second, by the program
+	// in the local store at that moment (the running job's; the next job is usually the same program)
+	if (static const bool job_count = !!std::getenv("RPCS3_SPU_JOB_COUNT"); job_count && pc == 0x203c) [[unlikely]]
+	{
+		static std::mutex s_mutex;
+		static std::map<u32, u64> s_counts;
+		static u64 s_last = get_system_time();
+		u32 hash = 0x811c9dc5;
+		for (u32 i = 0x4040; i < 0x4140; i++) hash = (hash ^ ls[i]) * 0x01000193;
+		std::lock_guard lock(s_mutex);
+		s_counts[hash]++;
+		if (const u64 now = get_system_time(); now - s_last >= 2'000'000)
+		{
+			std::string text;
+			for (auto& [h, n] : s_counts) { fmt::append(text, " %08x:%.0f", h, n * 1e6 / (now - s_last)); n = 0; }
+			spu_log.notice("Jobs fetched per second:%s", text);
+			s_last = now;
+		}
+	}
+
+	if (spu_job_capture::s_dir) [[unlikely]]
+	{
+		spu_job_capture::on_list(*this, args, (args.cmd & ~(MFC_BARRIER_MASK | MFC_FENCE_MASK | MFC_START_MASK)) == MFC_GETL_CMD);
+	}
+
+	if (static const bool xfer_trace = !!std::getenv("RPCS3_SPU_XFER_TRACE"); xfer_trace) [[unlikely]]
+	{
+		const bool list_get = (args.cmd & ~(MFC_BARRIER_MASK | MFC_FENCE_MASK | MFC_START_MASK)) == MFC_GETL_CMD;
+		u32 lsa = args.lsa;
+		for (u32 i = 0; i < args.size; i += 8)
+		{
+			const u8* e = this->ls + ((args.eal + i) & 0x3fff8);
+			const u32 size = (u32{e[2]} << 8) | e[3];
+			spu_xfer_trace(this, this->ls, list_get, (u32{e[4]} << 24) | (u32{e[5]} << 16) | (u32{e[6]} << 8) | e[7], lsa, size, 'L');
+			lsa += utils::align<u32>(size, 16);
+			if (e[0] & 0x80) break;
+		}
+	}
+
 	if (native_lighting_mode()) [[unlikely]]
 	{
 		const u8* first = this->ls + (args.eal & 0x3fff8);
@@ -4691,6 +4972,41 @@ bool spu_thread::do_list_transfer(spu_mfc_cmd& args)
 	return true;
 }
 
+static bool putllc_piecewise()
+{
+	static const bool on = []
+	{
+		const char* v = std::getenv("RPCS3_SPU_PUTLLC_PIECEWISE");
+		return v && v[0] != '0';
+	}();
+
+	// Live control 15 for comparisons inside one session: 1 = off, 2 = on
+	if (const u64 live = vk::live_ctl::get(15)) [[unlikely]]
+	{
+		return live == 2;
+	}
+
+	return on;
+}
+
+// Diagnostic (RPCS3_SPU_PUTLLC_STATS=1): how conditional and unconditional line stores that change data were done.
+// 0 one piece, 1 several pieces, 2 line had changed, 3 taken back, 4 full lock, 5 unconditional store with the full lock
+static void putllc_stats(u32 kind)
+{
+	static const bool on = !!std::getenv("RPCS3_SPU_PUTLLC_STATS");
+	if (!on) [[likely]] return;
+
+	static std::atomic<u64> s_counts[6]{};
+	static std::atomic<u64> s_total{0};
+	s_counts[kind]++;
+
+	if (++s_total % 200000 == 0)
+	{
+		spu_log.notice("Line stores: one piece %u, several pieces %u, line had changed %u, taken back %u, full lock %u, unconditional with full lock %u",
+			s_counts[0].load(), s_counts[1].load(), s_counts[2].load(), s_counts[3].load(), s_counts[4].load(), s_counts[5].load());
+	}
+}
+
 bool spu_thread::do_putllc(const spu_mfc_cmd& args)
 {
 	if (spu_buffer_access_diag::s_enabled) [[unlikely]]
@@ -4799,6 +5115,69 @@ bool spu_thread::do_putllc(const spu_mfc_cmd& args)
 				return ok;
 			}
 
+			// Accurate without the full lock (RPCS3_SPU_PUTLLC_PIECEWISE=1). The full lock below stops every PPU thread
+			// and waits for each of them; a game whose SPURS kernels hand out tens of thousands of jobs a second
+			// takes it that often. This thread holds the line's reservation lock, so every writer that takes part in
+			// reservations is excluded already. What is left are plain stores: against those, the line is compared
+			// once and each 16-byte piece that changes is then written with a compare-exchange. A plain store that
+			// lands in another piece in between is as if it came after this one; one that lands in a piece being
+			// written makes the exchange fail, and whatever was written before it is taken back under the full lock.
+			if (putllc_piecewise())
+			{
+				vm::range_lock<128>(range_lock, addr, 128);
+
+				bool ok = cmp_rdata(rdata, super_data);
+				u32 written = 0;
+
+				for (usz i = 0; ok && i < 8; i++)
+				{
+					const u128 desired = *cast_as_const(to_write, i);
+					u128 expected = *cast_as_const(rdata, i);
+
+					if (desired == expected)
+					{
+						continue;
+					}
+
+					if (atomic_storage<u128>::compare_exchange(*cast_as(super_data, i), expected, desired))
+					{
+						written |= 1u << i;
+					}
+					else
+					{
+						ok = false;
+					}
+				}
+
+				range_lock->release(0);
+
+				if (!ok && written) [[unlikely]]
+				{
+					vm::writer_lock lock(addr, range_lock);
+
+					for (usz i = 0; i < 8; i++)
+					{
+						if (written & (1u << i))
+						{
+							// Bytes that still hold what was written go back; bytes stored by someone else since stay
+							u8* cur = reinterpret_cast<u8*>(cast_as(super_data, i));
+							const u8* was = reinterpret_cast<const u8*>(cast_as_const(rdata, i));
+							const u8* put = reinterpret_cast<const u8*>(cast_as_const(to_write, i));
+
+							for (usz b = 0; b < 16; b++)
+							{
+								if (cur[b] == put[b]) cur[b] = was[b];
+							}
+						}
+					}
+				}
+
+				putllc_stats(ok ? (std::popcount(written) > 1 ? 1 : 0) : (written ? 3 : 2));
+				return ok;
+			}
+
+			putllc_stats(4);
+
 			// Full lock (heavyweight)
 			// TODO: vm::check_addr
 			vm::writer_lock lock(addr, range_lock);
@@ -4850,6 +5229,7 @@ bool spu_thread::do_putllc(const spu_mfc_cmd& args)
 		}
 
 		perf0.reset();
+		putllc_fail_streak = 0;
 		return true;
 	}
 	else
@@ -4877,6 +5257,18 @@ bool spu_thread::do_putllc(const spu_mfc_cmd& args)
 
 		raddr = 0;
 		perf1.reset();
+
+		// Back off after a failed conditional store (RPCS3_SPU_PUTLLC_BACKOFF=<cycles>, per failure in a row, 16 at most).
+		// Several SPURS kernels updating the same line otherwise keep invalidating each other: emulated, the window
+		// between GETLLAR and PUTLLC is much longer than on the console. God of War III has six of them on one line.
+		static const u64 backoff = [] { const char* v = std::getenv("RPCS3_SPU_PUTLLC_BACKOFF"); return v ? std::strtoull(v, nullptr, 10) : 0; }();
+
+		if (backoff)
+		{
+			putllc_fail_streak = std::min<u32>(putllc_fail_streak + 1, 16);
+			busy_wait(backoff * putllc_fail_streak);
+		}
+
 		return false;
 	}
 }
@@ -4987,6 +5379,15 @@ void do_cell_atomic_128_store(u32 addr, const void* to_write)
 		{
 			result = 0;
 		}
+		else if (putllc_piecewise())
+		{
+			// As in do_putllc: the line's reservation lock is held, which keeps every writer that takes part in
+			// reservations out, and a plain store or load on another thread sees each 16-byte piece either old or new
+			utils::trigger_write_page_fault(vm::base(addr));
+			mov_rdata(sdata, *static_cast<const spu_rdata_t*>(to_write));
+			vm::reservation_acquire(addr) += 32;
+			putllc_stats(0);
+		}
 		else
 		{
 			// Provoke page fault
@@ -5001,6 +5402,7 @@ void do_cell_atomic_128_store(u32 addr, const void* to_write)
 				cpu->state += cpu_flag::wait;
 			}
 
+			putllc_stats(5);
 			vm::writer_lock lock(addr, spu ? spu->range_lock : nullptr);
 			mov_rdata(sdata, *static_cast<const spu_rdata_t*>(to_write));
 			vm::reservation_acquire(addr) += 32;
@@ -5548,6 +5950,8 @@ u32 evaluate_spin_optimization(std::span<u8> stats, u64 evaluate_time, const cfg
 
 bool spu_thread::process_mfc_cmd()
 {
+	const spu_job_capture::atomic_scope capture_scope{*this, static_cast<u32>(ch_mfc_cmd.cmd), ch_mfc_cmd.eal, ch_mfc_cmd.lsa};
+
 	// Stall infinitely if MFC queue is full
 	while (mfc_size >= 16) [[unlikely]]
 	{
