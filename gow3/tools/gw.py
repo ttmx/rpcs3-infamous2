@@ -36,7 +36,7 @@ DEFAULT_SWITCHES = ['RPCS3_EXPERIMENT_SPU_INSTCOMBINE', 'RPCS3_SPU_NATIVE_RWV', 
                     'RPCS3_VK_READBACK_COMPRESSED_HITS', 'RPCS3_VK_READBACK_STREAM_COPY', 'RPCS3_VK_READBACK_OOP', 'RPCS3_VK_SEMAPHORE_PIPELINE_PREFETCH',
                     'RPCS3_VK_PERIODIC_SUBMIT_US', 'RPCS3_VK_STREAM_DMA_LOAD_MIN', 'RPCS3_EXPERIMENT_BLIT_COMPLEMENT', 'RPCS3_FIFO_INLINE_CACHE',
                     'RPCS3_EXPERIMENT_LAST_IMAGE_VIEW', 'RPCS3_NATIVE_SSAO', 'RPCS3_NATIVE_LIGHTING', 'RPCS3_VK_GEOMETRY_CACHE', 'RPCS3_VK_FAST_DRAWS',
-                    'RPCS3_VK_PIPELINE_REUSE', 'RPCS3_VK_DESCRIPTOR_REUSE', 'RPCS3_SPU_XFLOAT_FAST', 'RPCS3_VK_DYNAMIC_FACE', 'RPCS3_NATIVE_AA', 'RPCS3_SPU_PUTLLC_BACKOFF', 'RPCS3_SPU_PUTLLC_PIECEWISE', 'RPCS3_SPU_NATIVE_GEOMETRY', 'RPCS3_RSX_STREAM_VERTEX_COPY']
+                    'RPCS3_VK_PIPELINE_REUSE', 'RPCS3_VK_DESCRIPTOR_REUSE', 'RPCS3_SPU_XFLOAT_FAST', 'RPCS3_VK_DYNAMIC_FACE', 'RPCS3_NATIVE_AA', 'RPCS3_SPU_PUTLLC_BACKOFF', 'RPCS3_SPU_PUTLLC_PIECEWISE', 'RPCS3_SPU_NATIVE_GEOMETRY', 'RPCS3_RSX_STREAM_VERTEX_COPY', 'RPCS3_RSX_COPY_WORKER', 'RPCS3_RSX_COPY_WORKER']
 
 
 def alive(rec):
@@ -213,7 +213,7 @@ def fps(seconds, label='', quiet=False):
 def ab(seconds, reps, arms):
     for rep in range(reps):
         for arm in arms:
-            CTL.write_text(arm + '\n'); time.sleep(3.5)
+            CTL.write_text(arm + '\n'); time.sleep(float(os.environ.get('AB_SETTLE', 3.5)))
             r = fps(seconds, 'ab ' + arm, quiet=True)
             while r['spu_cores'] < 3:
                 # Kratos died (the fight load is gone): restart from the checkpoint and measure this window again

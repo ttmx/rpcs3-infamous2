@@ -259,6 +259,30 @@ offload thread (21 FPS), `Relaxed ZCULL Sync` (no clear change, and it delivers 
 1 KB and more written with non-temporal stores (53.8 against 53.4), a reuse of ranges uploaded earlier in the frame
 (not built: at most the 15% that lie inside an earlier copy).
 
+**Where a frame of the fight goes now** (`tools/ownwork.sh`: the main PPU thread from the sampler, 24 seconds,
+four sessions at 30 W, 54 to 57 FPS): of 17.6 to 18.5 ms a frame the thread works 11.7 to 12.6 ms on its own (game
+code spread over 600 functions), spins 2.5 to 4.2 ms for jobs (`0x2eafb0`, and a loop on a busy flag at `0x22fb40`)
+and sleeps 1.9 to 3.3 ms waiting for the render thread. A steady 60 needs the two waits together under 4.5 ms; they
+are 5 to 7.
+
+More that was tried after that and not kept:
+
+- **A worker thread for the vertex copies** (one producer, a lock-free ring, a spinning worker, drained before
+  submits, label and reference writes): 53.0 FPS without against 51.3 with (43 windows of 2.5 s each), and with a
+  worker that goes to sleep after 300 idle spins 52.8 against 52.6 (44 and 43). Taking the copy off the render thread
+  buys nothing. Removed.
+- **Vertex data read by the GPU from guest memory** (no copy): not built. The worker result bounds what it can give
+  to the energy of the copy itself, about a tenth of one core, and the game reuses its vertex ring inside a frame,
+  so the host GPU would have to be drained at every reference write.
+- **`PPU Vector NaN Handling: false`**: the main thread's own work is 11.7 and 12.6 ms without it, 11.9 and 12.4 with.
+  No difference; left at the default.
+- **Performance power profile** (54 W, 79 C): 52.1 to 59.9 FPS, mean 57.7 over a minute, against 56.9 at 30 W. Power
+  is not what holds the slow stretches back any more.
+
+What would move it further is more of the same on both sides of the main thread's waits: the remaining SPU loops
+(bone unpacking, lighting set-up, culling; the two other large programs `72cc647b` and `9d227620`, 14% of SPU time
+each) and the render thread's per-draw cost. None of them is worth more than about 1 FPS alone.
+
 Measuring: Kratos dies after 20 to 60 seconds of holding block. `gw.py ab` now restarts from the checkpoint when the
 SPU load is gone and measures that window again; `gw.py revive` does the same before a profile. Pairs of windows in a
 fixed A B order can lock to the fight's 20 second cycle (one such run showed the streaming copy 5 FPS slower); use

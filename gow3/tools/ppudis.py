@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """ppudis.py <address hex> [bytes] | callers <address hex>: disassemble the game's PPU code at an address (the
 executable's segments, so stripped parts work too), or list the bl instructions that target an address."""
-import struct, subprocess, sys, tempfile, os
+import re, struct, subprocess, sys, tempfile, os
 ELF = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'spu', 'EBOOT.elf')
 d = open(ELF, 'rb').read()
 phoff, = struct.unpack_from('>Q', d, 0x20); phentsize, phnum = struct.unpack_from('>HH', d, 0x36)
@@ -24,7 +24,6 @@ if sys.argv[1] == 'callers':
                 if va + o + disp == target: print('%x' % (va + o))
 else:
     addr = int(sys.argv[1], 16); n = int(sys.argv[2], 0) if len(sys.argv) > 2 else 128
-    with tempfile.NamedTemporaryFile(suffix='.bin') as f:
-        f.write(read(addr, n)); f.flush()
-        out = subprocess.run(['llvm-objdump', '-D', '-b', 'binary', '--triple=powerpc64', '--adjust-vma=' + hex(addr), f.name], capture_output=True, text=True).stdout
-    print('\n'.join(out.splitlines()[6:]))
+    read(addr, n)
+    out = subprocess.run(['llvm-objdump', '-d', '--start-address=' + hex(addr), '--stop-address=' + hex(addr + n), ELF], capture_output=True, text=True).stdout
+    print('\n'.join(l for l in out.splitlines() if re.match(r'\s*[0-9a-f]+:', l)))

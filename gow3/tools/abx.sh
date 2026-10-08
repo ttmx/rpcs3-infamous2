@@ -3,7 +3,7 @@
 # A B B A B A A B, so that neither arm follows the fight's load cycle (about 20 s); prints mean, median and slow windows
 cd "$(dirname "$0")/.."
 secs=$1; rounds=$2; settle=$3; A=$4; B=$5
-tools/fight.sh go abx --defaults --cfg=test >/dev/null 2>&1
+tools/fight.sh go abx --defaults --cfg=test $ABX_ARGS >/dev/null 2>&1
 python3 tools/gw.py seq "wait:$settle"
 python3 tools/gw.py ab "$secs" "$rounds" "$A" "$B" "$B" "$A" "$B" "$A" "$A" "$B" > /tmp/abx.txt 2>&1
 python3 tools/gw.py stop >/dev/null; pgrep -x rpcs3 | xargs -r kill -9
