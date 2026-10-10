@@ -578,7 +578,8 @@ the 60 FPS cap, dips to the low 50s (54 to 56 before it). What was found, in the
 - **The geometry jobs' wait for their output ring** (`0xd7e8`) became 14 to 22% of the workers' time once they
   were faster: a GET of the RSX label, then a delay of 2,400 decrementer reads. `RPCS3_SPU_DELAY_LOOPS=1` makes
   such a loop cheap (the time is read in the last turn only, PAUSE every 16th): no change (56.4 against 56.6), the
-  workers wait for the render thread either way. Off.
+  workers wait for the render thread either way; a PAUSE in every turn (`=2`, the core mostly idle): 56.5 against
+  57.4 over four pairs. Off.
 
 - **Longer runs of fast draws.** Depth bounds changes are dynamic state in Vulkan and now stay inside a run like the
   depth bias (a hundred a frame); writes of the value a register already holds stay inside for the handlers that
@@ -588,7 +589,9 @@ the 60 FPS cap, dips to the low 50s (54 to 56 before it). What was found, in the
   next draw went through the complete path). 370 to 530 runs a frame instead of 600 to 630, 45 to 95 of them
   continued; 15.22 against 15.31 ms of render thread time a frame (live control 23 bit 5), so little.
 - **With `SPU Block Size: Mega`**, which `play-config.yml` uses: 58.0, 59.3, 60.0, 60.0, 57.3, 59.9, 60.0, 59.3 FPS
-  in eight consecutive 5 second windows (mean 59.2). `launch.py` on the real profile was started once after the
+  in eight consecutive 5 second windows (mean 59.2); 58.3 over thirty windows later (lowest 52.4, 21 of 30 at 58
+  and more); 55.9 over 24 windows after a cold boot through the opening late in the evening, 57.3 with `Safe`
+  (both with the built-in defaults, pictures right). `launch.py` on the real profile was started once after the
   round (four minutes of compiling, then the game with six SPUs).
 
 Tried and not kept: `Disable ZCull Occlusion Queries` (the picture falls apart: the game culls objects by the
