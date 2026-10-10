@@ -29,7 +29,7 @@ All figures: Ryzen 7 8845HS / Radeon 780M on AC, power profile "balanced" (30 W 
 | main menu | 33.7 FPS | 42 to 46 FPS | 60.0 FPS, render thread at 0.54 of a core |
 | opening cutscene (in engine), 30 s | | 44.9 FPS (without the two main changes below) | 60.0 FPS at 21 W, render thread at 0.41 of a core |
 | first fight on Gaia | 29 FPS (one load) | 32 to 35 FPS (single loads) | 41 to 42 FPS after the first night (means of 6 or 7 loads); about 44 after the second round; 50.6 after the third (host kernels, see below); 56.9 after the fourth (ten kernels, non-temporal vertex copies); the fifth (three more kernels) takes 0.7 to 1.5 ms off the main thread's waits, between 0 and 5 FPS depending on the stretch; 57 to 59 in session means after the eighth (code verification once per change, a sixth SPU for geometry, index lists from the SPU side), most 5 second windows at the 60 FPS cap; all at 30 W |
-| first fight, `launch.py --fast` (relaxed SPU floats) | | | 44.8 FPS (mean of 6 loads, first night; not measured again) |
+| first fight, `launch.py --fast` (relaxed SPU floats) | | | 44.8 FPS (mean of 6 loads, first night); after the eighth round 56.4 against 56.0 without (three pairs of sessions): no longer worth its risk |
 | first fight, performance power profile (54 W) | | | 49 FPS before the third round; 54 to 60 after it |
 
 The fight was limited by the game's main PPU thread and the SPU jobs it waits for (second round, below); after the
