@@ -170,13 +170,18 @@ namespace
 						const u8* twin = rsx::spu_upload::g_state.twin.load() + offset;
 						const auto* guest = reinterpret_cast<const u8*>(command.raw_index_buffer.data());
 						bool same = true;
+						u32 low = 0xffff, high = 0;
 
 						for (u32 i = 0; i + 1 < upload_size && same; i += 2)
 						{
 							same = twin[i] == guest[i + 1] && twin[i + 1] == guest[i];
+							const u32 index = guest[i] << 8 | guest[i + 1];
+							low = std::min(low, index);
+							high = std::max(high, index);
 						}
 
-						rsx::spu_upload::g_state.index_differing += !same;
+						// The extremes as well
+						rsx::spu_upload::g_state.index_differing += !same || low != min_index || high != max_index;
 					}
 
 					if (min_index > max_index || (min_index == max_index && primitive != rsx::primitive_type::points))

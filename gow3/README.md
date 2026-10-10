@@ -591,12 +591,15 @@ the 60 FPS cap, dips to the low 50s (54 to 56 before it). What was found, in the
   in eight consecutive 5 second windows (mean 59.2). `launch.py` on the real profile was started once after the
   round (four minutes of compiling, then the game with six SPUs).
 
-Tried and not kept: `RSX FIFO Fetch Accuracy: Fast` (the render thread reads unmapped memory), two pinning layouts
+Tried and not kept: `Disable ZCull Occlusion Queries` (the picture falls apart: the game culls objects by the
+reports; the render thread's profile shows the report handling at 2% of it, so there is nothing to gain there
+either), `Relaxed ZCULL Sync` again (picture right, 50 to 54 FPS with the render thread at a full core),
+`RSX FIFO Fetch Accuracy: Fast` (the render thread reads unmapped memory), two pinning layouts
 for the nine busy threads (56.3 against 58.1 and 50.7 against 56.4 unpinned), a kernel for a sort function of a
 `72cc647b` binary that the fight does not run (the sampler's program hash covers only 256 bytes of the job
 manager: two builds of the job share it; `RPCS3_SPU_REGION_CAPTURE=<dir>,<pc>,0` now captures whatever is at an
-address). `RPCS3_PPU_SPIN_PAUSE=1` (two PAUSE per turn of a PPU loop that only reads memory and compares) is built
-and not measured properly.
+address). `RPCS3_PPU_SPIN_PAUSE=1` (two PAUSE per turn of a PPU loop that only reads memory and compares): 57.8 against
+57.7 FPS over four pairs of sessions, left off.
 
 Measuring: `tools/statepair.sh`, `tools/envpair.sh` (alternating sessions for what cannot be switched live),
 `tools/rsxwork.sh` (the render thread's working time per frame in one session). A recompiler change that fails

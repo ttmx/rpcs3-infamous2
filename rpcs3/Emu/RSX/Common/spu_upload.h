@@ -418,6 +418,9 @@ namespace rsx::spu_upload
 
 	// Render thread: the offset in the twin heap of the 16-bit index list at guest bytes [guest, guest + bytes) and
 	// its smallest and largest index, if one published range holds the list
+#if defined(__x86_64__) && (defined(__clang__) || defined(__GNUC__))
+	__attribute__((target("sse4.1")))
+#endif
 	inline u64 find_indices(u32 guest, u32 bytes, u32& min_index, u32& max_index)
 	{
 		auto& s = g_state;
@@ -450,6 +453,23 @@ namespace rsx::spu_upload
 				addr = last;
 				continue;
 			}
+
+#if defined(__x86_64__) && (defined(__clang__) || defined(__GNUC__))
+			if (last - addr >= 16)
+			{
+				__m128i lows = _mm_set1_epi16(-1), highs = _mm_setzero_si128();
+
+				for (; addr + 16 <= last; addr += 16)
+				{
+					const __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(data + (addr - guest)));
+					lows = _mm_min_epu16(lows, v);
+					highs = _mm_max_epu16(highs, v);
+				}
+
+				low = std::min<u32>(low, static_cast<u16>(_mm_cvtsi128_si32(_mm_minpos_epu16(lows))));
+				high = std::max<u32>(high, static_cast<u16>(~_mm_cvtsi128_si32(_mm_minpos_epu16(_mm_xor_si128(highs, _mm_set1_epi16(-1))))));
+			}
+#endif
 
 			for (; addr < last; addr += 2)
 			{
