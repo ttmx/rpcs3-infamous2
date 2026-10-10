@@ -89,6 +89,8 @@ def launch(args):
     argv = [str(STOCK if stock else FORK), '--no-gui', '--input-config=ProfilingKeyboard', '--config=' + str(cfg), boot]
     # --perf: hold the performance power profile for the session, as the inFamous 2 launcher does
     if '--perf' in opts: argv = ['powerprofilesctl', 'launch', '--profile', 'performance', '--reason', 'RPCS3 test', '--appid', 'rpcs3', *argv]
+    # GW_WRAP: a command in front of the emulator's (strace -f -c -o file ...)
+    if os.environ.get('GW_WRAP'): argv = [*os.environ['GW_WRAP'].split(), *argv]
     log = open(session / 'stdout.log', 'w')
     p = subprocess.Popen(argv, env=env, stdout=log, stderr=log, start_new_session=True)
     time.sleep(1.5)

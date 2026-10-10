@@ -604,6 +604,15 @@ manager: two builds of the job share it; `RPCS3_SPU_REGION_CAPTURE=<dir>,<pc>,0`
 address). `RPCS3_PPU_SPIN_PAUSE=1` (two PAUSE per turn of a PPU loop that only reads memory and compares): 57.8 against
 57.7 FPS over four pairs of sessions, left off.
 
+Checked again in the state after this round, all inside one session (24 windows of 5 s per arm unless noted, a
+window's standard deviation is 3 to 5 FPS, so under 2 FPS nothing shows): the SPURS reservation still helps a
+little (56.5 against 55.7, 16 windows), spinning through the main thread's 30 microsecond sleeps does not (57.1
+without against 55.8 with, after 55.0 against 56.9 the other way round in 16 windows), the periodic command
+buffer submit at 4 ms instead of 1 ms changes nothing (53.5 against 53.7), nor does flushing for an occlusion
+report after 6 ms instead of 300 microseconds (55.4 against 54.9). The render thread spends a fifth of its CPU
+time in the kernel (0.16 of 0.80 cores): about 110 ioctl calls of the GPU driver a frame (`GW_WRAP="strace -f -c
+-o file"` in front of `gw.py`'s emulator command counts them).
+
 Measuring: `tools/statepair.sh`, `tools/envpair.sh` (alternating sessions for what cannot be switched live),
 `tools/rsxwork.sh` (the render thread's working time per frame in one session). A recompiler change that fails
 LLVM's verification leaves the SPU cache build standing at the last modules: look for `·F` in the log first.
