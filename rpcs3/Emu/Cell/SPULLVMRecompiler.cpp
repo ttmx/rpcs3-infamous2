@@ -42,15 +42,16 @@
 #include "util/sysinfo.hpp"
 
 const // RPCS3_SPU_DELAY_LOOPS=1: counting loops around a decrementer read pass as one timed wait
-static bool spu_delay_loops()
+// (2 = a PAUSE in every turn: the delay is five times the console's and the core mostly idle)
+static u32 spu_delay_loops()
 {
-	static const bool enabled = []
+	static const u32 mode = []() -> u32
 	{
 		const char* option = std::getenv("RPCS3_SPU_DELAY_LOOPS");
-		return option && option[0] == '1' && !option[1];
+		return option && (option[0] == '1' || option[0] == '2') && !option[1] ? option[0] - '0' : 0;
 	}();
 
-	return enabled;
+	return mode;
 }
 
 extern u32 spu_verify_once_mode();
@@ -2626,7 +2627,7 @@ public:
 			+ (g_spu_native_rwv_experiment ? "-native-rwv-v1" : "")
 			+ (spu_native_geometry::enabled() ? "-native-geometry-v8" : "")
 			+ (spu_verify_once_mode() == 1 ? "-verify-once-v1" : spu_verify_once_mode() == 2 ? "-verify-once-check-v1" : "")
-			+ (spu_delay_loops() ? "-delay-loops-v2" : "")
+			+ (spu_delay_loops() == 1 ? "-delay-loops-v2" : spu_delay_loops() == 2 ? "-delay-loops-pause-v1" : "")
 			+ (spu_native_geometry::region_capture::get().pc ? "-region-capture" : "")
 			+ (spu_xfloat_fast_mode() && g_cfg.core.spu_xfloat_accuracy == xfloat_accuracy::accurate ? (spu_xfloat_fast_mode() == 2 ? "-xfloat-fast-check-v3" : "-xfloat-fast-v2") : "")
 			+ (g_spu_native_sxe_experiment ? "-native-sxe-v1" : "")
@@ -5887,7 +5888,7 @@ public:
 					m_ir->CreateBr(next);
 					m_ir->SetInsertPoint(turn);
 					const auto stale = m_ir->CreateLoad(get_type<u32>(), spu_ptr(&spu_thread::ch_dec_value));
-					m_ir->CreateCondBr(m_ir->CreateICmpEQ(m_ir->CreateAnd(counter, 15), m_ir->getInt32(0)), wait, skip, m_md_unlikely);
+					m_ir->CreateCondBr(m_ir->CreateICmpEQ(m_ir->CreateAnd(counter, spu_delay_loops() == 2 ? 0 : 15), m_ir->getInt32(0)), wait, skip, m_md_unlikely);
 					m_ir->SetInsertPoint(wait);
 					m_ir->CreateCall(llvm::Intrinsic::getOrInsertDeclaration(m_module, llvm::Intrinsic::x86_sse2_pause));
 					m_ir->CreateBr(skip);
