@@ -30,6 +30,7 @@ namespace rsx::spu_upload
 	constexpr u32 granule_shift = 8;
 	constexpr u32 minimum_bytes = 256;
 	constexpr u32 record_count = 1u << 20;
+	constexpr u32 id_block = 1024; // a divisor of 2^32, so that a block never wraps inside
 
 	struct record_t
 	{
@@ -74,6 +75,12 @@ namespace rsx::spu_upload
 	{
 		static constexpr u8 skinning_loop[8]{0x0f, 0x60, 0xdf, 0x9e, 0x04, 0x00, 0x04, 0xb2};
 		return !std::memcmp(ls + 0x10d74, skinning_loop, 8);
+	}
+
+	inline bool stats_wanted()
+	{
+		static const bool wanted = std::getenv("RPCS3_SPU_VERTEX_UPLOAD_STATS") != nullptr;
+		return wanted;
 	}
 
 	// Live control 19: 1 = draws do not use the heap, 2 = every use is compared with guest memory, 3 = PUTs do not publish either
@@ -145,6 +152,7 @@ namespace rsx::spu_upload
 	{
 		u64 position = 0, end = 0;
 		record_t* current = nullptr;
+		u32 next_id = 0, last_id = 0;
 	};
 
 	// An SPU PUT of data that is about to be (or has just been) written to guest memory
@@ -188,16 +196,26 @@ namespace rsx::spu_upload
 		}
 		else
 		{
-			do id = g_state.next_id.fetch_add(1); while (!id);
+			// Ids are taken from the shared counter a block at a time
+			if (arena.next_id == arena.last_id)
+			{
+				arena.next_id = g_state.next_id.fetch_add(id_block);
+				arena.last_id = arena.next_id + id_block;
+			}
+
+			id = arena.next_id++;
+			if (!id) id = arena.next_id++;
+
 			rec = &g_state.records[id % record_count];
-			rec->id.store(0);
+			rec->id.store(0, std::memory_order_release);
 			rec->guest = guest;
 			rec->position = arena.position;
 			arena.current = rec;
 		}
 
-		rec->guest_end.store(guest + bytes);
-		rec->id.store(id);
+		// Plain stores: the render thread reads the end and the id after the table entry that names the record
+		rec->guest_end.store(guest + bytes, std::memory_order_release);
+		rec->id.store(id, std::memory_order_release);
 
 		auto* table = g_state.table;
 		const u32 end = guest + bytes, granule = 1u << granule_shift;
@@ -221,8 +239,12 @@ namespace rsx::spu_upload
 		}
 
 		arena.position += bytes;
-		g_state.published.fetch_add(1, std::memory_order_relaxed);
-		g_state.published_bytes.fetch_add(bytes, std::memory_order_relaxed);
+
+		if (stats_wanted()) [[unlikely]]
+		{
+			g_state.published.fetch_add(1, std::memory_order_relaxed);
+			g_state.published_bytes.fetch_add(bytes, std::memory_order_relaxed);
+		}
 	}
 
 	// Bytes that no SPU wrote (a static stream next to a job's stream in one draw), put into the heap by the caller's
@@ -302,8 +324,7 @@ namespace rsx::spu_upload
 
 	inline void print_stats()
 	{
-		static const bool wanted = std::getenv("RPCS3_SPU_VERTEX_UPLOAD_STATS") != nullptr;
-		if (!wanted) return;
+		if (!stats_wanted()) return;
 
 		auto& s = g_state;
 		std::fprintf(stderr, "SPU vertex upload: published %llu (%.1f MB); draws: %llu from the heap (%.1f MB, of them %.1f MB in %llu blocks put there by the render thread), copied: %llu no range, %llu not inside one range, %llu too old, %llu too many blocks (%.1f MB); compared %llu, differing %llu\n",
