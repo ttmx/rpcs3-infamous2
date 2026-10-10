@@ -419,6 +419,20 @@ more are vertex and index data (its command chunks are a third of a kilobyte), s
 19 = 4 keeps it). `do_dma_transfer` on the three geometry workers and the render thread: 8.8 and 8.6% of their time
 with the lock, 7.7 and 7.3% without.
 
+**The publish path itself** was 40% of `do_dma_transfer` on the geometry workers after that: three stores with
+full barriers into a cold record, a shared id counter, two shared statistics counters. With plain stores, ids taken
+a thousand at a time and the counters only under `RPCS3_SPU_VERTEX_UPLOAD_STATS`, the function goes from 8.8 to 8.1%
+of those threads' time (1 KB granules instead of 256 bytes: 7.8%, but three times as many ranges fall back to the
+render thread's copy; kept at 256). Prefetching every element of a list GET before the first copy (the job reads its
+bone matrices as about a hundred 64-byte elements) changes nothing: 19.6, 19.6 and 18.1% for the three transfer
+functions without, 20.2, 18.9 and 18.3% with 128 and 4,096 bytes per element.
+
+What is left on the geometry workers, by `perf` on the three threads: transfers 19%, the kernels 19%, and of the
+recompiled code the bone decoder `0xfec0` 4.6% (a bit stream reader, 542 instructions per bone), the lighting driver
+`0x9958` 3.5% (per light two per-vertex passes at `0x9c48` and `0x9f90`, about 215 instructions together, then the
+point lights), transform and culling `0xf428`/`0xf918` 3.3%. By the delay probe each percent of those threads is
+worth about 0.1 ms of frame time.
+
 The test configuration `cfg-test.yml` has `SPU Block Size: Safe`; `play-config.yml` has `Mega`. Everything of this
 round was run with both: Mega 51.9 and 57.8 FPS, Safe 52.0 and 55.4 (alternating sessions), and the compare mode of
 the upload heap found no difference in 8 million ranges with Mega.
