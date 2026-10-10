@@ -1,3 +1,7 @@
+#ifdef __linux__
+#include <sys/uio.h>
+#include <unistd.h>
+#endif
 #include "Emu/RSX/VK/VKLiveCtl.hpp"
 #include "Emu/RSX/VK/VKNativeAA.h"
 #include "Emu/RSX/VK/VKReadbackCopy.hpp"
@@ -2860,6 +2864,32 @@ void spu_thread::do_dma_transfer(spu_thread* _this, const spu_mfc_cmd& args, u8*
 
 					if (n % 4000 == 0)
 					{
+#ifdef __linux__
+						// "<file>.dumpreq" with a host address in hex: 512 bytes from 256 before it go to "<file>.dump"
+						// (code that perf has no symbol for)
+						if (FILE* req = std::fopen((std::string(sampler_path) + ".dumpreq").c_str(), "r"))
+						{
+							unsigned long long address = 0;
+							u8 bytes[512];
+
+							if (std::fscanf(req, "%llx", &address) == 1 && address > 256)
+							{
+								iovec local{bytes, sizeof(bytes)}, remote{reinterpret_cast<void*>(address - 256), sizeof(bytes)};
+
+								if (process_vm_readv(getpid(), &local, 1, &remote, 1, 0) == static_cast<ssize_t>(sizeof(bytes)))
+								{
+									if (FILE* out = std::fopen((std::string(sampler_path) + ".dump").c_str(), "wb"))
+									{
+										std::fwrite(bytes, 1, sizeof(bytes), out);
+										std::fclose(out);
+									}
+								}
+							}
+
+							std::fclose(req);
+							std::remove((std::string(sampler_path) + ".dumpreq").c_str());
+						}
+#endif
 						if (FILE* f = std::fopen((std::string(sampler_path) + ".kctx").c_str(), "w"))
 						{
 							// Every SPU thread's SPURS kernel context now: where it is, what it waits for, its workload and its

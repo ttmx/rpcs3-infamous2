@@ -377,6 +377,13 @@ namespace rsx
 		virtual void clear_surface(u32 /*arg*/) {}
 		virtual void begin();
 		virtual void end();
+
+		// A renderer that consumes runs of draws from the FIFO by itself (VKGSRender::fast_draw_batch) and stopped
+		// at a jump, call or return sets this; when that command has been followed and no method has run since,
+		// the FIFO loop lets it go on from the new position
+		bool m_fast_draw_resumable = false;
+		u32 m_fast_draw_stop_cmd = 0; // the command it stopped at: a jump to self is waited for until the game replaces it
+		virtual void resume_fast_draws() {}
 		virtual void execute_nop_draw();
 
 		virtual void on_init_thread() = 0;

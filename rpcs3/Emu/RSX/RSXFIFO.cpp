@@ -896,6 +896,16 @@ namespace rsx
 
 	void thread::run_FIFO()
 	{
+		if (m_fast_draw_resumable && !fifo_ctrl->get_remaining_args_count()) [[unlikely]]
+		{
+			// The renderer's run of draws stopped at the command that comes next. If that was a jump to self, the game
+			// puts the next commands in its place: the run goes on with them
+			if (const u32 addr = iomap_table.get_addr(fifo_ctrl->get_pos()); addr != umax && vm::read32(addr) != m_fast_draw_stop_cmd)
+			{
+				resume_fast_draws();
+			}
+		}
+
 		FIFO::register_pair command;
 		fifo_ctrl->read(command);
 		const auto cmd = command.reg;
@@ -980,7 +990,14 @@ namespace rsx
 				}
 
 				//rsx_log.warning("rsx jump(0x%x) #addr=0x%x, cmd=0x%x, get=0x%x, put=0x%x", offs, m_ioAddress + get, cmd, get, put);
+				const bool followed = offs != fifo_ctrl->get_pos();
 				fifo_ctrl->set_get(offs, cmd);
+
+				if (followed && m_fast_draw_resumable)
+				{
+					resume_fast_draws();
+				}
+
 				return;
 			}
 			if ((cmd & RSX_METHOD_CALL_CMD_MASK) == RSX_METHOD_CALL_CMD)
@@ -1000,6 +1017,12 @@ namespace rsx
 				fifo_ret_addr = fifo_ctrl->get_pos() + 4;
 				fifo_ctrl->set_get(offs);
 				last_known_code_start = offs;
+
+				if (m_fast_draw_resumable)
+				{
+					resume_fast_draws();
+				}
+
 				return;
 			}
 			if ((cmd & RSX_METHOD_RETURN_MASK) == RSX_METHOD_RETURN_CMD)
@@ -1035,6 +1058,12 @@ namespace rsx
 
 				fifo_ctrl->set_get(std::exchange(fifo_ret_addr, RSX_CALL_STACK_EMPTY));
 				last_known_code_start = fifo_ctrl->get_pos();
+
+				if (m_fast_draw_resumable)
+				{
+					resume_fast_draws();
+				}
+
 				return;
 			}
 
@@ -1064,6 +1093,9 @@ namespace rsx
 
 		do
 		{
+			// A method runs: whatever a renderer's own run of draws left is no longer the last thing that happened
+			m_fast_draw_resumable = false;
+
 			if (capture_current_frame) [[unlikely]]
 			{
 				const u32 reg = (command.reg & 0xfffc) >> 2;

@@ -323,6 +323,7 @@ private:
 		u64 semaphores = 0;
 		u64 flow_commands = 0;
 		u64 reports = 0;
+		u64 resumes = 0;
 		u64 inline_draws = 0;
 		u64 not_armed[17]{};
 		u64 stops[12]{};
@@ -361,9 +362,11 @@ private:
 	bool fast_draw_textures_plain() const;
 	bool fast_draw_rebind_textures();
 	void fast_draw_batch();
+	void resume_fast_draws() override;
 	void update_transform_constants_buffer();
 	void update_fragment_texture_params_buffer();
 	void set_depth_bias_state();
+	void set_depth_bounds_state();
 
 	// Front face and cull mode as set in the current command buffer while they are dynamic state (umax = not set)
 	u32 m_dynamic_face_state = umax;

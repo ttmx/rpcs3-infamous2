@@ -580,6 +580,17 @@ the 60 FPS cap, dips to the low 50s (54 to 56 before it). What was found, in the
   such a loop cheap (the time is read in the last turn only, PAUSE every 16th): no change (56.4 against 56.6), the
   workers wait for the render thread either way. Off.
 
+- **Longer runs of fast draws.** Depth bounds changes are dynamic state in Vulkan and now stay inside a run like the
+  depth bias (a hundred a frame); writes of the value a register already holds stay inside for the handlers that
+  return at once for them (surface clip and options, stencil operations, colour mask, anti-aliasing control); and
+  a run that stopped at a jump goes on when the FIFO loop has followed the jump or the game has replaced its jump
+  to self (the render thread catches up with the game's command stream up to 200 times a frame, and each time the
+  next draw went through the complete path). 370 to 530 runs a frame instead of 600 to 630, 45 to 95 of them
+  continued; 15.22 against 15.31 ms of render thread time a frame (live control 23 bit 5), so little.
+- **With `SPU Block Size: Mega`**, which `play-config.yml` uses: 58.0, 59.3, 60.0, 60.0, 57.3, 59.9, 60.0, 59.3 FPS
+  in eight consecutive 5 second windows (mean 59.2). `launch.py` on the real profile was started once after the
+  round (four minutes of compiling, then the game with six SPUs).
+
 Tried and not kept: `RSX FIFO Fetch Accuracy: Fast` (the render thread reads unmapped memory), two pinning layouts
 for the nine busy threads (56.3 against 58.1 and 50.7 against 56.4 unpinned), a kernel for a sort function of a
 `72cc647b` binary that the fight does not run (the sampler's program hash covers only 256 bytes of the job

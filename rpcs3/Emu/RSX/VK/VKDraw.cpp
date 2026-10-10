@@ -2,6 +2,7 @@
 #include "../Common/BufferUtils.h"
 #include "../Program/GLSLCommon.h"
 #include "../rsx_methods.h"
+#include "../NV47/HW/nv4097.h"
 
 #include "VKAsyncScheduler.h"
 #include "VKNativeSSAO.h"
@@ -169,6 +170,34 @@ void VKGSRender::invalidate_render_pass()
 	}
 }
 
+void VKGSRender::set_depth_bounds_state()
+{
+	if (m_device->get_depth_bounds_support())
+	{
+		f32 bounds_min, bounds_max;
+		if (rsx::method_registers.depth_bounds_test_enabled())
+		{
+			// Update depth bounds min/max
+			bounds_min = rsx::method_registers.depth_bounds_min();
+			bounds_max = rsx::method_registers.depth_bounds_max();
+		}
+		else
+		{
+			// Avoid special case where min=max and depth bounds (incorrectly) fails
+			bounds_min = std::min(0.f, rsx::method_registers.clip_min());
+			bounds_max = std::max(1.f, rsx::method_registers.clip_max());
+		}
+
+		if (!m_device->get_unrestricted_depth_range_support())
+		{
+			bounds_min = std::clamp(bounds_min, 0.f, 1.f);
+			bounds_max = std::clamp(bounds_max, 0.f, 1.f);
+		}
+
+		vkCmdSetDepthBounds(*m_current_command_buffer, bounds_min, bounds_max);
+	}
+}
+
 void VKGSRender::set_depth_bias_state()
 {
 	if (rsx::method_registers.poly_offset_fill_enabled())
@@ -250,31 +279,7 @@ void VKGSRender::update_draw_state()
 	}
 
 	set_depth_bias_state();
-
-	if (m_device->get_depth_bounds_support())
-	{
-		f32 bounds_min, bounds_max;
-		if (rsx::method_registers.depth_bounds_test_enabled())
-		{
-			// Update depth bounds min/max
-			bounds_min = rsx::method_registers.depth_bounds_min();
-			bounds_max = rsx::method_registers.depth_bounds_max();
-		}
-		else
-		{
-			// Avoid special case where min=max and depth bounds (incorrectly) fails
-			bounds_min = std::min(0.f, rsx::method_registers.clip_min());
-			bounds_max = std::max(1.f, rsx::method_registers.clip_max());
-		}
-
-		if (!m_device->get_unrestricted_depth_range_support())
-		{
-			bounds_min = std::clamp(bounds_min, 0.f, 1.f);
-			bounds_max = std::clamp(bounds_max, 0.f, 1.f);
-		}
-
-		vkCmdSetDepthBounds(*m_current_command_buffer, bounds_min, bounds_max);
-	}
+	set_depth_bounds_state();
 
 	bind_viewport();
 
@@ -2035,7 +2040,8 @@ void VKGSRender::fast_draw_batch()
 	// Setup commands that are passed to their regular handlers: fragment texture setup and polygon offset.
 	// What they leave pending is dealt with before the draw (texture_state, depth_bias_state).
 	constexpr u32 texture_state = rsx::pipeline_state::fragment_program_state_dirty;
-	constexpr u32 depth_bias_state = rsx::pipeline_state::polygon_offset_state_dirty;
+	// The depth bounds are dynamic state as well (God of War III changes them before a hundred draws a frame)
+	constexpr u32 depth_bias_state = rsx::pipeline_state::polygon_offset_state_dirty | rsx::pipeline_state::depth_bounds_state_dirty;
 
 	const bool delegate = vk::live_ctl::get(9) != 5;
 
@@ -2063,6 +2069,7 @@ void VKGSRender::fast_draw_batch()
 		const auto within = [&](u32 first, u32 length) { return reg >= first && reg + count <= first + length; };
 		return within(NV4097_SET_TEXTURE_OFFSET, 8 * 16) || within(NV4097_SET_TEXTURE_CONTROL3, 16) || within(NV4097_SET_TEXTURE_CONTROL2, 16) ||
 			within(NV4097_SET_POLY_OFFSET_FILL_ENABLE, 1) || within(NV4097_SET_POLYGON_OFFSET_SCALE_FACTOR, 2) ||
+			(extended && within(NV4097_SET_DEPTH_BOUNDS_TEST_ENABLE, 3)) ||
 			(dynamic_face && (within(NV4097_SET_FRONT_FACE, 1) || within(NV4097_SET_CULL_FACE, 1) || within(NV4097_SET_CULL_FACE_ENABLE, 1)));
 	};
 
@@ -2082,14 +2089,17 @@ void VKGSRender::fast_draw_batch()
 
 	// Registers written with the value they hold. Without a handler the FIFO loop does nothing for such a write;
 	// the handlers of the two face registers, of the vertex program start (God of War III sets it before every
-	// draw) and of the vertex output mask return at once for it.
+	// draw), of the vertex output mask and the ones named below (surface clip and options, stencil operations,
+	// colour mask, anti-aliasing control) return at once for it.
 	const auto rewrites_registers = [&](u32 reg, u32 count) -> bool
 	{
 		for (u32 i = 0; i < count; i++)
 		{
 			const u32 r = reg + i;
 			if (r >= std::size(regs.registers) || regs.registers[r] != words[i]) return false;
-			if (rsx::methods[r] && r != NV4097_SET_FRONT_FACE && r != NV4097_SET_CULL_FACE && r != NV4097_SET_TRANSFORM_PROGRAM_START && r != NV4097_SET_VERTEX_ATTRIB_OUTPUT_MASK) return false;
+			if (const auto method = rsx::methods[r]; method && r != NV4097_SET_FRONT_FACE && r != NV4097_SET_CULL_FACE && r != NV4097_SET_TRANSFORM_PROGRAM_START && r != NV4097_SET_VERTEX_ATTRIB_OUTPUT_MASK &&
+				!(extended && (method == &rsx::nv4097::set_aa_control || method == &rsx::nv4097::set_surface_options_dirty_bit || method == &rsx::nv4097::set_surface_dirty_bit ||
+					method == &rsx::nv4097::set_stencil_op || method == &rsx::nv4097::set_color_mask))) return false;
 		}
 		return true;
 	};
@@ -2127,6 +2137,7 @@ void VKGSRender::fast_draw_batch()
 				fifo.fast_forward(pos - 4);
 			}
 
+			m_fast_draw_stop_cmd = cmd;
 			stop = flow_control;
 			break;
 		}
@@ -2558,7 +2569,8 @@ void VKGSRender::fast_draw_batch()
 				if (m_graphics_state & depth_bias_state)
 				{
 					// The other dynamic state is as the previous draw set it
-					set_depth_bias_state();
+					if (m_graphics_state & rsx::pipeline_state::polygon_offset_state_dirty) set_depth_bias_state();
+					if (m_graphics_state & rsx::pipeline_state::depth_bounds_state_dirty) set_depth_bounds_state();
 					m_graphics_state.clear(depth_bias_state);
 					m_fast_draw.depth_bias_updates++;
 				}
@@ -2623,6 +2635,38 @@ void VKGSRender::fast_draw_batch()
 
 	m_fast_draw.stops[stop]++;
 	m_fast_draw.in_batch = false;
+
+	// A jump that leads to itself (the game has not written the next part yet) or one that was not followed: the
+	// FIFO loop follows it later and the run can go on from there (resume_fast_draws), without a draw on the complete
+	// path in between (God of War III: 200 times a frame). Live control 23, bit 5: not.
+	m_fast_draw_resumable = stop == flow_control && extended && !(vk::live_ctl::get(23) & 32);
+}
+
+// Called by the FIFO loop after it followed the jump, call or return that ended a run, with nothing else executed
+// since. What a run needs at its start is checked again: other work of this thread came in between.
+void VKGSRender::resume_fast_draws()
+{
+	m_fast_draw_resumable = false;
+
+	if (!fast_draw_enabled() || m_fast_draw.in_batch || fast_draw_run_blocker() || !m_current_command_buffer || !vk::is_renderpass_open(*m_current_command_buffer))
+	{
+		return;
+	}
+
+	// The run reads from the word after the position; here that is the next command itself
+	const u32 start = fifo_ctrl->get_pos();
+	fifo_ctrl->fast_forward(start - 4);
+	fast_draw_batch();
+	m_fast_draw.resumes++;
+
+	if (const u32 next = fifo_ctrl->get_pos() + 4; next != start)
+	{
+		fifo_ctrl->set_get(next);
+	}
+	else
+	{
+		fifo_ctrl->fast_forward(start);
+	}
 }
 
 // Verification of the fast path's premise (live control 9 == 3). Nothing is skipped in this mode. For every draw that
