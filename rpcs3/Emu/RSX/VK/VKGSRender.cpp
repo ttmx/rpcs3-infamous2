@@ -963,6 +963,12 @@ VKGSRender::~VKGSRender()
 		m_spu_upload_views.clear();
 		m_spu_upload_buffer->unmap();
 		m_spu_upload_buffer.reset();
+
+		if (m_spu_index_buffer)
+		{
+			m_spu_index_buffer->unmap();
+			m_spu_index_buffer.reset();
+		}
 	}
 
 	// Upscaler (references some global resources)
@@ -2080,6 +2086,13 @@ void VKGSRender::create_spu_upload_heap()
 	for (u64 offset = 0; offset < bytes; offset += m_spu_upload_window)
 	{
 		m_spu_upload_views.emplace_back(std::make_unique<vk::buffer_view>(*m_device, m_spu_upload_buffer->value, VK_FORMAT_R8_UINT, offset, m_spu_upload_window));
+	}
+
+	if (rsx::spu_upload::indices_enabled())
+	{
+		m_spu_index_buffer = std::make_unique<vk::buffer>(*m_device, bytes, memory_map.host_visible_coherent,
+			VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, VK_BUFFER_USAGE_INDEX_BUFFER_BIT, 0, VMM_ALLOCATION_POOL_SYSTEM);
+		rsx::spu_upload::attach_twin(static_cast<u8*>(m_spu_index_buffer->map(0, bytes)));
 	}
 
 	rsx::spu_upload::attach(static_cast<u8*>(m_spu_upload_buffer->map(0, bytes)), bytes);

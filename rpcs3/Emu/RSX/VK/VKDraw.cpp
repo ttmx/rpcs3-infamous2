@@ -1440,7 +1440,7 @@ void VKGSRender::emit_geometry(u32 sub_index)
 		const VkDeviceSize offset = std::get<0>(*upload_info.index_info);
 
 		vkCmdBindIndexBuffer(*m_current_command_buffer,
-			upload_info.static_indices ? m_geometry_cache.index_heap.buffer->value : m_index_buffer_ring_info.heap->value, offset, index_type);
+			upload_info.spu_indices ? m_spu_index_buffer->value : upload_info.static_indices ? m_geometry_cache.index_heap.buffer->value : m_index_buffer_ring_info.heap->value, offset, index_type);
 
 		if (draw_call.is_trivial_instanced_draw)
 		{
@@ -2581,7 +2581,7 @@ void VKGSRender::fast_draw_batch()
 				if (upload_info.index_info)
 				{
 					vkCmdBindIndexBuffer(*m_current_command_buffer,
-						upload_info.static_indices ? m_geometry_cache.index_heap.buffer->value : m_index_buffer_ring_info.heap->value,
+						upload_info.spu_indices ? m_spu_index_buffer->value : upload_info.static_indices ? m_geometry_cache.index_heap.buffer->value : m_index_buffer_ring_info.heap->value,
 						std::get<0>(*upload_info.index_info), std::get<1>(*upload_info.index_info));
 					vkCmdDrawIndexed(*m_current_command_buffer, upload_info.vertex_draw_count, 1, 0, 0, 0);
 				}

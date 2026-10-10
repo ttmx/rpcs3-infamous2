@@ -96,6 +96,7 @@ namespace
 		u32 vertex_index_offset;
 		std::optional<std::tuple<VkDeviceSize, VkIndexType>> index_info;
 		bool static_indices = false;
+		bool spu_indices = false;
 	};
 
 	constexpr u32 geometry_cache_vertex_bytes = 64 * 0x100000;
@@ -103,11 +104,12 @@ namespace
 
 	struct draw_command_visitor
 	{
-		draw_command_visitor(vk::data_heap& index_buffer_ring_info, rsx::vertex_input_layout& layout, vk::geometry_cache* cache, u32 frame)
+		draw_command_visitor(vk::data_heap& index_buffer_ring_info, rsx::vertex_input_layout& layout, vk::geometry_cache* cache, u32 frame, bool spu_indices)
 			: m_index_buffer_ring_info(index_buffer_ring_info)
 			, m_vertex_layout(layout)
 			, m_cache(cache)
 			, m_frame(frame)
+			, m_spu_indices(spu_indices)
 		{
 		}
 
@@ -151,6 +153,41 @@ namespace
 			u32 upload_size = index_count * type_size;
 
 			if (emulate_restart) upload_size *= 2;
+
+			// An index list that an SPU job wrote and published already converted (spu_upload.h): nothing to copy
+			if (m_spu_indices && index_type == rsx::index_array_type::u16 && !primitives_emulated && !rsx::method_registers.restart_index_enabled() &&
+				!rsx::method_registers.current_draw_clause.is_immediate_draw && upload_size >= 2)
+			{
+				const auto [address, mapped] = vm::try_get_addr(command.raw_index_buffer.data());
+				u32 min_index = 0, max_index = 0;
+
+				if (const u64 offset = mapped && u64{address} + upload_size <= rsx::constants::local_mem_base && command.raw_index_buffer.size() >= upload_size
+					? rsx::spu_upload::find_indices(address, upload_size, min_index, max_index) : u64{umax}; offset != umax)
+				{
+					if (rsx::spu_upload::mode() == 2) [[unlikely]]
+					{
+						// Check: the published list against guest memory
+						const u8* twin = rsx::spu_upload::g_state.twin.load() + offset;
+						const auto* guest = reinterpret_cast<const u8*>(command.raw_index_buffer.data());
+						bool same = true;
+
+						for (u32 i = 0; i + 1 < upload_size && same; i += 2)
+						{
+							same = twin[i] == guest[i + 1] && twin[i + 1] == guest[i];
+						}
+
+						rsx::spu_upload::g_state.index_differing += !same;
+					}
+
+					if (min_index > max_index || (min_index == max_index && primitive != rsx::primitive_type::points))
+					{
+						return{ prims, false, 0, 0, 0, 0, {} };
+					}
+
+					return { prims, true, min_index, max_index, index_count, rsx::method_registers.vertex_data_base_index(),
+						std::make_tuple(VkDeviceSize{offset}, VK_INDEX_TYPE_UINT16), false, true };
+				}
+			}
 
 			// Static index data: use the converted copy for as long as its guest pages stay unwritten
 			vk::geometry_cache::slot_t* slot = nullptr;
@@ -333,6 +370,7 @@ namespace
 		rsx::vertex_input_layout& m_vertex_layout;
 		vk::geometry_cache* m_cache;
 		u32 m_frame;
+		bool m_spu_indices;
 	};
 }
 
@@ -345,7 +383,9 @@ vk::vertex_upload_info VKGSRender::upload_vertex_data()
 	const u32 cache_frame = static_cast<u32>(vk::get_current_frame_id()) + 1;
 	vk::geometry_cache* geometry_cache = vk::geometry_cache::mode() ? &m_geometry_cache : nullptr;
 
-	draw_command_visitor visitor(m_index_buffer_ring_info, m_vertex_layout, geometry_cache, cache_frame);
+	// Live control 23, bit 4: index lists are converted by this thread as before
+	const bool spu_indices = m_spu_index_buffer && rsx::spu_upload::mode() != 1 && rsx::spu_upload::mode() != 3 && !(vk::live_ctl::get(23) & 16);
+	draw_command_visitor visitor(m_index_buffer_ring_info, m_vertex_layout, geometry_cache, cache_frame, spu_indices);
 
 	if (geometry_cache && geometry_cache->suspect_count)
 	{
@@ -1142,5 +1182,6 @@ vk::vertex_upload_info VKGSRender::upload_vertex_data()
 			persistent_range_base, volatile_range_base,   // Binding range
 			result.index_info,                            // Index buffer info
 			static_vertices, result.static_indices,       // Geometry cache buffers in use
+			result.spu_indices,                           // Index data in the SPU upload heap's twin
 			spu_window, spu_block_offsets };              // SPU upload heap in use
 }

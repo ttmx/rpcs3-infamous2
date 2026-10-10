@@ -378,6 +378,7 @@ private:
 
 	// Vertex data that SPU jobs write, appended by their threads (Common/spu_upload.h): a heap and views of its windows
 	std::unique_ptr<vk::buffer> m_spu_upload_buffer;
+	std::unique_ptr<vk::buffer> m_spu_index_buffer; // the same bytes with every pair swapped: 16-bit index lists
 	std::vector<std::unique_ptr<vk::buffer_view>> m_spu_upload_views;
 	u64 m_spu_upload_window = 0;
 	void create_spu_upload_heap();

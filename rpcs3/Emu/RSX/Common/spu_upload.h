@@ -24,6 +24,10 @@
 #include <cstring>
 #include <initializer_list>
 
+#if defined(__x86_64__)
+#include <immintrin.h>
+#endif
+
 namespace rsx::spu_upload
 {
 	constexpr u64 chunk_size = 0x100000;
@@ -49,6 +53,12 @@ namespace rsx::spu_upload
 		std::atomic<u64>* table = nullptr; // by guest address >> granule_shift: the ids of up to two ranges with bytes there, 0 = none
 		record_t* records = nullptr;
 		std::atomic<u32> next_id{1};
+
+		// Index data (see write_twin): a second heap with every byte pair of the first swapped, and by guest granule
+		// the smallest and largest 16-bit value in it (low and high half; low above high = not known)
+		std::atomic<u8*> twin{nullptr};
+		u32* ranges = nullptr;
+		u64 index_hits = 0, index_bytes = 0, index_differing = 0;
 
 		// Counters (render thread only, except the first two)
 		std::atomic<u64> published{0}, published_bytes{0};
@@ -107,7 +117,86 @@ namespace rsx::spu_upload
 
 	inline void detach()
 	{
+		g_state.twin = nullptr;
 		g_state.mapped = nullptr;
+	}
+
+	// RPCS3_SPU_INDEX_UPLOAD=1: the jobs' output is also kept as 16-bit index data
+	inline bool indices_enabled()
+	{
+		static const bool value = []
+		{
+			const char* option = std::getenv("RPCS3_SPU_INDEX_UPLOAD");
+			return option && option[0] == '1' && !option[1];
+		}();
+		return value;
+	}
+
+	constexpr u32 unknown_range = 0x0000ffff;
+
+	inline void attach_twin(u8* mapped)
+	{
+		auto& s = g_state;
+		if (!s.ranges) s.ranges = static_cast<u32*>(std::calloc(usz{1} << (32 - granule_shift), sizeof(u32)));
+		s.twin = mapped;
+	}
+
+	// The job writes each draw's index list with the same PUTs as its vertices, big-endian, and the render thread
+	// converted every list again (byte swap and a search for the smallest and largest index, 9% of its time in God
+	// of War III). Nothing tells an index list from vertex data at the PUT, so all of it is written a second time
+	// with the bytes of every pair swapped, by the SPU thread that has the data in its cache, together with the
+	// extremes of each whole 256-byte granule. A draw whose index list lies in one published range binds this heap.
+#if defined(__x86_64__) && (defined(__clang__) || defined(__GNUC__))
+	__attribute__((target("ssse3,sse4.1")))
+#endif
+	inline void write_twin(u8* dst, const u8* src, u32 guest, u32 bytes, u32* ranges)
+	{
+		const u32 end = guest + bytes;
+
+#if defined(__x86_64__) && (defined(__clang__) || defined(__GNUC__))
+		if (!((guest | bytes | reinterpret_cast<uptr>(dst)) & 15))
+		{
+			const __m128i swap = _mm_setr_epi8(1, 0, 3, 2, 5, 4, 7, 6, 9, 8, 11, 10, 13, 12, 15, 14);
+
+			for (u32 addr = guest; addr < end;)
+			{
+				const u32 first = addr, last = std::min<u32>(end, (addr | 255) + 1);
+				__m128i low = _mm_set1_epi16(-1), high = _mm_setzero_si128();
+
+				for (; addr < last; addr += 16, src += 16, dst += 16)
+				{
+					const __m128i v = _mm_shuffle_epi8(_mm_loadu_si128(reinterpret_cast<const __m128i*>(src)), swap);
+					low = _mm_min_epu16(low, v);
+					high = _mm_max_epu16(high, v);
+					_mm_stream_si128(reinterpret_cast<__m128i*>(dst), v);
+				}
+
+				if (!(first & 255) && last - first == 256)
+				{
+					const u32 min = static_cast<u16>(_mm_cvtsi128_si32(_mm_minpos_epu16(low)));
+					const u32 max = static_cast<u16>(~_mm_cvtsi128_si32(_mm_minpos_epu16(_mm_xor_si128(high, _mm_set1_epi16(-1)))));
+					ranges[first >> granule_shift] = min | max << 16;
+				}
+				else
+				{
+					ranges[first >> granule_shift] = unknown_range;
+				}
+			}
+
+			return;
+		}
+#endif
+
+		for (u32 i = 0; i + 1 < bytes; i += 2)
+		{
+			dst[i] = src[i + 1];
+			dst[i + 1] = src[i];
+		}
+
+		for (u32 g = guest >> granule_shift; g <= (end - 1) >> granule_shift; g++)
+		{
+			ranges[g] = unknown_range;
+		}
 	}
 
 	// A write to guest memory that does not publish: whatever was published for these bytes is no longer true
@@ -185,6 +274,11 @@ namespace rsx::spu_upload
 		}
 
 		copy(mapped + arena.position % g_state.size, data, bytes);
+
+		if (u8* const twin = g_state.twin.load(std::memory_order_relaxed))
+		{
+			write_twin(twin + arena.position % g_state.size, static_cast<const u8*>(data), guest, bytes, g_state.ranges);
+		}
 
 		record_t* rec = arena.current;
 		u32 id;
@@ -322,6 +416,57 @@ namespace rsx::spu_upload
 		return umax;
 	}
 
+	// Render thread: the offset in the twin heap of the 16-bit index list at guest bytes [guest, guest + bytes) and
+	// its smallest and largest index, if one published range holds the list
+	inline u64 find_indices(u32 guest, u32 bytes, u32& min_index, u32& max_index)
+	{
+		auto& s = g_state;
+		const u8* const twin = s.twin.load(std::memory_order_relaxed);
+
+		if (!twin || (guest & 1) || bytes < 2)
+		{
+			return umax;
+		}
+
+		const u64 offset = find(guest, bytes);
+
+		if (offset == umax)
+		{
+			return umax;
+		}
+
+		const u8* const data = twin + offset;
+		u32 low = 0xffff, high = 0;
+
+		for (u32 addr = guest, end = guest + bytes; addr < end;)
+		{
+			const u32 last = std::min<u32>(end, (addr | 255) + 1);
+			const u32 range = s.ranges[addr >> granule_shift];
+
+			if (!(addr & 255) && last - addr == 256 && (range & 0xffff) <= range >> 16)
+			{
+				low = std::min<u32>(low, range & 0xffff);
+				high = std::max<u32>(high, range >> 16);
+				addr = last;
+				continue;
+			}
+
+			for (; addr < last; addr += 2)
+			{
+				u16 index;
+				std::memcpy(&index, data + (addr - guest), 2);
+				low = std::min<u32>(low, index);
+				high = std::max<u32>(high, index);
+			}
+		}
+
+		min_index = low;
+		max_index = high;
+		s.index_hits++;
+		s.index_bytes += bytes;
+		return offset;
+	}
+
 	inline void print_stats()
 	{
 		if (!stats_wanted()) return;
@@ -331,6 +476,9 @@ namespace rsx::spu_upload
 			static_cast<unsigned long long>(s.published.exchange(0)), s.published_bytes.exchange(0) / 1048576., static_cast<unsigned long long>(s.hits), s.hit_bytes / 1048576., s.appended_bytes / 1048576., static_cast<unsigned long long>(s.appended),
 			static_cast<unsigned long long>(s.no_record), static_cast<unsigned long long>(s.partial), static_cast<unsigned long long>(s.old), static_cast<unsigned long long>(s.multi_block), s.miss_bytes / 1048576.,
 			static_cast<unsigned long long>(s.verified), static_cast<unsigned long long>(s.differing));
+		std::fprintf(stderr, "SPU index upload: %llu lists from the heap (%.1f MB), compared and differing %llu\n",
+			static_cast<unsigned long long>(s.index_hits), s.index_bytes / 1048576., static_cast<unsigned long long>(s.index_differing));
+		s.index_hits = s.index_bytes = s.index_differing = 0;
 		s.appended = s.appended_bytes = 0;
 		s.hits = s.hit_bytes = s.no_record = s.partial = s.old = s.multi_block = s.miss_bytes = s.verified = s.differing = 0;
 	}

@@ -41,7 +41,19 @@
 #include "util/simd.hpp"
 #include "util/sysinfo.hpp"
 
-const extern u32 spu_verify_once_mode();
+const // RPCS3_SPU_DELAY_LOOPS=1: counting loops around a decrementer read pass as one timed wait
+static bool spu_delay_loops()
+{
+	static const bool enabled = []
+	{
+		const char* option = std::getenv("RPCS3_SPU_DELAY_LOOPS");
+		return option && option[0] == '1' && !option[1];
+	}();
+
+	return enabled;
+}
+
+extern u32 spu_verify_once_mode();
 extern spu_decoder<spu_itype> g_spu_itype;
 const extern spu_decoder<spu_iname> g_spu_iname;
 const extern spu_decoder<spu_iflag> g_spu_iflag;
@@ -717,6 +729,11 @@ class spu_llvm_recompiler : public spu_recompiler_base, public cpu_translator
 
 	// Next opcode
 	u32 m_next_op = 0;
+
+	// Set for a decrementer read that is the whole body of a counting loop (see RDCH): counter and limit registers
+	u32 m_delay_loop_counter = 0;
+	u32 m_delay_loop_limit = 0;
+	bool m_delay_loop = false;
 
 	// Current function (chunk)
 	llvm::Function* m_function{};
@@ -2609,6 +2626,7 @@ public:
 			+ (g_spu_native_rwv_experiment ? "-native-rwv-v1" : "")
 			+ (spu_native_geometry::enabled() ? "-native-geometry-v8" : "")
 			+ (spu_verify_once_mode() == 1 ? "-verify-once-v1" : spu_verify_once_mode() == 2 ? "-verify-once-check-v1" : "")
+			+ (spu_delay_loops() ? "-delay-loops-v2" : "")
 			+ (spu_native_geometry::region_capture::get().pc ? "-region-capture" : "")
 			+ (spu_xfloat_fast_mode() && g_cfg.core.spu_xfloat_accuracy == xfloat_accuracy::accurate ? (spu_xfloat_fast_mode() == 2 ? "-xfloat-fast-check-v3" : "-xfloat-fast-v2") : "")
 			+ (g_spu_native_sxe_experiment ? "-native-sxe-v1" : "")
@@ -4229,6 +4247,28 @@ public:
 					else
 						m_next_op = func.data[(m_pos - start) / 4 + 1];
 
+					// A delay written as a counting loop around a decrementer read (God of War III's geometry jobs wait
+					// for room in their output ring with 2,400 turns of it between two looks at the RSX label):
+					//   AI rc, rc, 1; RDCH rx, SPU_RdDec; CEQ rt, rc, rl; BRZ rt, back to the AI
+					m_delay_loop = false;
+
+					if (spu_delay_loops() && (op & 0xffffff80) == 0x01a00400 && m_pos >= start + 4 && m_pos + 12 <= end)
+					{
+						const spu_opcode_t add{std::bit_cast<be_t<u32>>(func.data[(m_pos - start) / 4 - 1])};
+						const spu_opcode_t ceq{std::bit_cast<be_t<u32>>(func.data[(m_pos - start) / 4 + 1])};
+						const spu_opcode_t brz{std::bit_cast<be_t<u32>>(func.data[(m_pos - start) / 4 + 2])};
+						const u32 rx = op & 0x7f;
+
+						if ((add.opcode >> 24) == 0x1c && add.si10 == 1 && add.ra == add.rt && (ceq.opcode >> 21) == 0x3c0 && ceq.ra == add.rt &&
+							(brz.opcode >> 23) == 0x40 && brz.rt == ceq.rt && static_cast<s32>(static_cast<s16>(brz.i16)) == -3 &&
+							rx != add.rt && rx != ceq.rb && ceq.rb != add.rt && ceq.rt != add.rt && ceq.rt != ceq.rb)
+						{
+							m_delay_loop = true;
+							m_delay_loop_counter = add.rt;
+							m_delay_loop_limit = ceq.rb;
+						}
+					}
+
 					switch (m_inst_attrs[(m_pos - start) / 4])
 					{
 					case inst_attr::putllc0:
@@ -5811,19 +5851,57 @@ public:
 #if defined(ARCH_X64) || defined(ARCH_ARM64)
 			if (utils::get_tsc_freq() && !(g_cfg.core.spu_loop_detection) && (g_cfg.core.clocks_scale == 100))
 			{
-				const auto timebase_offs = m_ir->CreateLoad(get_type<u64>(), m_ir->CreateIntToPtr(m_ir->getInt64(reinterpret_cast<u64>(&g_timebase_offs)), get_type<u64*>()));
-				const auto timestamp = m_ir->CreateLoad(get_type<u64>(), spu_ptr(&spu_thread::ch_dec_start_timestamp));
-				const auto dec_value = m_ir->CreateLoad(get_type<u32>(), spu_ptr(&spu_thread::ch_dec_value));
-				const auto tsc = m_ir->CreateCall(get_intrinsic(llvm::Intrinsic::readcyclecounter));
-				const auto tscx = m_ir->CreateMul(m_ir->CreateUDiv(tsc, m_ir->getInt64(utils::get_tsc_freq())), m_ir->getInt64(80000000));
-				const auto tscm = m_ir->CreateUDiv(m_ir->CreateMul(m_ir->CreateURem(tsc, m_ir->getInt64(utils::get_tsc_freq())), m_ir->getInt64(80000000)), m_ir->getInt64(utils::get_tsc_freq()));
-				const auto tsctb = m_ir->CreateSub(m_ir->CreateAdd(tscx, tscm), timebase_offs);
-				const auto frz = m_ir->CreateLoad(get_type<u8>(), spu_ptr(&spu_thread::is_dec_frozen));
-				const auto frzev = m_ir->CreateICmpEQ(frz, m_ir->getInt8(0));
+				const auto read = [&]() -> llvm::Value*
+				{
+					const auto timebase_offs = m_ir->CreateLoad(get_type<u64>(), m_ir->CreateIntToPtr(m_ir->getInt64(reinterpret_cast<u64>(&g_timebase_offs)), get_type<u64*>()));
+					const auto timestamp = m_ir->CreateLoad(get_type<u64>(), spu_ptr(&spu_thread::ch_dec_start_timestamp));
+					const auto dec_value = m_ir->CreateLoad(get_type<u32>(), spu_ptr(&spu_thread::ch_dec_value));
+					const auto tsc = m_ir->CreateCall(get_intrinsic(llvm::Intrinsic::readcyclecounter));
+					const auto tscx = m_ir->CreateMul(m_ir->CreateUDiv(tsc, m_ir->getInt64(utils::get_tsc_freq())), m_ir->getInt64(80000000));
+					const auto tscm = m_ir->CreateUDiv(m_ir->CreateMul(m_ir->CreateURem(tsc, m_ir->getInt64(utils::get_tsc_freq())), m_ir->getInt64(80000000)), m_ir->getInt64(utils::get_tsc_freq()));
+					const auto tsctb = m_ir->CreateSub(m_ir->CreateAdd(tscx, tscm), timebase_offs);
+					const auto frz = m_ir->CreateLoad(get_type<u8>(), spu_ptr(&spu_thread::is_dec_frozen));
+					const auto frzev = m_ir->CreateICmpEQ(frz, m_ir->getInt8(0));
 
-				const auto delta = m_ir->CreateTrunc(m_ir->CreateSub(tsctb, timestamp), get_type<u32>());
-				const auto deltax = m_ir->CreateSelect(frzev, delta, m_ir->getInt32(0));
-				res.value = m_ir->CreateSub(dec_value, deltax);
+					const auto delta = m_ir->CreateTrunc(m_ir->CreateSub(tsctb, timestamp), get_type<u32>());
+					const auto deltax = m_ir->CreateSelect(frzev, delta, m_ir->getInt32(0));
+					return m_ir->CreateSub(dec_value, deltax);
+				};
+
+				if (m_delay_loop)
+				{
+					// A delay loop does nothing with the value but in its last turn: the others take the value the
+					// decrementer was set to (no time read: 40 host cycles against the SPU's 8 for a turn), and every
+					// 16th turn waits with a PAUSE, which brings 2,400 turns to about the console's 6 microseconds
+					const auto counter = m_ir->CreateExtractElement(get_reg_fixed<u32[4]>(m_delay_loop_counter).value, 3);
+					const auto limit = m_ir->CreateExtractElement(get_reg_fixed<u32[4]>(m_delay_loop_limit).value, 3);
+					const auto last = llvm::BasicBlock::Create(m_context, "", m_function);
+					const auto turn = llvm::BasicBlock::Create(m_context, "", m_function);
+					const auto wait = llvm::BasicBlock::Create(m_context, "", m_function);
+					const auto skip = llvm::BasicBlock::Create(m_context, "", m_function);
+					const auto next = llvm::BasicBlock::Create(m_context, "", m_function);
+					m_ir->CreateCondBr(m_ir->CreateICmpEQ(counter, limit), last, turn, m_md_unlikely);
+					m_ir->SetInsertPoint(last);
+					const auto exact = read();
+					const auto last_end = m_ir->GetInsertBlock();
+					m_ir->CreateBr(next);
+					m_ir->SetInsertPoint(turn);
+					const auto stale = m_ir->CreateLoad(get_type<u32>(), spu_ptr(&spu_thread::ch_dec_value));
+					m_ir->CreateCondBr(m_ir->CreateICmpEQ(m_ir->CreateAnd(counter, 15), m_ir->getInt32(0)), wait, skip, m_md_unlikely);
+					m_ir->SetInsertPoint(wait);
+					m_ir->CreateCall(llvm::Intrinsic::getOrInsertDeclaration(m_module, llvm::Intrinsic::x86_sse2_pause));
+					m_ir->CreateBr(skip);
+					m_ir->SetInsertPoint(skip);
+					m_ir->CreateBr(next);
+					m_ir->SetInsertPoint(next);
+					const auto value = m_ir->CreatePHI(get_type<u32>(), 2);
+					value->addIncoming(exact, last_end);
+					value->addIncoming(stale, skip);
+					res.value = value;
+					break;
+				}
+
+				res.value = read();
 				break;
 			}
 #endif

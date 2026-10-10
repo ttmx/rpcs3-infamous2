@@ -53,6 +53,7 @@ namespace vk
 		std::optional<std::tuple<VkDeviceSize, VkIndexType>> index_info;
 		bool static_vertices = false;  // Persistent stream is in the geometry cache's buffer, not the ring
 		bool static_indices = false;   // Same for the index data
+		bool spu_indices = false;      // The index data is in the SPU upload heap's swapped twin (spu_upload.h)
 		s8 spu_window = -1;            // Persistent stream is in this window of the SPU upload heap (spu_upload.h)
 		std::array<u32, 8> spu_block_offsets{}; // and each interleaved block starts at this offset in the window
 	};
