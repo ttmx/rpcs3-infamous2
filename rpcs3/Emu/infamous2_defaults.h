@@ -45,6 +45,8 @@ namespace infamous2
 			{"RPCS3_RSX_STREAM_VERTEX_COPY", "1"},
 			{"RPCS3_SPU_VERTEX_UPLOAD", "1"},
 			{"RPCS3_SPURS_RESERVE", "1"},
+			{"RPCS3_GOW3_SIX_SPUS", "1"},
+			{"RPCS3_SPU_VERIFY_ONCE", "1"},
 		};
 
 		for (const entry& e : defaults)

@@ -2508,28 +2508,35 @@ bool ppu_load_exec(const ppu_exec_object& elf, bool virtual_load, const std::str
 	// God of War III (BCES00510 1.03): its mesh processing ("MeshProc") runs the geometry jobs of every draw on three
 	// SPUs: output rings for three workers, three job queues with priorities 5 5 5 0 0 for the five SPURS SPUs, and a
 	// worker count of 3 per queue, all constants in one set-up function, while its structures have room for six
-	// workers. RPCS3_GOW3_FIVE_SPUS=1 sets five everywhere. Off by default: on an eight core host at 30 W the first
-	// fight is the same within the spread between boots (57.0 against 56.3 FPS, three boots each), with more SPU
-	// time used. Not when a savestate is loaded: the set-up has run by then.
+	// workers. Not when a savestate is loaded: the set-up has run by then.
+	// RPCS3_GOW3_SIX_SPUS=1: the game's SPURS instance gets a sixth SPU (the console has six in all, and the game
+	// uses five here and one in a second instance) that runs geometry jobs and nothing else: the game's other
+	// workloads keep buffers per SPU for five. Rings and count for six, priorities 5 5 5 0 0 5. About 1.4 FPS in the
+	// first fight on an eight core host at 30 W (54.9 against 53.5, three pairs of sessions).
+	// RPCS3_GOW3_FIVE_SPUS=1: geometry on all five SPUs instead, 57.0 against 56.3 FPS (three boots each). Off.
 	if (!ar && hash == "PPU-4d5c51503a81a327c2a99427390a395b8dcb3767")
 	{
-		static const bool five_spus = []
+		const auto enabled = [](const char* name)
 		{
-			const char* option = std::getenv("RPCS3_GOW3_FIVE_SPUS");
+			const char* option = std::getenv(name);
 			return option && option[0] == '1' && !option[1];
-		}();
+		};
 
-		struct word_t { u32 addr, original, patched; };
+		static const bool six_spus = enabled("RPCS3_GOW3_SIX_SPUS");
+		static const bool five_spus = !six_spus && enabled("RPCS3_GOW3_FIVE_SPUS");
+
+		struct word_t { u32 addr, original, five, six; };
 
 		static constexpr word_t words[]
 		{
-			{0x0028dd08, 0x38600003, 0x38600005}, // li r3, 5: output rings and command buffers for five workers
-			{0x0028dd2c, 0x3a600003, 0x3a600005}, // li r19, 5: the worker count stored for each queue
-			{0x0028de08, 0xfb410070, 0x3c000505}, // std r26, 112(r1)  ->  lis r0, 0x0505
-			{0x0028de0c, 0x9a410077, 0x60000505}, // stb r18, 119(r1)  ->  ori r0, r0, 0x0505
-			{0x0028de10, 0x9b210070, 0x90010070}, // stb r25, 112(r1)  ->  stw r0, 112(r1): priority 5 on SPU 0 to 3
-			{0x0028de14, 0x9b210071, 0x92410074}, // stb r25, 113(r1)  ->  stw r18, 116(r1): zeros and the 3 of the last byte
-			{0x0028de18, 0x9b210072, 0x9b210074}, // stb r25, 114(r1)  ->  stb r25, 116(r1): priority 5 on SPU 4
+			{0x0028ec7c, 0x38c00005, 0x38c00005, 0x38c00006}, // li r6, 5: the SPU count of the SPURS instance
+			{0x0028dd08, 0x38600003, 0x38600005, 0x38600006}, // li r3, 3: output rings and command buffers per worker
+			{0x0028dd2c, 0x3a600003, 0x3a600005, 0x3a600006}, // li r19, 3: the worker count stored for each queue
+			{0x0028de08, 0xfb410070, 0x3c000505, 0x3c000505}, // std r26, 112(r1)  ->  lis r0, 0x0505
+			{0x0028de0c, 0x9a410077, 0x60000505, 0x60000500}, // stb r18, 119(r1)  ->  ori r0, r0, 0x0505 or 0x0500
+			{0x0028de10, 0x9b210070, 0x90010070, 0x90010070}, // stb r25, 112(r1)  ->  stw r0, 112(r1): priorities of SPU 0 to 3
+			{0x0028de14, 0x9b210071, 0x92410074, 0x92410074}, // stb r25, 113(r1)  ->  stw r18, 116(r1): zeros and the 3 of the last byte
+			{0x0028de18, 0x9b210072, 0x9b210074, 0x9b210075}, // stb r25, 114(r1)  ->  stb r25, 116(r1) or 117(r1): priority 5 on SPU 4 or 5
 		};
 
 		bool original = true;
@@ -2540,18 +2547,30 @@ bool ppu_load_exec(const ppu_exec_object& elf, bool virtual_load, const std::str
 			original = original && ptr && *ptr == w.original;
 		}
 
-		if (five_spus && original)
+		if ((five_spus || six_spus) && original)
 		{
 			for (const auto& w : words)
 			{
-				*_main.get_ptr<be_t<u32>>(w.addr, 4) = w.patched;
+				*_main.get_ptr<be_t<u32>>(w.addr, 4) = six_spus ? w.six : w.five;
 			}
 
-			ppu_loader.success("God of War III: geometry jobs on five SPUs");
+			if (six_spus)
+			{
+				// One SPU thread more than the console has, for the geometry workloads (10 to 12) only
+#ifdef _WIN32
+				_putenv_s("RPCS3_SPU_EXTRA_THREADS", "1");
+				_putenv_s("RPCS3_SPURS_EXTRA_WORKLOADS", "1c00");
+#else
+				::setenv("RPCS3_SPU_EXTRA_THREADS", "1", 0);
+				::setenv("RPCS3_SPURS_EXTRA_WORKLOADS", "1c00", 0);
+#endif
+			}
+
+			ppu_loader.success("God of War III: geometry jobs on %s", six_spus ? "a sixth SPU" : "five SPUs");
 		}
-		else if (five_spus)
+		else if (five_spus || six_spus)
 		{
-			ppu_loader.warning("God of War III: the mesh set-up code is not as expected, geometry jobs stay on three SPUs");
+			ppu_loader.warning("God of War III: the set-up code is not as expected, geometry jobs stay on three SPUs");
 		}
 	}
 

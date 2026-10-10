@@ -1331,8 +1331,34 @@ void spu_thread::cpu_on_stop()
 	}
 }
 
+// 0 = off, 1 = on, 2 = every comparison still runs and a failed one that would have been skipped is reported
+u32 spu_verify_once_mode()
+{
+	static const u32 mode = []() -> u32
+	{
+		const char* option = std::getenv("RPCS3_SPU_VERIFY_ONCE");
+		return option && (option[0] == '1' || option[0] == '2') && !option[1] ? option[0] - '0' : 0;
+	}();
+
+	return mode;
+}
+
+void spu_thread::code_changed()
+{
+	std::memset(code_lines, 0, sizeof(code_lines));
+	code_noted = false;
+
+	if (!++code_gen)
+	{
+		verify_cache.fill(0);
+		code_gen = 1;
+	}
+}
+
 void spu_thread::cpu_init()
 {
+	code_changed();
+
 	std::memset(gpr.data(), 0, gpr.size() * sizeof(gpr[0]));
 	fpscr.Reset();
 
@@ -2426,6 +2452,47 @@ namespace spurs_reserve
 	static void on_getllar(spu_thread& spu, u32 addr)
 	{
 		static const bool wanted = std::getenv("RPCS3_SPURS_RESERVE") != nullptr || std::getenv("RPCS3_VK_LIVE_CTL") != nullptr;
+
+		// An SPU the console did not have (see RPCS3_SPU_EXTRA_THREADS) only takes the workloads of this mask
+		// (RPCS3_SPURS_EXTRA_WORKLOADS=<hex>): a game's other workloads may keep state per SPU for the number it knew
+		static const u32 extra_workloads = []() -> u32
+		{
+			const char* option = std::getenv("RPCS3_SPURS_EXTRA_WORKLOADS");
+			return option ? static_cast<u32>(std::strtoul(option, nullptr, 16)) | 0x10000 : 0;
+		}();
+
+		if (extra_workloads) [[unlikely]]
+		{
+			be_t<u32> own;
+			std::memcpy(&own, spu.ls + 0x1c4, 4);
+
+			if (own == addr && addr && vm::check_addr(addr, vm::page_writable, 0x2000))
+			{
+				u8* sp = vm::_ptr<u8>(addr);
+
+				for (u32 wid = 0; wid < 16; wid++)
+				{
+					if (extra_workloads & (1u << wid)) continue;
+
+					const auto table = reinterpret_cast<atomic_t<u64>*>(sp + 0xb00 + wid * 32 + 0x18);
+					const u64 old = table->load();
+					u8 p[8];
+					std::memcpy(p, &old, 8);
+					if (!p[5]) continue;
+
+					p[5] = 0;
+					u64 changed;
+					std::memcpy(&changed, p, 8);
+
+					if (table->compare_and_swap_test(old, changed))
+					{
+						reinterpret_cast<atomic_t<u8>*>(sp + 0xbd)->release(0xff);
+						reinterpret_cast<atomic_t<u8>*>(sp + 0x72)->release(0xff);
+					}
+				}
+			}
+		}
+
 		if (!wanted) [[likely]] return;
 
 		// The kernel context holds the structure's address at 0x1c0
@@ -2705,7 +2772,7 @@ void spu_thread::do_dma_transfer(spu_thread* _this, const spu_mfc_cmd& args, u8*
 					{
 						if (id != 0x1000000) return;
 						const bool waits = !!(ppu.state.load() & (cpu_flag::wait + cpu_flag::suspend + cpu_flag::stop));
-						main_state = (waits || ppu.cia == 0x2eafe8 || ppu.cia == 0x22fb28) ? ppu.cia : 0;
+						main_state = (waits || ppu.cia == 0x2eafe8 || ppu.cia == 0x22fb28 || ppu.cia == 0x21eb08 || ppu.cia == 0x228f00 || ppu.cia == 0x230048 || ppu.cia == 0x2303e4) ? ppu.cia : 0;
 					});
 					running_now.clear();
 					idm::select<named_thread<spu_thread>>([&](u32, spu_thread& spu)
@@ -2733,7 +2800,7 @@ void spu_thread::do_dma_transfer(spu_thread* _this, const spu_mfc_cmd& args, u8*
 					{
 						const bool waits = !!(ppu.state.load() & (cpu_flag::wait + cpu_flag::suspend + cpu_flag::stop));
 						ppu_counts[{id, ppu.cia, waits ? 1 : 0}]++;
-						if (id == 0x1000000 && (waits || ppu.cia == 0x2eafe8 || ppu.cia == 0x22fb28))
+						if (id == 0x1000000 && (waits || ppu.cia == 0x2eafe8 || ppu.cia == 0x22fb28 || ppu.cia == 0x21eb08 || ppu.cia == 0x228f00 || ppu.cia == 0x230048 || ppu.cia == 0x2303e4))
 						{
 							// Who the main thread waits for: the return addresses up its stack (read while it sleeps)
 							std::array<u32, 7> chain{ppu.cia, static_cast<u32>(ppu.lr)};
@@ -2809,6 +2876,31 @@ void spu_thread::do_dma_transfer(spu_thread* _this, const spu_mfc_cmd& args, u8*
 								std::fprintf(f, " priority");
 								for (u32 i = 0; i < 16; i++) std::fprintf(f, " %x", ls[0x1a0 + i]);
 								std::fprintf(f, "\n");
+
+								// The MFC command it issued last, its link register and stack chain, and its local store in a
+								// file of its own, for a thread that stands at a transfer
+								std::fprintf(f, "  mfc cmd %x eal %x lsa %x size %x lr %x stack", static_cast<u32>(spu.ch_mfc_cmd.cmd), spu.ch_mfc_cmd.eal, spu.ch_mfc_cmd.lsa, spu.ch_mfc_cmd.size, spu.gpr[0]._u32[3]);
+								for (u32 sp = spu.gpr[1]._u32[3] & 0x3fff0, depth = 0; depth < 8 && sp; depth++)
+								{
+									be_t<u32> back, link;
+									std::memcpy(&back, ls + sp, 4);
+									std::memcpy(&link, ls + ((sp + 16) & 0x3fff0), 4);
+									std::fprintf(f, " %x", +link);
+									if (back <= sp) break;
+									sp = back & 0x3fff0;
+								}
+								std::fprintf(f, "\n");
+
+								if (FILE* dump = std::fopen(fmt::format("%s.ls%u", sampler_path, +number & 7).c_str(), "wb"); dump && spu.lv2_id != 0x200)
+								{
+									std::fwrite(ls, 1, 0x40000, dump);
+									std::fwrite(spu.gpr.data(), 1, sizeof(spu.gpr), dump);
+									std::fclose(dump);
+								}
+								else if (dump)
+								{
+									std::fclose(dump);
+								}
 							});
 
 							if (spurs_addr && vm::check_addr(spurs_addr, vm::page_readable, 0x2000))
@@ -6227,6 +6319,37 @@ u32 evaluate_spin_optimization(std::span<u8> stats, u64 evaluate_time, const cfg
 
 bool spu_thread::process_mfc_cmd()
 {
+	// Every command that writes to the local store: GET, GETLLAR and the list forms, whose elements follow each
+	// other from the address on, each rounded up to 16 bytes
+	if (ch_mfc_cmd.cmd & MFC_GET_CMD) [[unlikely]]
+	{
+		if (vk::live_ctl::get(23) & 4) [[unlikely]]
+		{
+			code_changed();
+		}
+		else if (code_noted)
+		{
+			u32 size = ch_mfc_cmd.cmd == MFC_GETLLAR_CMD ? 128 : ch_mfc_cmd.size;
+
+			if (ch_mfc_cmd.cmd != MFC_GETLLAR_CMD && (ch_mfc_cmd.cmd & MFC_LIST_MASK))
+			{
+				size = 0;
+
+				for (u32 i = 0; i + 8 <= ch_mfc_cmd.size; i += 8)
+				{
+					be_t<u16> element;
+					std::memcpy(&element, ls + ((ch_mfc_cmd.eal + i) & 0x3fff8) + 2, 2);
+					size += utils::align<u32>(element & 0x7fff, 16);
+				}
+			}
+
+			if (size)
+			{
+				ls_written(ch_mfc_cmd.lsa & (ch_mfc_cmd.cmd == MFC_GETLLAR_CMD ? 0x3ff80 : 0x3fff0), size);
+			}
+		}
+	}
+
 	const spu_job_capture::atomic_scope capture_scope{*this, static_cast<u32>(ch_mfc_cmd.cmd), ch_mfc_cmd.eal, ch_mfc_cmd.lsa};
 
 	// Stall infinitely if MFC queue is full

@@ -882,6 +882,7 @@ namespace spu_native_geometry
 		return 1;
 	}
 
+
 	struct kernel
 	{
 		u32 entry;    // first instruction of the region
@@ -908,7 +909,7 @@ namespace spu_native_geometry
 	};
 
 	// Diagnostic for writing a kernel (RPCS3_SPU_REGION_CAPTURE=<directory>,<pc hex>,<first instruction hex>[,<every>]):
-	// registers and local store at up to 200 arrivals at that instruction (every n-th), as region-NNNN.bin
+	// registers and local store at up to 200 arrivals at that instruction (every n-th; instruction 0 = whatever is there), as region-NNNN.bin
 	// ("SPUR", pc, 128 registers, local store). The SPU code runs on as usual.
 	struct region_capture
 	{
@@ -972,7 +973,7 @@ namespace spu_native_geometry
 	// The kernel whose region starts with these instructions at this address, if any
 	inline const kernel* find(u32 pc, std::span<const u32> words_from_pc)
 	{
-		if (const auto& capture = region_capture::get(); capture.pc && capture.pc == pc && !words_from_pc.empty() && words_from_pc[0] == capture.word) [[unlikely]]
+		if (const auto& capture = region_capture::get(); capture.pc && capture.pc == pc && !words_from_pc.empty() && (!capture.word || words_from_pc[0] == capture.word)) [[unlikely]]
 		{
 			return &capture_kernel;
 		}

@@ -171,6 +171,7 @@ bool serialize<ppu_thread::cr_bits>(utils::serial& ar, typename ppu_thread::cr_b
 extern void ppu_initialize();
 extern void ppu_finalize(const ppu_module<lv2_obj>& info, bool force_mem_release = false);
 extern bool ppu_initialize(const ppu_module<lv2_obj>& info, bool check_only = false, u64 file_size = 0);
+extern bool ppu_spin_pause();
 static void ppu_initialize2(class jit_compiler& jit, const ppu_module<lv2_obj>& module_part, const std::string& cache_path, const std::string& obj_name);
 extern bool ppu_load_exec(const ppu_exec_object&, bool virtual_load, const std::string&, utils::serial* = nullptr);
 extern std::pair<shared_ptr<lv2_overlay>, CellError> ppu_load_overlay(const ppu_exec_object&, bool virtual_load, const std::string& path, s64 file_offset, utils::serial* = nullptr);
@@ -5586,7 +5587,7 @@ bool ppu_initialize(const ppu_module<lv2_obj>& info, bool check_only, u64 file_s
 				settings += ppu_settings::daz_and_ftz;
 
 			// Write version, hash, CPU, settings
-			fmt::append(obj_name, "v8-kusa-%s-%s-%s.obj", fmt::base57(output, 16), fmt::base57(settings), jit_compiler::cpu(g_cfg.core.llvm_cpu.to_string()));
+			fmt::append(obj_name, "v8-kusa%s-%s-%s-%s.obj", ppu_spin_pause() ? "-pause" : "", fmt::base57(output, 16), fmt::base57(settings), jit_compiler::cpu(g_cfg.core.llvm_cpu.to_string()));
 		}
 
 		if (cpu ? cpu->state.all_of(cpu_flag::exit) : Emu.IsStopped())

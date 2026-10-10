@@ -796,6 +796,49 @@ public:
 	u64 block_recover = 0;
 	u64 block_failure = 0;
 
+	// Code verification once per change of the local store (RPCS3_SPU_VERIFY_ONCE). A recompiled chunk compares the
+	// code in the local store with what it was compiled from every time it is entered. With this, a chunk that has
+	// passed the comparison notes it in verify_cache (indexed by the entry's pc: its identifier and code_gen), and
+	// its 128-byte lines in code_lines; an entry that finds its note skips the comparison. The emulator's own writes
+	// to the local store (transfers) start another generation when they touch a noted line. Stores of the SPU
+	// program itself into code that was already run are not seen (mode 2 runs every comparison and reports those).
+	u32 code_gen = 1;
+	u8 verify_hit = 0;
+	bool code_noted = false;
+	u64 code_lines[32]{};
+	std::array<u64, 0x10000> verify_cache{};
+
+	void code_changed();
+
+	// The emulator wrote size bytes of the local store at lsa
+	void ls_written(u32 lsa, u32 size)
+	{
+		if (!code_noted) [[likely]]
+		{
+			return;
+		}
+
+		if (size >= SPU_LS_SIZE)
+		{
+			code_changed();
+			return;
+		}
+
+		for (u32 line = (lsa % SPU_LS_SIZE) >> 7, last = ((lsa + size - 1) % SPU_LS_SIZE) >> 7;; line = (line + 1) & 0x7ff)
+		{
+			if (code_lines[line >> 6] & (1ull << (line & 63)))
+			{
+				code_changed();
+				return;
+			}
+
+			if (line == last)
+			{
+				return;
+			}
+		}
+	}
+
 	rpcs3::hypervisor_context_t hv_ctx; // NOTE: The offset within the class must be within the first 1MiB
 
 	u64 ftx = 0; // Failed transactions

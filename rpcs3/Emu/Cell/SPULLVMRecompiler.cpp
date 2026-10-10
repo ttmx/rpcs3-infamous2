@@ -41,7 +41,8 @@
 #include "util/simd.hpp"
 #include "util/sysinfo.hpp"
 
-const extern spu_decoder<spu_itype> g_spu_itype;
+const extern u32 spu_verify_once_mode();
+extern spu_decoder<spu_itype> g_spu_itype;
 const extern spu_decoder<spu_iname> g_spu_iname;
 const extern spu_decoder<spu_iflag> g_spu_iflag;
 
@@ -2607,6 +2608,7 @@ public:
 			+ (g_spu_04ac8_contribution_trace ? "-trace-04ac8-Hc9ev2Q8JGX0Fcwtuv18zKbed58C-tree-v4" : "")
 			+ (g_spu_native_rwv_experiment ? "-native-rwv-v1" : "")
 			+ (spu_native_geometry::enabled() ? "-native-geometry-v8" : "")
+			+ (spu_verify_once_mode() == 1 ? "-verify-once-v1" : spu_verify_once_mode() == 2 ? "-verify-once-check-v1" : "")
 			+ (spu_native_geometry::region_capture::get().pc ? "-region-capture" : "")
 			+ (spu_xfloat_fast_mode() && g_cfg.core.spu_xfloat_accuracy == xfloat_accuracy::accurate ? (spu_xfloat_fast_mode() == 2 ? "-xfloat-fast-check-v3" : "-xfloat-fast-v2") : "")
 			+ (g_spu_native_sxe_experiment ? "-native-sxe-v1" : "")
@@ -2635,8 +2637,24 @@ public:
 		// Start compilation
 		const auto label_test = BasicBlock::Create(m_context, "", m_function);
 		const auto label_diff = BasicBlock::Create(m_context, "", m_function);
-		const auto label_body = BasicBlock::Create(m_context, "", m_function);
+		auto label_body = BasicBlock::Create(m_context, "", m_function);
 		const auto label_stop = BasicBlock::Create(m_context, "", m_function);
+
+		// Verification once per change of the local store (see spu_thread::verify_cache): the chunk's note is its
+		// identifier (from its hash) and the thread's generation
+		const u32 verify_once = func.data.size() > 2 && g_cfg.core.spu_verification ? spu_verify_once_mode() : 0;
+		const auto label_run = label_body;
+		u64 verify_id = 0;
+
+		if (verify_once)
+		{
+			u32 id = 0x811c9dc5;
+			for (const char c : m_hash) id = (id ^ static_cast<u8>(c)) * 0x01000193;
+			verify_id = u64{id | 1} << 32;
+
+			// What the comparison branches to when it passes
+			label_body = BasicBlock::Create(m_context, "", m_function);
+		}
 
 		// Load PC, which will be the actual value of 'm_base'
 		m_base_pc = m_ir->CreateLoad(get_type<u32>(), spu_ptr(&spu_thread::pc));
@@ -2648,6 +2666,28 @@ public:
 		// Emit code check
 		u32 check_iterations = 0;
 		m_ir->SetInsertPoint(label_test);
+
+		llvm::Value* verify_note = nullptr;
+		llvm::Value* verify_slot = nullptr;
+
+		if (verify_once)
+		{
+			const auto index = m_ir->CreateAnd(m_ir->CreateLShr(m_base_pc, 2), 0xffff);
+			verify_slot = m_ir->CreateGEP(get_type<u64>(), spu_ptr(&spu_thread::verify_cache), m_ir->CreateZExt(index, get_type<u64>()));
+			verify_note = m_ir->CreateOr(m_ir->CreateZExt(m_ir->CreateLoad(get_type<u32>(), spu_ptr(&spu_thread::code_gen)), get_type<u64>()), m_ir->getInt64(verify_id));
+			const auto noted = m_ir->CreateICmpEQ(m_ir->CreateLoad(get_type<u64>(), verify_slot), verify_note);
+
+			if (verify_once == 1)
+			{
+				const auto label_compare = BasicBlock::Create(m_context, "", m_function);
+				m_ir->CreateCondBr(noted, label_run, label_compare, m_md_likely);
+				m_ir->SetInsertPoint(label_compare);
+			}
+			else
+			{
+				m_ir->CreateStore(m_ir->CreateZExt(noted, get_type<u8>()), spu_ptr(&spu_thread::verify_hit));
+			}
+		}
 
 		// Set block hash for profiling (if enabled)
 		if ((g_cfg.core.spu_prof || g_cfg.core.spu_debug) && g_cfg.core.spu_verification)
@@ -3306,6 +3346,15 @@ public:
 		}
 
 		// Increase block counter with statistics
+		if (verify_once)
+		{
+			// The comparison passed: note it and the pages of the code
+			m_ir->SetInsertPoint(label_body);
+			call("spu_code_verified", &exec_code_verified, m_thread, m_ir->CreateAnd(get_pc(start), 0x3fffc), m_ir->getInt32(end - start), verify_slot, verify_note);
+			m_ir->CreateBr(label_run);
+			label_body = label_run;
+		}
+
 		m_ir->SetInsertPoint(label_body);
 		if (!g_spu_capture_directory.empty()
 			&& (m_hash.find(g_spu_capture_hash) != std::string::npos
@@ -3391,6 +3440,11 @@ public:
 		m_ir->CreateRetVoid();
 
 		m_ir->SetInsertPoint(label_diff);
+
+		if (verify_once == 2)
+		{
+			call("spu_code_verify_missed", &exec_code_verify_missed, m_thread);
+		}
 		if (g_spu_04ac8_contribution_trace)
 			call("spu_04ac8_tree_abort", &spu_04ac8_tree_abort, m_thread);
 
@@ -5467,6 +5521,54 @@ public:
 		return spu_runtime::g_interpreter;
 	}
 
+	static void exec_ls_written(spu_thread* _spu, u32 lsa, u32 size)
+	{
+		if (vk::live_ctl::get(23) & 4) [[unlikely]]
+		{
+			// Switched off: the notes of before end with the next transfer
+			_spu->code_changed();
+			return;
+		}
+
+		_spu->ls_written(lsa, size);
+	}
+
+	static void exec_code_verified(spu_thread* _spu, u32 start, u32 size, u64* slot, u64 note)
+	{
+		// A RawSPU's local store is guest memory that every thread can write. Live control 23, bit 2: no notes
+		if (_spu->get_type() != spu_type::threaded || !size || size > SPU_LS_SIZE || (vk::live_ctl::get(23) & 4))
+		{
+			return;
+		}
+
+		for (u32 line = (start % SPU_LS_SIZE) >> 7, last = ((start + size - 1) % SPU_LS_SIZE) >> 7;; line = (line + 1) & 0x7ff)
+		{
+			_spu->code_lines[line >> 6] |= 1ull << (line & 63);
+
+			if (line == last)
+			{
+				break;
+			}
+		}
+
+		_spu->code_noted = true;
+
+		*slot = note;
+	}
+
+	static void exec_code_verify_missed(spu_thread* _spu)
+	{
+		if (_spu->verify_hit)
+		{
+			static atomic_t<u32> s_count{0};
+
+			if (s_count++ < 16)
+			{
+				spu_log.error("Code verification: the chunk at 0x%x has changed since its comparison passed and no transfer was seen (generation %u)", _spu->pc, _spu->code_gen);
+			}
+		}
+	}
+
 	static bool exec_check_state(spu_thread* _spu)
 	{
 		return spu_04ac8_tree_check_state(_spu);
@@ -6292,6 +6394,11 @@ public:
 					if (cmd & MFC_GET_CMD)
 					{
 						std::swap(src, dst);
+
+						if (spu_verify_once_mode())
+						{
+							call("spu_ls_written", &exec_ls_written, m_thread, lsa.value, m_ir->CreateZExt(size.value, get_type<u32>()));
+						}
 					}
 
 					llvm::Value* barrier = m_ir->CreateLoad(get_type<u32>(), pb);

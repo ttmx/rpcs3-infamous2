@@ -2290,6 +2290,17 @@ void PPUTranslator::ADDIS(ppu_opcode_t op)
 	SetGpr(op.rd, op.ra ? m_ir->CreateAdd(GetGpr(op.ra), imm) : imm);
 }
 
+bool ppu_spin_pause()
+{
+	static const bool enabled = []
+	{
+		const char* option = std::getenv("RPCS3_PPU_SPIN_PAUSE");
+		return option && option[0] == '1' && !option[1];
+	}();
+
+	return enabled;
+}
+
 void PPUTranslator::BC(ppu_opcode_t op)
 {
 	const s32 bt14 = op.bt14; // Workaround for VS 16.5
@@ -2303,6 +2314,48 @@ void PPUTranslator::BC(ppu_opcode_t op)
 	if (op.lk)
 	{
 		m_ir->CreateStore(GetAddr(+4), m_ir->CreateStructGEP(m_thread_type, m_thread, static_cast<uint>(&m_lr - m_locals)));
+	}
+
+	// A loop that only reads memory and compares until another thread changes it (God of War III's main thread waits
+	// for its SPU jobs in three of them, 40% of its time): two PAUSE per turn with RPCS3_PPU_SPIN_PAUSE=1. The
+	// wait ends 30 ns later at most; the core draws less meanwhile and leaves more to its other hardware thread.
+	if (ppu_spin_pause() && !op.lk && !op.aa && bt14 < 0 && bt14 >= -96 && !m_reloc)
+	{
+		bool waits = true;
+		u32 loads = 0;
+
+		for (u64 addr = target; addr < m_addr && waits; addr += 4)
+		{
+			const auto word = m_info.get_ptr<u32>(::narrow<u32>(addr));
+			const ppu_opcode_t inner{word ? static_cast<u32>(*word) : 0u};
+
+			switch (g_ppu_itype.decode(inner.opcode))
+			{
+			case ppu_itype::LBZ:
+			case ppu_itype::LHZ:
+			case ppu_itype::LWZ:
+				loads++;
+				break;
+			case ppu_itype::CMPI:
+			case ppu_itype::CMPLI:
+			case ppu_itype::CMP:
+			case ppu_itype::CMPL:
+				break;
+			case ppu_itype::ORI:
+				waits = inner.opcode == ppu_instructions::NOP();
+				break;
+			default:
+				waits = false;
+				break;
+			}
+		}
+
+		if (waits && loads)
+		{
+			const auto pause = llvm::Intrinsic::getOrInsertDeclaration(m_module, llvm::Intrinsic::x86_sse2_pause);
+			m_ir->CreateCall(pause);
+			m_ir->CreateCall(pause);
+		}
 	}
 
 	UseCondition(CheckBranchProbability(op.bo), CheckBranchCondition(op.bo, op.bi));

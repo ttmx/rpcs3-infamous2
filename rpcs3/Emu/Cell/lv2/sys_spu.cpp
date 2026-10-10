@@ -416,6 +416,19 @@ struct spu_limits_t
 
 	SAVESTATE_INIT_POS(47);
 
+	// SPU threads allowed beyond the console's six (RPCS3_SPU_EXTRA_THREADS=<n>): a host with more cores can give a
+	// game's SPURS instance an SPU the PS3 did not have
+	static u32 extra_threads()
+	{
+		static const u32 extra = []() -> u32
+		{
+			const char* option = std::getenv("RPCS3_SPU_EXTRA_THREADS");
+			return option && option[0] >= '0' && option[0] <= '2' && !option[1] ? option[0] - '0' : 0;
+		}();
+
+		return extra;
+	}
+
 	bool check_valid(const limits_data& init) const
 	{
 		const u32 physical_spus_count = init.physical;
@@ -424,7 +437,7 @@ struct spu_limits_t
 		const u32 spu_limit = init.spu_limit != umax ? init.spu_limit : max_spu;
 		const u32 raw_limit = init.raw_limit != umax ? init.raw_limit : max_raw;
 
-		if (spu_limit + raw_limit > 6 || physical_spus_count > spu_limit || controllable_spu_count > spu_limit)
+		if (spu_limit + raw_limit > 6 || physical_spus_count > spu_limit + extra_threads() || controllable_spu_count > spu_limit + extra_threads())
 		{
 			return false;
 		}
@@ -463,7 +476,7 @@ struct spu_limits_t
 		raw_spu_count += spu_thread::g_raw_spu_ctr;
 
 		// physical_spus_count >= spu_limit returns EBUSY, not EINVAL!
-		if (spu_limit + raw_limit > 6 || raw_spu_count > raw_limit || physical_spus_count >= spu_limit || controllable_spu_count > spu_limit)
+		if (spu_limit + raw_limit > 6 || raw_spu_count > raw_limit || physical_spus_count >= spu_limit + extra_threads() || controllable_spu_count > spu_limit + extra_threads())
 		{
 			return false;
 		}
@@ -1883,6 +1896,9 @@ error_code sys_spu_thread_write_ls(ppu_thread& ppu, u32 id, u32 lsa, u64 value, 
 	case 8: thread->_ref<u64>(lsa) = value; break;
 	default: fmt::throw_exception("Unreachable");
 	}
+
+	// Code the recompiler has verified may have changed
+	thread->code_changed();
 
 	return CELL_OK;
 }
