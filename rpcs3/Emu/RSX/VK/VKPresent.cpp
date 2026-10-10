@@ -285,12 +285,17 @@ void VKGSRender::advance_queued_frames()
 				if (fast.not_armed[i]) fmt::append(blockers, " %u:%.0f", i, fast.not_armed[i] / frames);
 			}
 
-			rsx_log.notice("Fast draws: per frame: %.0f draws in %.0f runs, %.1f sent to the complete path; run ends by reason:%s; blocked by reason:%s (state bits 0x%x)",
-				fast.draws / frames, fast.batches / frames, fast.fallbacks / frames, stops, blockers, fast.blocking_state_bits);
+			rsx_log.notice("Fast draws: per frame: %.0f draws (%.0f of them inline arrays) in %.0f runs, %.1f sent to the complete path; run ends by reason:%s; blocked by reason:%s (state bits 0x%x)",
+				fast.draws / frames, fast.inline_draws / frames, fast.batches / frames, fast.fallbacks / frames, stops, blockers, fast.blocking_state_bits);
 			rsx_log.notice("Fast draws: per frame: %.0f with textures set up again, %.1f of those needed another shader variant, %.0f depth bias updates, %.0f semaphore releases, %.0f jumps/calls/returns, %.0f report commands; "
 				"program checks in the interval: %u, mismatches %u",
 				fast.texture_rebinds / frames, fast.texture_program_changes / frames, fast.depth_bias_updates / frames, fast.semaphores / frames, fast.flow_commands / frames, fast.reports / frames,
 				static_cast<u32>(fast.texture_checks), static_cast<u32>(fast.texture_check_mismatches));
+
+			// Why a draw's textures kept it on the complete path (blocker 14)
+			rsx_log.notice("Fast draws: textures in the way per frame: dirty, missing or sampled while rendered to %.0f; render target assembled %.0f, bound %.0f, resolved %.0f, written since %.0f; other source %.0f; assembled %.0f",
+				fast.texture_blockers[0] / frames, fast.texture_blockers[1] / frames, fast.texture_blockers[2] / frames, fast.texture_blockers[3] / frames, fast.texture_blockers[4] / frames,
+				fast.texture_blockers[5] / frames, fast.texture_blockers[6] / frames);
 
 			if (m_fast_draw_stop_methods)
 			{

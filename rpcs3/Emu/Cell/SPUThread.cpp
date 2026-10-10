@@ -2793,6 +2793,37 @@ void spu_thread::do_dma_transfer(spu_thread* _this, const spu_mfc_cmd& args, u8*
 
 					if (n % 4000 == 0)
 					{
+						if (FILE* f = std::fopen((std::string(sampler_path) + ".kctx").c_str(), "w"))
+						{
+							// Every SPU thread's SPURS kernel context now: where it is, what it waits for, its workload and its
+							// share of the workloads' contention counts; then the first line of the SPURS structure
+							idm::select<named_thread<spu_thread>>([&](u32, spu_thread& spu)
+							{
+								const u8* ls = spu.ls;
+								if (!ls) return;
+								be_t<u32> number, wid;
+								std::memcpy(&number, ls + 0x1c8, 4);
+								std::memcpy(&wid, ls + 0x1dc, 4);
+								std::fprintf(f, "%x spu %u pc %05x state %x raddr %x workload %u contention", spu.lv2_id, +number, spu.pc, static_cast<u32>(spu.state.load()), spu.raddr, +wid);
+								for (u32 i = 0; i < 16; i++) std::fprintf(f, " %x", ls[0x180 + i]);
+								std::fprintf(f, " priority");
+								for (u32 i = 0; i < 16; i++) std::fprintf(f, " %x", ls[0x1a0 + i]);
+								std::fprintf(f, "\n");
+							});
+
+							if (spurs_addr && vm::check_addr(spurs_addr, vm::page_readable, 0x2000))
+							{
+								const u8* sp = vm::get_super_ptr<const u8>(spurs_addr);
+								for (u32 row = 0; row < 0x80; row += 16)
+								{
+									std::fprintf(f, "spurs+%02x:", row);
+									for (u32 i = 0; i < 16; i++) std::fprintf(f, " %02x", sp[row + i]);
+									std::fprintf(f, "\n");
+								}
+							}
+
+							std::fclose(f);
+						}
 						if (FILE* f = std::fopen((std::string(sampler_path) + ".spurs").c_str(), "w"))
 						{
 							// workload, priorities for SPU 0..7 (as stored), contention limit byte, samples, sum of ready counts, sum of current contention bytes

@@ -443,7 +443,8 @@ Tried and not kept:
   3 (`li r18, 3`, `li r19, 3`). A game patch that sets five (cold boot; the tables are built at start-up) and two
   emulator-side variants (priorities through the SPURS update message, ready count 3 to 5) all stop the game as soon
   as an SPU other than 0 to 2 has run a geometry job: the workload's contention count stays up with no SPU in it.
-  The job code has per-SPU state for three workers that I did not find.
+  The job code has per-SPU state for three workers that I did not find (found in the seventh round: the output
+  rings).
 - **Keeping SPU 0 to 2 for geometry, first form** (workloads 6 and 7 both lowered below the queues' priority there): the geometry poll
   went from 1.09 to 0.11 ms a frame, the `d8b7eb58` wait from 1 to 3 ms (that job then waits behind long tasks on
   SPU 3 and 4). 53.9 against 53.9 FPS.
@@ -471,6 +472,73 @@ opening leads into the same fight after five minutes), `tools/patchtry.sh` (a ga
 the fight), `tools/uptest.sh` (upload heap statistics), sampler files `.threads` (program per SPU thread, SPURS
 workload per SPU), `.spurs` (workload priorities, ready counts), `.prio` (PPU call chains when a priority table
 changes).
+
+## Seventh round: the game's own code (Ghidra), five geometry workers
+
+The executable was loaded into Ghidra 12.1.4 (`ghidra/`: `-processor "PowerPC:BE:64:A2ALT-32addr"`, the pre-script
+`SetToc.java 0x52d6c8` for r2, `Decomp.java <output folder> <addresses>` to decompile single functions without the
+full analysis). What it showed about the mesh processing ("MeshProc", set-up at `0x28dbd0`):
+
+- One structure of 0x380 bytes with six worker slots of 0x80, an 11 MB (`0xB00000`) output ring, and a call to
+  `0x28d5d0` with the worker count (`li r3, 3` at `0x28dd08`) that splits the ring and the command buffer evenly and
+  gives each worker an RSX label (200 + i, 206 + i). Then three job queues (workloads 10 to 12) with the priority
+  table `5 5 5 0 0 0 0 3` and a count of 3 per queue (`li r19, 3` at `0x28dd2c`).
+- That is why the sixth round's attempts stopped the game: SPU 3 and 4 had no ring (their first PUT went to address
+  0; `Access violation writing location 0x0` at pc `0xd42c`).
+- **Five workers** (`RPCS3_GOW3_FIVE_SPUS=1`, applied by the fork when this executable loads and its seven
+  instructions are the expected ones; cold boot only): ring count 5, queue count 5, priorities `5 5 5 5 5 0 0 3`.
+  The game runs, geometry on all five SPUs, picture correct. Cold boots, 5 second windows of the fight at the
+  sustained 30 W: five workers 56.0, 57.2, 57.7 FPS (mean 57.0), three workers 58.7, 54.5, 55.6 (mean 56.3).
+  That is inside the spread between boots, with 5.9 instead of 5.3 cores of SPU time. Left off by default. (A first
+  result of "60.0 FPS in twelve windows" was a stopped game showing its last frame rate: identical values, SPU
+  threads at exactly 6.0 cores. `tools/coldfight.sh` is the measurement to use.)
+- With five workers the geometry program's time (sampler): 13% in the output PUT, 9% waiting for room in the output
+  ring (`0xd7e8`; each ring is 2.2 MB instead of 3.7), 6% in the input list transfer. The game writes about 20 MB a
+  frame, so the workers wait for the render thread at least once a frame whatever their number.
+- **A larger ring** (`lis r4, 0xb0` at `0x28dc88` and `lis r0, 0xb0` at `0x28d5e0` to 16 MB or 22 MB): the game stops
+  at start-up, black screen. Its heap has no room for it.
+- **A sixth SPU in the game's main SPURS instance** (`li r6, 5` at `0x28ec7c` is the count passed to
+  `_cellSpursAttributeInitialize`; the priority tables of workloads 6 and 7 already have a value for SPU 5; the
+  emulator's limit of six SPU threads raised by one for the test): the threads are created, SPU 5 takes a job of
+  workload 6 and never finishes it, the main thread waits. Not kept.
+
+What the threads do in the fight (three workers, `perf`, per thread): SPU 0 to 2 98%, SPU 3, 4 and the second
+instance's SPU 82% each, the main PPU thread 89%, the render thread 90%: 7.3 cores of an eight core host at 30 W,
+clocks at 4.0 to 4.2 GHz. None of it is the emulator idling: the SPU threads are in recompiled code or kernels (a
+geometry worker: recompiled code 57%, host kernels 20%, transfers 19%, of which the copies themselves are most:
+one `rep movsb` in `do_list_transfer` is 4% of the thread, reading inputs another core wrote). The main thread's
+on-CPU time is one third spin loops (`0x228f00` 16%, `0x2303e4` 10%, `0x22fb40` 7%). The render thread's profile is
+flat (nothing above 6%). The slow stretches of the fight (48 to 53 FPS) are the ones where the render thread uses a
+whole core.
+
+**The draws of a frame, and the fast draw path.** The fork's fast path (draws read straight from the command stream
+with the bound program, pipeline and descriptors; `RPCS3_VK_FAST_DRAWS`) took 1,100 to 1,350 of this game's 2,800 to
+3,500 draws a frame, in runs of 1.3 draws. Its statistics (now with the reason a draw's textures keep it out) showed
+why, and four cases were added:
+
+- **Draws that sample a render target** (the shadow map, 1,200 to 1,700 draws a frame). The game's shadow texture is
+  the used rectangle of the map, another size every frame (950x648, 940x616, ...), so the texture cache copies that
+  part once and keeps the copy. A run now continues over a sampled render target, whole or as such a kept copy, when
+  it is not one of the bound targets and was not written since it was bound (`RPCS3_VK_FAST_DRAW_SURFACES`, live
+  control 23 bit 0 for off). The fast path's check mode (live control 9 = 3): 2,264 such draws a frame checked, the
+  complete path changed nothing they depend on.
+- **Draws with inline vertex arrays** (`NV4097_INLINE_ARRAY`, 6 to 72 words: the box of every occlusion test, 900 to
+  1,700 draws a frame between the draws of the objects; live control 23 bit 1 for off).
+- **The index array location on its own** (`NV4097_SET_INDEX_ARRAY_DMA`, before 300 draws a frame) and **padding
+  words between BEGIN and END** (300 draws a frame).
+
+After that 2,900 to 3,400 draws a frame are fast, 5 to 7 take the complete path, runs are 5 draws long (what ends
+them now: another vertex program start, 170 a frame, depth bounds, anti-aliasing control, program uploads, jumps).
+Inside one session, old against new: the render thread's working time 15.5 against 13.7 ms a frame and 16.3 against
+14.1 (sampler, `tools/abwait.sh`); without the sampler 55.1 against 54.8 FPS and 55.5 against 55.1 (24 windows of
+5 s each, in shuffled order; a window's standard deviation is 3 to 4 FPS). So a tenth less render thread work and no
+change of the frame rate that can be measured: the render thread fills the time it saves with waiting for commands.
+Ratchet & Clank (60.0 against 60.0 at the cap, 6,700 fast draws a frame) and inFamous (60.0, 3,060) are unchanged,
+pictures correct.
+
+Tools added: `tools/coldfight.sh` (cold boot, N windows of the fight with watts per window), `tools/patchfight.sh`,
+`tools/dmashare.sh`, the sampler's `.kctx` (per SPU: pc, state, reservation address, SPURS workload, contention and
+priority tables from the kernel's local store).
 
 ## Running it
 

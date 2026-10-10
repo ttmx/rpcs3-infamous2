@@ -1791,7 +1791,21 @@ u32 VKGSRender::fast_draw_run_blocker() const
 	return fast_draw_textures_plain() ? 0 : 14;
 }
 
-// Every texture the fragment program samples is an ordinary uploaded texture with a view of its own
+// Live control 23, bit 0 keeps draws that sample a render target on the complete path (RPCS3_VK_FAST_DRAW_SURFACES=0),
+// bit 1 draws with inline vertex arrays
+static bool fast_draw_surface_textures()
+{
+	static const bool enabled = []
+	{
+		const char* option = std::getenv("RPCS3_VK_FAST_DRAW_SURFACES");
+		return !option || option[0] != '0' || option[1];
+	}();
+
+	return enabled && !(vk::live_ctl::get(23) & 1);
+}
+
+// Every texture the fragment program samples is an ordinary uploaded texture with a view of its own, or a whole
+// render target that nothing is rendering to
 bool VKGSRender::fast_draw_textures_plain() const
 {
 	for (u32 textures_ref = current_fp_metadata.referenced_textures_mask, i = 0; textures_ref; textures_ref >>= 1, ++i)
@@ -1799,14 +1813,52 @@ bool VKGSRender::fast_draw_textures_plain() const
 		if (!(textures_ref & 1)) continue;
 
 		const auto* sampler = static_cast<const vk::texture_cache::sampled_image_descriptor*>(fs_sampler_state[i].get());
-		if (m_textures_dirty[i] || !sampler || sampler->upload_context != rsx::texture_upload_context::shader_read || sampler->is_cyclic_reference)
+		if (m_textures_dirty[i] || !sampler || sampler->is_cyclic_reference)
 		{
+			m_fast_draw.texture_blockers[0]++;
+			return false;
+		}
+
+		// A copy of a part of a render target that the texture cache keeps (see below)
+		bool kept_copy = false;
+
+		if (sampler->upload_context == rsx::texture_upload_context::framebuffer_storage)
+		{
+			// A render target that is sampled (God of War III: the shadow map, in four of ten draws). The complete path
+			// looks at it before every draw for two things: whether it was rendered to since it was bound (it is not
+			// one of the bound targets here, and a run does not change those) and its layout (the previous draw left
+			// it readable, and a transition would have ended the render pass, which ends a run).
+			// Sampled as a whole, the view has to be of the surface's own image (not a resolve target). Sampled in
+			// part (that game's shadow texture is the used rectangle of the map, another size every frame), the
+			// previous draw bound a copy of that part which the texture cache keeps for as long as the surface is
+			// not written, and the complete path would look the same copy up again.
+			const auto& part = sampler->external_subresource_desc;
+			kept_copy = !sampler->image_handle && part.op == rsx::deferred_request_command::copy_image_static && !part.do_not_cache;
+
+			if (!fast_draw_surface_textures() || (!sampler->image_handle && !kept_copy) || m_rtts.address_is_bound(sampler->ref_address))
+			{
+				m_fast_draw.texture_blockers[!sampler->image_handle && !kept_copy ? 1 : 2]++;
+				return false;
+			}
+
+			const auto surface = dynamic_cast<const vk::render_target*>(sampler->image_handle ? sampler->image_handle->image() : part.external_handle);
+
+			if (!surface || surface->last_use_tag > sampler->surface_cache_tag)
+			{
+				m_fast_draw.texture_blockers[!surface ? 3 : 4]++;
+				return false;
+			}
+		}
+		else if (sampler->upload_context != rsx::texture_upload_context::shader_read)
+		{
+			m_fast_draw.texture_blockers[5]++;
 			return false;
 		}
 
 		// A texture that is assembled from several sections for each draw
-		if (rsx::method_registers.fragment_textures[i].enabled() && sampler->validate() && (!sampler->image_handle || !fs_sampler_handles[i]))
+		if (rsx::method_registers.fragment_textures[i].enabled() && sampler->validate() && ((!sampler->image_handle && !kept_copy) || !fs_sampler_handles[i]))
 		{
+			m_fast_draw.texture_blockers[6]++;
 			return false;
 		}
 	}
@@ -1949,6 +2001,10 @@ void VKGSRender::fast_draw_batch()
 	u32 words[40];
 	u32 draw_values[32];
 
+	// Vertices carried in the command stream (God of War III draws the box of every occlusion test this way: a
+	// thousand draws a frame of 6 to 72 words, between the draws of the objects themselves)
+	u32 inline_values[256];
+
 	// Complete packets only: every word comes through the FIFO's own fetch, which ends at PUT
 	const auto fetch = [&](u32 at, u32 count) -> bool
 	{
@@ -1995,6 +2051,7 @@ void VKGSRender::fast_draw_batch()
 
 	// Vertex formats and the texture read semaphore (live control 9 == 6 leaves them out)
 	const bool extended = delegate && vk::live_ctl::get(9) != 6;
+	const bool inline_arrays = extended && !(vk::live_ctl::get(23) & 2);
 
 	// The label write of a texture read semaphore only touches guest memory in this configuration; with strict
 	// rendering or host labels it can flush the command queue
@@ -2146,7 +2203,7 @@ void VKGSRender::fast_draw_batch()
 					regs.decode(reg + i, words[i]);
 				}
 			}
-			else if (reg == NV4097_SET_INDEX_ARRAY_ADDRESS && count <= 2)
+			else if ((reg == NV4097_SET_INDEX_ARRAY_ADDRESS && count <= 2) || (reg == NV4097_SET_INDEX_ARRAY_DMA && count == 1))
 			{
 				if (!fetch(pos + 4, count))
 				{
@@ -2154,7 +2211,9 @@ void VKGSRender::fast_draw_batch()
 					break;
 				}
 
-				if (count == 2 && (words[1] & ~(CELL_GCM_LOCATION_MAIN | (CELL_GCM_DRAW_INDEX_ARRAY_TYPE_16 << 4))))
+				// The location and index type, with the address or on their own (God of War III, before 300 draws a frame)
+				if (const u32 type = reg + count - 1 == NV4097_SET_INDEX_ARRAY_DMA ? words[count - 1] : 0;
+					type & ~(CELL_GCM_LOCATION_MAIN | (CELL_GCM_DRAW_INDEX_ARRAY_TYPE_16 << 4)))
 				{
 					stop = unusual_packet;
 					break;
@@ -2301,6 +2360,7 @@ void VKGSRender::fast_draw_batch()
 		}
 
 		u32 draw_count = 0;
+		u32 inline_count = 0;
 		u32 next = pos + 8;
 		bool closed = false;
 
@@ -2317,13 +2377,39 @@ void VKGSRender::fast_draw_batch()
 			const u32 c = (header >> 18) & 0x7ff;
 			const bool repeat = (header & RSX_METHOD_NON_INCREMENT_CMD_MASK) == RSX_METHOD_NON_INCREMENT_CMD;
 
+			if (!(header & RSX_METHOD_NON_METHOD_CMD_MASK) && !c && empty_commands < 1024)
+			{
+				// Padding between BEGIN and END as well (God of War III, in 300 draws a frame)
+				next += 4;
+				empty_commands++;
+				continue;
+			}
+
 			if ((header & RSX_METHOD_NON_METHOD_CMD_MASK) || !c)
 			{
 				stop = unusual_draw;
 				break;
 			}
 
-			if (r == NV4097_DRAW_INDEX_ARRAY && (c == 1 || repeat) && draw_count + c <= 32)
+			if (inline_arrays && r == NV4097_INLINE_ARRAY && (c == 1 || repeat) && !draw_count && inline_count + c <= std::size(inline_values))
+			{
+				bool complete = true;
+
+				for (u32 i = 0; i < c && complete; i++)
+				{
+					complete = fifo.peek(next + 4 + i * 4, inline_values[inline_count + i]);
+				}
+
+				if (!complete)
+				{
+					stop = fifo_end;
+					break;
+				}
+
+				inline_count += c;
+				next += 4 + c * 4;
+			}
+			else if (r == NV4097_DRAW_INDEX_ARRAY && (c == 1 || repeat) && !inline_count && draw_count + c <= 32)
 			{
 				if (!fetch(next + 4, c))
 				{
@@ -2343,7 +2429,7 @@ void VKGSRender::fast_draw_batch()
 					break;
 				}
 
-				if (static_cast<u8>(words[0]) || !draw_count)
+				if (static_cast<u8>(words[0]) || (!draw_count && !inline_count))
 				{
 					stop = unusual_draw;
 					break;
@@ -2381,9 +2467,22 @@ void VKGSRender::fast_draw_batch()
 			vk::gpu_pass_profile::mark(*m_current_command_buffer, (u64{ m_surface_info[0].address } << 32) | m_depth_surface_info.address, m_framebuffer_layout.width, m_framebuffer_layout.height);
 		}
 
-		// The draw is consumed from here on; set the clause up as BEGIN, DRAW_INDEX_ARRAY and END do
+		// The draw is consumed from here on; set the clause up as BEGIN, DRAW_INDEX_ARRAY or INLINE_ARRAY, and END do
 		regs.decode(NV4097_SET_BEGIN_END, begin_arg);
 		clause.reset(rsx::primitive_type::triangles);
+
+		if (inline_count)
+		{
+			regs.decode(NV4097_INLINE_ARRAY, inline_values[inline_count - 1]);
+			clause.command = rsx::draw_command::inlined_array;
+
+			for (u32 i = 0; i < inline_count; i++)
+			{
+				clause.inline_vertex_array.push_back(std::bit_cast<u32, be_t<u32>>(inline_values[i]));
+			}
+
+			m_fast_draw.inline_draws++;
+		}
 
 		for (u32 i = 0; i < draw_count; i++)
 		{

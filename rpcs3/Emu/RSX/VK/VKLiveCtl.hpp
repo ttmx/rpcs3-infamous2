@@ -37,6 +37,7 @@
 //     compared with guest memory, 3 = SPU PUTs do not publish either, 4 = vertex PUTs take the command fetch lock as before
 // 20: the SPURS workload one step above the geometry queues moves below them on their SPUs (SPUThread.cpp, RPCS3_SPURS_RESERVE): 1 = off, 2 = on
 // 21, 22: sensitivity probe (probe_delay below): place and nanoseconds
+// 23: fast draws, bit 0 = draws that sample a render target take the complete path, bit 1 = draws with inline vertex arrays
 namespace vk::live_ctl
 {
 	inline std::atomic<std::uint64_t> values[24]{};

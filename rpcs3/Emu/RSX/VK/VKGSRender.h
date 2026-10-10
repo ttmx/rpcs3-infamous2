@@ -323,10 +323,12 @@ private:
 		u64 semaphores = 0;
 		u64 flow_commands = 0;
 		u64 reports = 0;
+		u64 inline_draws = 0;
 		u64 not_armed[17]{};
 		u64 stops[12]{};
 		u32 report_frame = 0;
 		mutable u32 blocking_state_bits = 0;
+		mutable u64 texture_blockers[8]{};
 	} m_fast_draw;
 
 	// Diagnostic (live control 9 == 3): state before a draw that the fast path would have taken

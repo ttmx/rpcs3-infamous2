@@ -2505,6 +2505,56 @@ bool ppu_load_exec(const ppu_exec_object& elf, bool virtual_load, const std::str
 		}
 	}
 
+	// God of War III (BCES00510 1.03): its mesh processing ("MeshProc") runs the geometry jobs of every draw on three
+	// SPUs: output rings for three workers, three job queues with priorities 5 5 5 0 0 for the five SPURS SPUs, and a
+	// worker count of 3 per queue, all constants in one set-up function, while its structures have room for six
+	// workers. RPCS3_GOW3_FIVE_SPUS=1 sets five everywhere. Off by default: on an eight core host at 30 W the first
+	// fight is the same within the spread between boots (57.0 against 56.3 FPS, three boots each), with more SPU
+	// time used. Not when a savestate is loaded: the set-up has run by then.
+	if (!ar && hash == "PPU-4d5c51503a81a327c2a99427390a395b8dcb3767")
+	{
+		static const bool five_spus = []
+		{
+			const char* option = std::getenv("RPCS3_GOW3_FIVE_SPUS");
+			return option && option[0] == '1' && !option[1];
+		}();
+
+		struct word_t { u32 addr, original, patched; };
+
+		static constexpr word_t words[]
+		{
+			{0x0028dd08, 0x38600003, 0x38600005}, // li r3, 5: output rings and command buffers for five workers
+			{0x0028dd2c, 0x3a600003, 0x3a600005}, // li r19, 5: the worker count stored for each queue
+			{0x0028de08, 0xfb410070, 0x3c000505}, // std r26, 112(r1)  ->  lis r0, 0x0505
+			{0x0028de0c, 0x9a410077, 0x60000505}, // stb r18, 119(r1)  ->  ori r0, r0, 0x0505
+			{0x0028de10, 0x9b210070, 0x90010070}, // stb r25, 112(r1)  ->  stw r0, 112(r1): priority 5 on SPU 0 to 3
+			{0x0028de14, 0x9b210071, 0x92410074}, // stb r25, 113(r1)  ->  stw r18, 116(r1): zeros and the 3 of the last byte
+			{0x0028de18, 0x9b210072, 0x9b210074}, // stb r25, 114(r1)  ->  stb r25, 116(r1): priority 5 on SPU 4
+		};
+
+		bool original = true;
+
+		for (const auto& w : words)
+		{
+			const auto ptr = _main.get_ptr<be_t<u32>>(w.addr, 4);
+			original = original && ptr && *ptr == w.original;
+		}
+
+		if (five_spus && original)
+		{
+			for (const auto& w : words)
+			{
+				*_main.get_ptr<be_t<u32>>(w.addr, 4) = w.patched;
+			}
+
+			ppu_loader.success("God of War III: geometry jobs on five SPUs");
+		}
+		else if (five_spus)
+		{
+			ppu_loader.warning("God of War III: the mesh set-up code is not as expected, geometry jobs stay on three SPUs");
+		}
+	}
+
 	if (applied.empty())
 	{
 		ppu_loader.warning("PPU executable hash: %s", hash);
