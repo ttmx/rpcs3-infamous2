@@ -30,7 +30,13 @@
 // 14: 1 = the inFamous particle depth buffer takes over its old contents again before it is filled (VKDraw.cpp, end())
 // 15: SPU line stores without the full lock (SPUThread.cpp, do_putllc): 0 = as RPCS3_SPU_PUTLLC_PIECEWISE says, 1 = off, 2 = on
 // 16: host kernels of the God of War III geometry job (SPUNativeGeometry.hpp): 1 = they decline, the SPU code runs
+//     otherwise bits: 2 = the two kernels of the bounding sphere job decline, 4 = the noise kernel's scalar version
 // 17: minimum byte length of a vertex copy done with non-temporal stores (0 = 1024)
+// 18: PPU usleep calls of at most this many microseconds are spun through, stored +1 (lv2.cpp, RPCS3_PPU_USLEEP_SPIN)
+// 19: SPU vertex upload heap (Common/spu_upload.h, RPCS3_SPU_VERTEX_UPLOAD): 1 = draws do not use it, 2 = every range used is
+//     compared with guest memory, 3 = SPU PUTs do not publish either, 4 = vertex PUTs take the command fetch lock as before
+// 20: the SPURS workload one step above the geometry queues moves below them on their SPUs (SPUThread.cpp, RPCS3_SPURS_RESERVE): 1 = off, 2 = on
+// 21, 22: sensitivity probe (probe_delay below): place and nanoseconds
 namespace vk::live_ctl
 {
 	inline std::atomic<std::uint64_t> values[24]{};
@@ -38,6 +44,16 @@ namespace vk::live_ctl
 	inline std::uint64_t get(unsigned index)
 	{
 		return values[index].load(std::memory_order_relaxed);
+	}
+
+	// Sensitivity probe: live control 21 names a place (1 = each published PUT of the geometry job, 2 = each call of
+	// the noise kernel, 3 = each draw's vertex upload on the render thread), live control 22 the nanoseconds to burn
+	// there. What the frame rate loses for time added at a place tells whether that place is on the frame's critical path.
+	inline void probe_delay(unsigned place)
+	{
+		if (get(21) != place) [[likely]] return;
+		const std::uint64_t ticks = get(22) * 38 / 10; // 3.8 GHz time stamp counter
+		for (const std::uint64_t start = __builtin_ia32_rdtsc(); __builtin_ia32_rdtsc() - start < ticks;) __builtin_ia32_pause();
 	}
 
 	// Start cache-line transfers for a source range that another core most likely just wrote.

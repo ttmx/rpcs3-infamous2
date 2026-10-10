@@ -13,6 +13,7 @@
 #include "VKNativeAA.h"
 #include "VKNativeLighting.h"
 #include "VKGSRender.h"
+#include "Emu/RSX/Common/spu_upload.h"
 #include "Emu/infamous_titles.h"
 #include "../Common/RSXTailDemandTrace.hpp"
 #include "VKTimestampDiagnostics.hpp"
@@ -955,6 +956,14 @@ VKGSRender::~VKGSRender()
 	m_persistent_attribute_storage.reset();
 	m_volatile_attribute_storage.reset();
 	m_geometry_cache.destroy();
+
+	if (m_spu_upload_buffer)
+	{
+		rsx::spu_upload::detach();
+		m_spu_upload_views.clear();
+		m_spu_upload_buffer->unmap();
+		m_spu_upload_buffer.reset();
+	}
 
 	// Upscaler (references some global resources)
 	m_upscaler.reset();
@@ -2047,6 +2056,36 @@ std::pair<volatile vk::host_data_t*, VkBuffer> VKGSRender::map_host_object_data(
 	return { m_host_dma_ctrl->host_ctx(), m_host_object_data->value };
 }
 
+// The heap that SPU threads append their jobs' vertex data to (Common/spu_upload.h), made when such a job first runs
+void VKGSRender::create_spu_upload_heap()
+{
+	const auto& limits = m_device->gpu().get_limits();
+
+	// 256 MB in windows as large as one texel buffer view may be (one window where the driver allows); chunks never cross a window
+	m_spu_upload_window = std::min<u64>(limits.maxTexelBufferElements, 0x10000000) & ~(rsx::spu_upload::chunk_size - 1);
+	while (m_spu_upload_window && 0x10000000 % m_spu_upload_window) m_spu_upload_window -= rsx::spu_upload::chunk_size;
+
+	if (m_spu_upload_window < 16 * rsx::spu_upload::chunk_size)
+	{
+		// Stays without a buffer; not tried again
+		m_spu_upload_window = 1;
+		return;
+	}
+
+	const u64 bytes = 0x10000000;
+	const auto& memory_map = m_device->get_memory_mapping();
+	m_spu_upload_buffer = std::make_unique<vk::buffer>(*m_device, bytes, memory_map.host_visible_coherent,
+		VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT, 0, VMM_ALLOCATION_POOL_SYSTEM);
+
+	for (u64 offset = 0; offset < bytes; offset += m_spu_upload_window)
+	{
+		m_spu_upload_views.emplace_back(std::make_unique<vk::buffer_view>(*m_device, m_spu_upload_buffer->value, VK_FORMAT_R8_UINT, offset, m_spu_upload_window));
+	}
+
+	rsx::spu_upload::attach(static_cast<u8*>(m_spu_upload_buffer->map(0, bytes)), bytes);
+	rsx_log.notice("SPU vertex upload heap: %u MB in windows of %u MB", static_cast<u32>(bytes >> 20), static_cast<u32>(m_spu_upload_window >> 20));
+}
+
 bool VKGSRender::release_GCM_label(u32 type, u32 address, u32 args)
 {
 	if (!backend_config.supports_host_gpu_labels)
@@ -2836,7 +2875,8 @@ void VKGSRender::update_vertex_env(u32 id, const vk::vertex_upload_info& vertex_
 		vertex_info.allocated_vertex_count,
 		dst->attrib_data,
 		vertex_info.persistent_window_offset,
-		vertex_info.volatile_window_offset);
+		vertex_info.volatile_window_offset,
+		vertex_info.spu_window >= 0 ? vertex_info.spu_block_offsets.data() : nullptr);
 
 	m_vertex_layout_ring_info.unmap();
 }

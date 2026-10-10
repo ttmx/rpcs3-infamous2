@@ -1,4 +1,5 @@
 #include "stdafx.h"
+#include "Emu/RSX/VK/VKLiveCtl.hpp"
 #include "Emu/System.h"
 #include "Emu/system_config.h"
 #include "Emu/Memory/vm_ptr.h"
@@ -2231,6 +2232,25 @@ bool lv2_obj::wait_timeout(u64 usec, ppu_thread* cpu, bool scale, bool is_usleep
 		constexpr u64 host_min_quantum = 500;
 #endif
 		// TODO: Tune for other non windows operating sytems
+
+		// RPCS3_PPU_USLEEP_SPIN=<microseconds> (live control 18 overrides it, stored +1): a usleep this short is spun
+		// through. A host sleep of some tens of microseconds returns late by about as much again, and games poll with
+		// such sleeps (God of War III: 30 microseconds, for the render thread and for jobs)
+		static const u64 s_spin_limit = []() -> u64
+		{
+			const char* option = std::getenv("RPCS3_PPU_USLEEP_SPIN");
+			return option ? std::strtoull(option, nullptr, 10) : 0;
+		}();
+
+		if (const u64 live = vk::live_ctl::get(18), spin_limit = live ? live - 1 : s_spin_limit; is_usleep && usec <= spin_limit)
+		{
+			while ((passed = get_system_time() - start_time) < usec && state == old_state)
+			{
+				utils::pause();
+			}
+
+			continue;
+		}
 
 		if (g_cfg.core.sleep_timers_accuracy < (is_usleep ? sleep_timers_accuracy_level::_usleep : sleep_timers_accuracy_level::_all_timers))
 		{

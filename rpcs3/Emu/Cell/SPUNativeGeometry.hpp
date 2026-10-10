@@ -13,6 +13,7 @@
 #include "Emu/RSX/VK/VKLiveCtl.hpp"
 #include <immintrin.h>
 #include <atomic>
+#include <bit>
 #include <cstdio>
 #include <cmath>
 #include <cstdlib>
@@ -46,6 +47,69 @@ namespace spu_native_geometry
 	{
 		return vk::live_ctl::get(16) != 1;
 	}
+
+	// Live control 16, bit 2: only the kernels of the bounding sphere job decline
+	inline bool active_spheres()
+	{
+		return active() && !(vk::live_ctl::get(16) & 2);
+	}
+
+	// Diagnostic for checking a built kernel (RPCS3_SPU_KERNEL_CHECK=<directory>,<pc hex>): the state before each of the
+	// first 200 runs of the kernel at that address as region-NNNN.bin (the region capture's format) and the local store
+	// and registers after it as after-NNNN.bin, to compare with the SPU code's result in the offline interpreter.
+	// Kernels that support it call before() once their inputs are accepted and after() when they are done.
+	struct kernel_check
+	{
+		std::string dir;
+		u32 pc = 0;
+
+		static const kernel_check& get()
+		{
+			static const kernel_check instance = []
+			{
+				kernel_check r;
+				if (const char* v = std::getenv("RPCS3_SPU_KERNEL_CHECK"))
+				{
+					const std::string text = v;
+					if (const auto a = text.find(','); a != std::string::npos)
+					{
+						r.dir = text.substr(0, a);
+						r.pc = static_cast<u32>(std::strtoul(text.c_str() + a + 1, nullptr, 16));
+					}
+				}
+				return r;
+			}();
+			return instance;
+		}
+
+		static void write(const spu_thread* spu, const u8* ls, u32 pc, const char* name, u32 n)
+		{
+			if (FILE* f = std::fopen((get().dir + "/" + name + "-" + std::to_string(n + 10000).substr(1) + ".bin").c_str(), "wb"))
+			{
+				std::fwrite("SPUR", 4, 1, f);
+				std::fwrite(&pc, 4, 1, f);
+				std::fwrite(spu->gpr.data(), 16, 128, f);
+				std::fwrite(ls, 1, SPU_LS_SIZE, f);
+				std::fclose(f);
+			}
+		}
+
+		// Returns the number of this run, or -1 for none
+		static s32 before(const spu_thread* spu, const u8* ls, u32 pc)
+		{
+			if (get().pc != pc) [[likely]] return -1;
+			static std::atomic<u32> s_runs{0};
+			const u32 n = s_runs++;
+			if (n >= 200) return -1;
+			write(spu, ls, pc, "region", n);
+			return static_cast<s32>(n);
+		}
+
+		static void after(const spu_thread* spu, const u8* ls, u32 pc, s32 n)
+		{
+			if (n >= 0) [[unlikely]] write(spu, ls, pc, "after", static_cast<u32>(n));
+		}
+	};
 
 	// Preferred word of a register
 	inline u32 word(const spu_thread& spu, u32 reg)
@@ -321,7 +385,99 @@ namespace spu_native_geometry
 
 		if (!active() || !tables.same) return 0;
 
-		const u8* perm = tables.perm;
+		vk::live_ctl::probe_delay(2);
+
+		const u8* const perm = tables.perm;
+		const s32 check = kernel_check::before(spu, ls, 0x4980);
+
+		// Live control 16, bit 4: the scalar version below (comparisons)
+		if (!(vk::live_ctl::get(16) & 4))
+		{
+			// The gradient components are -1, 0 or 1: one byte table per component, looked up for all 32 corners at once
+			static const struct gradient_bytes_t
+			{
+				alignas(16) s8 x[16], y[16], z[16];
+
+				gradient_bytes_t()
+				{
+					for (u32 i = 0; i < 16; i++) x[i] = static_cast<s8>(gradients[i][0]), y[i] = static_cast<s8>(gradients[i][1]), z[i] = static_cast<s8>(gradients[i][2]);
+				}
+			} bytes;
+
+			const __m128 px = _mm_setr_ps(spu->gpr[3]._f[3], spu->gpr[4]._f[3], spu->gpr[5]._f[3], spu->gpr[6]._f[3]);
+			const __m128 py = _mm_setr_ps(spu->gpr[3]._f[2], spu->gpr[4]._f[2], spu->gpr[5]._f[2], spu->gpr[6]._f[2]);
+			const __m128 pz = _mm_setr_ps(spu->gpr[3]._f[1], spu->gpr[4]._f[1], spu->gpr[5]._f[1], spu->gpr[6]._f[1]);
+
+			// Every coordinate has to be an ordinary number that fits an integer
+			const __m128 limit = _mm_set1_ps(1e9f), sign = _mm_set1_ps(-0.f);
+			if (_mm_movemask_ps(_mm_and_ps(_mm_and_ps(_mm_cmplt_ps(_mm_andnot_ps(sign, px), limit), _mm_cmplt_ps(_mm_andnot_ps(sign, py), limit)), _mm_cmplt_ps(_mm_andnot_ps(sign, pz), limit))) != 15) return 0;
+
+			const __m128 fx = _mm_floor_ps(px), fy = _mm_floor_ps(py), fz = _mm_floor_ps(pz);
+			const __m128 tx = _mm_sub_ps(px, fx), ty = _mm_sub_ps(py, fy), tz = _mm_sub_ps(pz, fz);
+
+			alignas(16) u32 cx[4], cy[4], cz[4];
+			const __m128i low_byte = _mm_set1_epi32(255);
+			_mm_store_si128(reinterpret_cast<__m128i*>(cx), _mm_and_si128(_mm_cvttps_epi32(fx), low_byte));
+			_mm_store_si128(reinterpret_cast<__m128i*>(cy), _mm_and_si128(_mm_cvttps_epi32(fy), low_byte));
+			_mm_store_si128(reinterpret_cast<__m128i*>(cz), _mm_and_si128(_mm_cvttps_epi32(fz), low_byte));
+
+			// The corners' hashes, x fastest; a point's eight in one 64-bit value
+			u64 hashes[4];
+
+			for (u32 i = 0; i < 4; i++)
+			{
+				const u32 xi = cx[i], yi = cy[i], zi = cz[i];
+				const u32 a = perm[xi] + yi, aa = perm[a] + zi, ab = perm[a + 1] + zi;
+				const u32 b = perm[xi + 1] + yi, ba = perm[b] + zi, bb = perm[b + 1] + zi;
+
+				hashes[i] = u64{perm[aa]} | u64{perm[ba]} << 8 | u64{perm[ab]} << 16 | u64{perm[bb]} << 24 |
+					u64{perm[aa + 1]} << 32 | u64{perm[ba + 1]} << 40 | u64{perm[ab + 1]} << 48 | u64{perm[bb + 1]} << 56;
+			}
+
+			const __m256i h = _mm256_and_si256(_mm256_set_epi64x(hashes[3], hashes[2], hashes[1], hashes[0]), _mm256_set1_epi8(15));
+			const __m256i gxb = _mm256_shuffle_epi8(_mm256_broadcastsi128_si256(_mm_load_si128(reinterpret_cast<const __m128i*>(bytes.x))), h);
+			const __m256i gyb = _mm256_shuffle_epi8(_mm256_broadcastsi128_si256(_mm_load_si128(reinterpret_cast<const __m128i*>(bytes.y))), h);
+			const __m256i gzb = _mm256_shuffle_epi8(_mm256_broadcastsi128_si256(_mm_load_si128(reinterpret_cast<const __m128i*>(bytes.z))), h);
+
+			// fade(t) = t^3 (t (6 t - 15) + 10)
+			const auto fade4 = [](__m128 t)
+			{
+				return _mm_mul_ps(_mm_mul_ps(_mm_mul_ps(t, t), t), _mm_fmadd_ps(t, _mm_fmsub_ps(t, _mm_set1_ps(6.f), _mm_set1_ps(15.f)), _mm_set1_ps(10.f)));
+			};
+
+			alignas(16) float u[4], v[4], w[4], x[4], y[4], z[4];
+			_mm_store_ps(u, fade4(tx)), _mm_store_ps(v, fade4(ty)), _mm_store_ps(w, fade4(tz));
+			_mm_store_ps(x, tx), _mm_store_ps(y, ty), _mm_store_ps(z, tz);
+
+			const __m256 corner_x = _mm256_setr_ps(0, 1, 0, 1, 0, 1, 0, 1), corner_y = _mm256_setr_ps(0, 0, 1, 1, 0, 0, 1, 1), corner_z = _mm256_setr_ps(0, 0, 0, 0, 1, 1, 1, 1);
+
+			for (u32 i = 0; i < 4; i++)
+			{
+				const auto eight = [&](__m256i all)
+				{
+					const __m128i half = i < 2 ? _mm256_castsi256_si128(all) : _mm256_extracti128_si256(all, 1);
+					return _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(i & 1 ? _mm_unpackhi_epi64(half, half) : half));
+				};
+
+				__m256 d = _mm256_mul_ps(eight(gxb), _mm256_sub_ps(_mm256_set1_ps(x[i]), corner_x));
+				d = _mm256_fmadd_ps(eight(gyb), _mm256_sub_ps(_mm256_set1_ps(y[i]), corner_y), d);
+				d = _mm256_fmadd_ps(eight(gzb), _mm256_sub_ps(_mm256_set1_ps(z[i]), corner_z), d);
+
+				// Along x inside both halves, then y and z across them
+				const __m256 even = _mm256_shuffle_ps(d, d, _MM_SHUFFLE(2, 0, 2, 0)), odd = _mm256_shuffle_ps(d, d, _MM_SHUFFLE(3, 1, 3, 1));
+				const __m256 along_x = _mm256_fmadd_ps(_mm256_set1_ps(u[i]), _mm256_sub_ps(odd, even), even);
+				const __m128 t = _mm_unpacklo_ps(_mm256_castps256_ps128(along_x), _mm256_extractf128_ps(along_x, 1));
+				const __m128 far_y = _mm_movehl_ps(t, t);
+				const __m128 along_y = _mm_fmadd_ps(_mm_set1_ps(v[i]), _mm_sub_ps(far_y, t), t);
+				const float near_z = _mm_cvtss_f32(along_y), far_z = _mm_cvtss_f32(_mm_shuffle_ps(along_y, along_y, 1));
+				spu->gpr[3]._f[3 - i] = near_z + w[i] * (far_z - near_z);
+			}
+
+			spu->pc = word(*spu, 0) & 0x3fffc;
+			kernel_check::after(spu, ls, 0x4980, check);
+			return 1;
+		}
+
 		const auto fade = [](float t) { return t * t * t * (t * (t * 6.f - 15.f) + 10.f); };
 		const auto lerp = [](float t, float a, float b) { return a + t * (b - a); };
 
@@ -360,6 +516,7 @@ namespace spu_native_geometry
 		for (u32 i = 0; i < 4; i++) spu->gpr[3]._f[3 - i] = result[i];
 
 		spu->pc = word(*spu, 0) & 0x3fffc;
+		kernel_check::after(spu, ls, 0x4980, check);
 		return 1;
 	}
 
@@ -582,6 +739,149 @@ namespace spu_native_geometry
 		return 1;
 	}
 
+	// Job b245f318 (bounding spheres of the scene's objects; the main thread waits for it), function 0x59a0:
+	// r3 groups, r4 one sphere out per group, r5 a byte per group: its number of spheres, r6 room for a group's moved
+	// spheres, r7 the spheres of all groups in a row (16 bytes: centre, bone index byte, exponent byte, two index bits
+	// and 14 mantissa bits of the radius), r8 bone matrices (64 bytes). Every sphere is moved by its bone and its
+	// radius scaled by the longest of the matrix's three axes; a group's sphere sits in the middle of its spheres' bounds
+	// and reaches the farthest of them. Square roots are exact here (the SPU code refines an estimate once).
+	inline u32 group_spheres(spu_thread* spu, u8* ls)
+	{
+		const u32 groups = word(*spu, 3);
+		const u32 out = word(*spu, 4) & 0x3ffff;
+		const u32 counts = word(*spu, 5) & 0x3ffff;
+		const u32 moved = word(*spu, 6) & 0x3ffff;
+		const u32 first = word(*spu, 7) & 0x3ffff;
+		const u32 matrices = word(*spu, 8) & 0x3ffff;
+
+		if (!active_spheres() || !groups || groups > 0x1000 || ((out | moved | first | matrices) & 15)) return 0;
+		if (counts + groups > SPU_LS_SIZE || out + groups * 16 > SPU_LS_SIZE || moved + 255 * 16 > SPU_LS_SIZE) return 0;
+
+		// Nothing may be written before every input is known to be in range
+		u32 total = 0;
+		for (u32 g = 0; g < groups; g++) total += ls[counts + g];
+		if (!ls[counts + groups - 1] || first + total * 16 > SPU_LS_SIZE) return 0;
+
+		for (u32 i = 0; i < total; i++)
+		{
+			const u8* item = ls + first + i * 16;
+			if (matrices + (item[12] | (item[14] >> 6) << 8) * 64 + 64 > SPU_LS_SIZE) return 0;
+		}
+
+		const s32 check = kernel_check::before(spu, ls, 0x59a0);
+		const u8* item = ls + first;
+		__m128 spheres[255];
+		float far = 0.f;
+
+		for (u32 g = 0; g < groups; g++)
+		{
+			const u32 n = ls[counts + g];
+			__m128 low = _mm_set1_ps(3.40282347e+38f), high = _mm_set1_ps(-3.40282347e+38f);
+
+			for (u32 i = 0; i < n; i++, item += 16)
+			{
+				const u8* m = ls + matrices + (item[12] | (item[14] >> 6) << 8) * 64;
+				const __m128 r0 = load_be(m), r1 = load_be(m + 16), r2 = load_be(m + 32), r3 = load_be(m + 48);
+				const __m128 p = load_be(item);
+
+				__m128 c = _mm_mul_ps(r0, _mm_shuffle_ps(p, p, _MM_SHUFFLE(0, 0, 0, 0)));
+				c = _mm_fmadd_ps(r1, _mm_shuffle_ps(p, p, _MM_SHUFFLE(1, 1, 1, 1)), c);
+				c = _mm_fmadd_ps(r2, _mm_shuffle_ps(p, p, _MM_SHUFFLE(2, 2, 2, 2)), c);
+				c = _mm_add_ps(c, r3);
+
+				const __m128 axis = _mm_max_ss(_mm_max_ss(_mm_dp_ps(r0, r0, 0x71), _mm_dp_ps(r1, r1, 0x71)), _mm_dp_ps(r2, r2, 0x71));
+				const __m128 radius = _mm_castsi128_ps(_mm_cvtsi32_si128(item[13] << 23 | ((item[14] << 8 | item[15]) & 0x3fff) << 9));
+				const __m128 s = _mm_insert_ps(c, _mm_mul_ss(_mm_sqrt_ss(axis), radius), 0x30);
+
+				spheres[i] = s;
+				store_be(ls + moved + i * 16, s);
+				low = _mm_min_ps(low, s);
+				high = _mm_max_ps(high, s);
+			}
+
+			const __m128 centre = _mm_mul_ps(_mm_add_ps(low, high), _mm_set1_ps(0.5f));
+			far = 0.f;
+
+			for (u32 i = 0; i < n; i++)
+			{
+				const __m128 d = _mm_sub_ps(spheres[i], centre);
+				far = std::max(far, _mm_cvtss_f32(_mm_sqrt_ss(_mm_dp_ps(d, d, 0x71))) + _mm_cvtss_f32(_mm_shuffle_ps(spheres[i], spheres[i], _MM_SHUFFLE(3, 3, 3, 3))));
+			}
+
+			store_be(ls + out + g * 16, _mm_insert_ps(centre, _mm_set_ss(far), 0x30));
+		}
+
+		spu->gpr[3] = v128::from32p(std::bit_cast<u32>(far));
+		spu->pc = word(*spu, 0) & 0x3fffc;
+		kernel_check::after(spu, ls, 0x59a0, check);
+		return 1;
+	}
+
+	// The same job, function 0x4ef0: r3 and r4 the numbers of spheres in two lists (16 bits each), r5 and r7 the lists
+	// (centre and radius), r6 a bit for every pair, row by row, the lowest bit of a byte first: set where the two
+	// spheres overlap. The comparison is done in the SPU code's operations and order, so the bits are the same.
+	inline u32 sphere_pairs(spu_thread* spu, u8* ls)
+	{
+		const u32 na = word(*spu, 3) & 0xffff;
+		const u32 nb = word(*spu, 4) & 0xffff;
+		const u32 a = word(*spu, 5) & 0x3ffff;
+		const u32 bits = word(*spu, 6) & 0x3ffff;
+		const u32 b = word(*spu, 7) & 0x3ffff;
+		const u32 bytes = (na * nb + 7) >> 3;
+
+		constexpr u32 max_b = 1024;
+
+		if (!active_spheres() || nb > max_b || na > 0x1000 || ((a | b) & 15)) return 0;
+		if (a + na * 16 > SPU_LS_SIZE || b + nb * 16 > SPU_LS_SIZE || bits + bytes + 1 > SPU_LS_SIZE) return 0;
+		if ((bits < a + na * 16 && a < bits + bytes) || (bits < b + nb * 16 && b < bits + bytes)) return 0;
+
+		const s32 check = kernel_check::before(spu, ls, 0x4ef0);
+		u8* out = ls + bits;
+		std::memset(out, 0, bytes);
+
+		if (na && nb)
+		{
+			// The second list as one array per component, padded to whole groups of eight
+			alignas(32) float bx[max_b + 8], by[max_b + 8], bz[max_b + 8], bw[max_b + 8];
+
+			for (u32 j = 0; j < nb; j++)
+			{
+				alignas(16) float v[4];
+				_mm_store_ps(v, load_be(ls + b + j * 16));
+				bx[j] = v[0], by[j] = v[1], bz[j] = v[2], bw[j] = v[3];
+			}
+
+			for (u32 j = nb; j < ((nb + 7) & ~7u); j++) bx[j] = by[j] = bz[j] = bw[j] = 0.f;
+
+			u32 bit = 0;
+
+			for (u32 i = 0; i < na; i++)
+			{
+				alignas(16) float v[4];
+				_mm_store_ps(v, load_be(ls + a + i * 16));
+				const __m256 ax = _mm256_set1_ps(v[0]), ay = _mm256_set1_ps(v[1]), az = _mm256_set1_ps(v[2]), aw = _mm256_set1_ps(v[3]);
+
+				for (u32 j = 0; j < nb; j += 8)
+				{
+					const __m256 dx = _mm256_sub_ps(ax, _mm256_load_ps(bx + j)), dy = _mm256_sub_ps(ay, _mm256_load_ps(by + j)), dz = _mm256_sub_ps(az, _mm256_load_ps(bz + j));
+					const __m256 distance = _mm256_add_ps(_mm256_add_ps(_mm256_mul_ps(dx, dx), _mm256_mul_ps(dy, dy)), _mm256_mul_ps(dz, dz));
+					const __m256 reach = _mm256_add_ps(_mm256_load_ps(bw + j), aw);
+					const u32 count = std::min<u32>(8, nb - j);
+					const u32 hit = (_mm256_movemask_ps(_mm256_cmp_ps(_mm256_mul_ps(reach, reach), distance, _CMP_GT_OQ)) & ((1u << count) - 1)) << (bit & 7);
+
+					out[bit >> 3] |= static_cast<u8>(hit);
+					if (hit >> 8) out[(bit >> 3) + 1] |= static_cast<u8>(hit >> 8);
+					bit += count;
+				}
+			}
+		}
+
+		spu->gpr[3]._u32[3] = na * nb;
+		spu->pc = word(*spu, 0) & 0x3fffc;
+		kernel_check::after(spu, ls, 0x4ef0, check);
+		return 1;
+	}
+
 	struct kernel
 	{
 		u32 entry;    // first instruction of the region
@@ -603,6 +903,8 @@ namespace spu_native_geometry
 		{0x066f0, 0x05de8, {0x4080001f, 0x34058636, 0x4080026f, 0x33973ec1}, &pack_vertices<true>, "spu_geometry_pack_vertices_54"},
 		{0x08fd8, 0, {0x0400020b, 0x34004308, 0x0400018a, 0x34000309}, &point_lights, "spu_geometry_point_lights"},
 		{0x0dd50, 0, {0x1c01c242, 0x3388679f, 0x34000198, 0x14fe2117}, &normalize, "spu_geometry_normalize"},
+		{0x059a0, 0, {0x040001ac, 0x3fe00226, 0x04000297, 0x3fe0032b}, &group_spheres, "spu_native_group_spheres"},
+		{0x04ef0, 0, {0x04000188, 0x12000792, 0x7980c203, 0x3fe0021a}, &sphere_pairs, "spu_native_sphere_pairs"},
 	};
 
 	// Diagnostic for writing a kernel (RPCS3_SPU_REGION_CAPTURE=<directory>,<pc hex>,<first instruction hex>[,<every>]):
@@ -656,7 +958,17 @@ namespace spu_native_geometry
 
 	inline const kernel capture_kernel{0, 0, {}, &region_capture::run, "spu_region_capture"};
 
-	// The kernel whose region starts with these instructions at this address, if any
+	// The kernel that replaces a whole function at this address, if there is one (its instructions are for the caller to compare)
+	inline const kernel* find_function(u32 pc)
+	{
+		for (const kernel& k : kernels)
+		{
+			if (k.entry == pc && !k.exit) return &k;
+		}
+
+		return nullptr;
+	}
+
 	// The kernel whose region starts with these instructions at this address, if any
 	inline const kernel* find(u32 pc, std::span<const u32> words_from_pc)
 	{

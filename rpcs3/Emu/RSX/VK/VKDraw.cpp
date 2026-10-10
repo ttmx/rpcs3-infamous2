@@ -1307,15 +1307,14 @@ void VKGSRender::emit_geometry(u32 sub_index)
 		load_occlusion_task();
 	}
 
-	VkDescriptorBufferViewEx persistent_buffer = upload_info.static_vertices ? *m_geometry_cache.vertex_heap.view :
-		m_persistent_attribute_storage ? *m_persistent_attribute_storage : *null_buffer_view;
+	VkDescriptorBufferViewEx persistent_buffer = persistent_view(upload_info);
 	VkDescriptorBufferViewEx volatile_buffer = m_volatile_attribute_storage ? *m_volatile_attribute_storage : *null_buffer_view;
 	bool update_descriptors = false;
 
-	if (m_current_draw.subdraw_id == 0 || m_static_vertices_bound != upload_info.static_vertices)
+	if (m_current_draw.subdraw_id == 0 || m_persistent_source_bound != persistent_source(upload_info))
 	{
 		update_descriptors = true;
-		m_static_vertices_bound = upload_info.static_vertices;
+		m_persistent_source_bound = persistent_source(upload_info);
 	}
 
 	if (m_current_draw.subdraw_id == 0)
@@ -1926,6 +1925,13 @@ u32 VKGSRender::fast_draw_blocker(u32 handled_state, u32 handled_flags) const
 	return 0;
 }
 
+VkDescriptorBufferViewEx VKGSRender::persistent_view(const vk::vertex_upload_info& info)
+{
+	if (info.spu_window >= 0) return *m_spu_upload_views[info.spu_window];
+	if (info.static_vertices) return *m_geometry_cache.vertex_heap.view;
+	return m_persistent_attribute_storage ? *m_persistent_attribute_storage : *null_buffer_view;
+}
+
 void VKGSRender::fast_draw_batch()
 {
 	enum stop_reason : u32 { limit_reached, fifo_end, flow_control, other_method, unusual_packet, blocked, other_primitive, unusual_draw, complete_path };
@@ -2465,10 +2471,9 @@ void VKGSRender::fast_draw_batch()
 
 				update_vertex_env(0, upload_info);
 
-				VkDescriptorBufferViewEx persistent_buffer = upload_info.static_vertices ? *m_geometry_cache.vertex_heap.view :
-					m_persistent_attribute_storage ? *m_persistent_attribute_storage : *null_buffer_view;
+				VkDescriptorBufferViewEx persistent_buffer = persistent_view(upload_info);
 				VkDescriptorBufferViewEx volatile_buffer = m_volatile_attribute_storage ? *m_volatile_attribute_storage : *null_buffer_view;
-				m_static_vertices_bound = upload_info.static_vertices;
+				m_persistent_source_bound = persistent_source(upload_info);
 
 				m_program->bind_uniform(persistent_buffer, vk::glsl::binding_set_index_vertex, m_vs_binding_table->vertex_buffers_location);
 				m_program->bind_uniform(volatile_buffer, vk::glsl::binding_set_index_vertex, m_vs_binding_table->vertex_buffers_location + 1);

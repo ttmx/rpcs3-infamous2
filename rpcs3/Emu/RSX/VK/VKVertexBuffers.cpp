@@ -1,6 +1,10 @@
 #include "stdafx.h"
 #include "VKLiveCtl.hpp"
 #include "VKGSRender.h"
+#include "VKReadbackCopy.hpp"
+#include "util/sysinfo.hpp"
+#include <unordered_map>
+#include "Emu/RSX/Common/spu_upload.h"
 #include "VKUploadDiagnostics.hpp"
 #include "VKGeomTrace.hpp"
 #include "../Common/geometry_sync.h"
@@ -335,6 +339,7 @@ namespace
 vk::vertex_upload_info VKGSRender::upload_vertex_data()
 {
 	rsx::geometry_sync::draws++;
+	vk::live_ctl::probe_delay(3);
 
 	// Frame number for the geometry cache; never 0, which marks a free slot
 	const u32 cache_frame = static_cast<u32>(vk::get_current_frame_id()) + 1;
@@ -390,8 +395,117 @@ vk::vertex_upload_info VKGSRender::upload_vertex_data()
 	bool geometry_cache_used = false;
 	bool geometry_promote = false;
 	vk::geometry_cache::slot_t* geometry_slot = nullptr;
+	s8 spu_window = -1;
 
-	if (required.first > 0)
+	// Written by SPU jobs and already in the SPU upload heap (Common/spu_upload.h): nothing to copy. A draw that has
+	// such a block and others that no job wrote (a static stream of the model) gets those copied into the heap by this
+	// thread, so that all of its blocks are in one window; the layout then points at each block where it is.
+	std::array<u32, 8> spu_block_offsets{};
+
+	if (!m_spu_upload_buffer && rsx::spu_upload::g_state.wanted.load(std::memory_order_relaxed) && !m_spu_upload_window) [[unlikely]]
+	{
+		m_spu_upload_window = 1; // tried
+		create_spu_upload_heap();
+	}
+
+	if (required.first > 0 && m_spu_upload_buffer && rsx::spu_upload::mode() != 1 && rsx::spu_upload::mode() != 3)
+	{
+		auto& stats = rsx::spu_upload::g_state;
+		const auto& blocks = m_vertex_layout.interleaved_blocks;
+
+		if (blocks.size() <= spu_block_offsets.size() && rsx::method_registers.current_draw_clause.command != rsx::draw_command::inlined_array)
+		{
+			struct span_t { u32 address, length; u64 offset; };
+			std::array<span_t, 8> spans;
+			u32 total = 0, found = 0, appended_blocks = 0, appended_bytes = 0;
+			bool usable = true;
+
+			for (u32 i = 0; i < blocks.size(); i++)
+			{
+				const auto range = blocks[i]->calculate_required_range(vertex_base, vertex_count);
+				const u64 address = u64{blocks[i]->real_offset_address} + u64{range.first} * blocks[i]->attribute_stride;
+				const u32 length = range.second * blocks[i]->attribute_stride;
+
+				if (!length || address + length > 0x100000000ull)
+				{
+					usable = false;
+					break;
+				}
+
+				spans[i] = {static_cast<u32>(address), length, address + length <= rsx::constants::local_mem_base ? rsx::spu_upload::find(static_cast<u32>(address), length) : u64{umax}};
+				found += spans[i].offset != umax;
+				total += length;
+			}
+
+			usable = usable && found && total == required.first;
+			s64 window = -1;
+
+			for (u32 i = 0; usable && i < blocks.size(); i++)
+			{
+				auto& span = spans[i];
+
+				if (span.offset == umax)
+				{
+					span.offset = rsx::spu_upload::append(vm::get_super_ptr<const u8>(span.address), span.length, [](u8* to, const void* from, u32 bytes)
+					{
+						if (bytes >= 1024 && utils::has_avx512())
+						{
+							vk::readback_copy::stream(to, from, bytes);
+						}
+						else
+						{
+							std::memcpy(to, from, bytes);
+						}
+					});
+
+					appended_blocks++;
+					appended_bytes += span.length;
+				}
+
+				if (span.offset == umax || (window >= 0 && static_cast<s64>(span.offset / m_spu_upload_window) != window))
+				{
+					usable = false;
+					break;
+				}
+
+				if (rsx::spu_upload::mode() == 2)
+				{
+					stats.verified++;
+					if (std::memcmp(stats.mapped.load() + span.offset, vm::get_super_ptr<const u8>(span.address), span.length)) stats.differing++;
+				}
+
+				window = static_cast<s64>(span.offset / m_spu_upload_window);
+				spu_block_offsets[i] = static_cast<u32>(span.offset % m_spu_upload_window);
+			}
+
+			if (usable)
+			{
+				spu_window = static_cast<s8>(window);
+				persistent_range_base = 0;
+				stats.hits++;
+				stats.hit_bytes += total;
+				stats.appended += appended_blocks;
+				stats.appended_bytes += appended_bytes;
+			}
+			else
+			{
+				stats.miss_bytes += required.first;
+			}
+		}
+		else
+		{
+			stats.multi_block++;
+			stats.miss_bytes += required.first;
+		}
+
+		if (static u64 printed = 0; vk::get_current_frame_id() - printed >= 300)
+		{
+			printed = vk::get_current_frame_id();
+			rsx::spu_upload::print_stats();
+		}
+	}
+
+	if (required.first > 0 && spu_window < 0)
 	{
 		//Check if cacheable
 		//Only data in the 'persistent' block may be cached
@@ -992,7 +1106,7 @@ vk::vertex_upload_info VKGSRender::upload_vertex_data()
 		vk::clear_status_interrupt(vk::heap_changed);
 	}
 
-	if (persistent_range_base != umax && !static_vertices)
+	if (persistent_range_base != umax && !static_vertices && spu_window < 0)
 	{
 		if (!m_persistent_attribute_storage || !m_persistent_attribute_storage->in_range(persistent_range_base, required.first, persistent_range_base))
 		{
@@ -1027,5 +1141,6 @@ vk::vertex_upload_info VKGSRender::upload_vertex_data()
 			result.vertex_index_offset,                   // Index offset
 			persistent_range_base, volatile_range_base,   // Binding range
 			result.index_info,                            // Index buffer info
-			static_vertices, result.static_indices };     // Geometry cache buffers in use
+			static_vertices, result.static_indices,       // Geometry cache buffers in use
+			spu_window, spu_block_offsets };              // SPU upload heap in use
 }

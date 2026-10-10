@@ -28,7 +28,7 @@ All figures: Ryzen 7 8845HS / Radeon 780M on AC, power profile "balanced" (30 W 
 |---|---|---|---|
 | main menu | 33.7 FPS | 42 to 46 FPS | 60.0 FPS, render thread at 0.54 of a core |
 | opening cutscene (in engine), 30 s | | 44.9 FPS (without the two main changes below) | 60.0 FPS at 21 W, render thread at 0.41 of a core |
-| first fight on Gaia | 29 FPS (one load) | 32 to 35 FPS (single loads) | 41 to 42 FPS after the first night (means of 6 or 7 loads); about 44 after the second round; 50.6 after the third (host kernels, see below); 56.9 after the fourth (ten kernels, non-temporal vertex copies), all at 30 W |
+| first fight on Gaia | 29 FPS (one load) | 32 to 35 FPS (single loads) | 41 to 42 FPS after the first night (means of 6 or 7 loads); about 44 after the second round; 50.6 after the third (host kernels, see below); 56.9 after the fourth (ten kernels, non-temporal vertex copies); the fifth (three more kernels) takes 0.7 to 1.5 ms off the main thread's waits, between 0 and 5 FPS depending on the stretch; all at 30 W |
 | first fight, `launch.py --fast` (relaxed SPU floats) | | | 44.8 FPS (mean of 6 loads, first night; not measured again) |
 | first fight, performance power profile (54 W) | | | 49 FPS before the third round; 54 to 60 after it |
 
@@ -90,6 +90,9 @@ Checks: inFamous 2 city with the wide fast-draw scope, mode 4: 738,000 draws, no
 - `Accurate SPU Reservations: false`: the emulator exits when the menu state is loaded.
 - `Thread Scheduler Mode: RPCS3 Alternative Scheduler`: 38.4 against 43.7 FPS in the fight (6 pairs). Worse, although
   with the operating system's placement two of the seven busy threads share a physical core in half of the samples.
+- The main thread, the render thread and the six SPU threads each on a core of their own with every other emulator
+  thread kept off the main and render threads' sibling hardware threads (`tools/pin2.sh`, switched inside one
+  session, sixth round): 53.4 against 53.5 FPS.
 - Each of the eight busy threads pinned to a physical core of its own (`tools/pin.sh`): 41.0 against 40.8 FPS in the
   fight (5 pairs). No difference.
 - `Thread Scheduler Mode: RPCS3 Scheduler`: 36 FPS in the menu against 51. `Max SPURS Threads` 4 and 3: 46 and 42.
@@ -287,6 +290,173 @@ Measuring: Kratos dies after 20 to 60 seconds of holding block. `gw.py ab` now r
 SPU load is gone and measures that window again; `gw.py revive` does the same before a profile. Pairs of windows in a
 fixed A B order can lock to the fight's 20 second cycle (one such run showed the streaming copy 5 FPS slower); use
 `tools/abx.sh`. `tools/ppudis.py` disassembles the executable's PPU code by address and lists callers.
+
+## Fifth round: what the main thread waits for, job by job
+
+New diagnostics (all part of `RPCS3_SPU_SAMPLER=<file>`): `<file>.stack` has the main PPU thread's guest call chain
+whenever it sleeps or spins at one of its two job waits; `<file>.blocked` has what every SPU thread was running at
+those moments, by wait site (`tools/blocked.py`); `<file>.rsx` has the state of the render thread's command queue
+(running, or spinning on the game's jump to self). `tools/abwait.sh` switches a live control inside one fight session
+and prints, per setting, the main thread's milliseconds per frame at each wait site and the render thread's working
+time per frame. `RPCS3_SPU_KERNEL_CHECK=<dir>,<pc>` writes the state before and after each run of a built kernel;
+`geom/kcheck.py` compares it with the SPU code run in the interpreter.
+
+The main thread's waits, milliseconds per frame (they vary by a factor of two between sessions):
+
+| where | what it is | ms | SPU threads meanwhile |
+|---|---|---|---|
+| `0x7212d8` (in a firmware module, from `0x2315f8`) | sleeps until up to six handles are done | 1.5 to 3.0 | the tasks `9d227620`, `fb56025d` and the noise task, next to geometry jobs |
+| `0x2eafb0` (from `0x2307c8` and `0x236a64`) | spins until every worker has passed a job index | 0.9 to 2.0 | half geometry jobs, a quarter asleep, `a6df6c09`; a worker inside a long task holds it up |
+| `0x26d398` | polls the RSX reference with a 30 microsecond sleep | 1.0 to 2.0 | |
+| `0x22fb40` | spins on a busy flag after submitting a job | 0.9 to 1.1 | one worker in `b245f318`, the rest geometry |
+| `0x28da90` | polls a flag with a 30 microsecond sleep | 0.2 to 0.8 | |
+
+What was done with it:
+
+- **`b245f318` is a bounding sphere job** that the main thread waits for directly. Its two hot functions are host
+  kernels now: `0x59a0` (groups of spheres moved by their bone matrices, one sphere around each group) and `0x4ef0`
+  (a bit for every overlapping pair of two sphere lists). `geom/b245.py` has the prototypes. The built pair test is
+  identical to the SPU code in 200 runs; the sphere kernel differs by the SPU code's square root estimate (largest
+  difference 0.2% of a 0.017 radius). The wait at `0x22fb40` goes from 1.12 to 0.90 ms a frame.
+- **The noise function is the lever on the job barrier.** With `noise4` skipped as an experiment the fight ran at
+  57.4 against 51.6 FPS in one session and the spin at `0x2eafb0` fell from 1.45 to 0.40 ms: the noise task runs
+  for milliseconds without yielding, and the barrier waits for the worker that has it. The kernel was rewritten: the
+  eight corner gradients of all four points come from three byte shuffles (the components are -1, 0 or 1) instead of
+  96 scalar loads, fade and floor are done for the four points at once. It costs 1.1% of SPU time instead of 3.4%;
+  results agree with the SPU code to 3e-7. Old against new inside one session: the spin at `0x2eafb0` 1.67 to 0.90
+  ms, all waits 5.90 to 5.16 ms. What is left of the task is its loop at `0x61e4` (430 instructions and four calls
+  of the function per iteration), 1.5% of SPU time.
+- All three together (live control 16 = 6 gives the earlier state): waits 7.18 to 5.71 ms a frame and 51.4 against
+  56.5 FPS in 11 windows of 8 seconds each; 54.5 against 54.7 FPS in 40 windows of 2.5 seconds each. The waits fall
+  every time; the frame rate follows only where the render thread is not the limit.
+- **In the slowest stretches the render thread is the limit**: its queue is running 96 to 98% of the time in windows
+  of 43 to 47 FPS, 80 to 90% in windows above 55. It works 16.7 to 18.3 ms a frame.
+- **Short sleeps spun through** (`RPCS3_PPU_USLEEP_SPIN=<microseconds>`, off by default; live control 18): with 100
+  the reference poll goes from 1.00 to 0.54 ms a frame and the flag poll from 0.52 to 0.75; 54.4 against 55.1 FPS
+  (40 windows each). Too little to make it a default for every game.
+
+Tried and not kept:
+
+- The vertex copy worker again, now with the per-draw label (`NV4097_TEXTURE_READ_SEMAPHORE_RELEASE`, which the
+  render thread had been waiting at for the worker, 10% of its time) written by the worker after the copy: 50.8
+  against 54.8 FPS, the main thread's waits up from 5.3 to 7.0 ms. The eight physical cores are all busy (five to six
+  SPU threads, the main thread, the render thread); a ninth busy thread shares a core with one of them and costs
+  more than it saves. The same explains the offload thread's 21 FPS.
+- SPU transfers: two million a second, 11% of SPU time in the transfer functions, most of it in the copy itself.
+  Without `rep movsb` (vector loops for every size): 11.2% against 11.2%. With the list prefetch (live control 7) at
+  512 and 4,096 bytes: 10.8% and 11.6% against 11.2%. It is the memory, not the copy routine.
+- `SPU Reservation Busy Waiting Enabled`: spinning 3.0 and 2.0 ms against 3.8, sleeping 3.4 and 5.0 against 2.7,
+  the same frame rate.
+
+Not done: the rest of the noise task's loop; the four hot functions of `a6df6c09` (2% of SPU time, running while
+the main thread spins at the barrier); `72cc647b` (6% in five places, tree walks rather than arithmetic).
+
+## Sixth round: copies, the job chain, and what a frame really waits for
+
+**Vertex data straight from the SPU thread to the GPU buffer** (`rpcs3/Emu/RSX/Common/spu_upload.h`,
+`RPCS3_SPU_VERTEX_UPLOAD=1`, now a default; live control 19: 1 = draws do not use it, 2 = every range used is compared
+with guest memory, 3 = off). The geometry job PUTs each draw's vertices to guest memory and the render thread copied
+them again, cold, into its upload ring: 20 MB a frame. Now the SPU thread's PUT also appends the bytes (still in its
+cache) to a 256 MB heap that the vertex shader reads, and publishes the guest range in a table; a draw whose blocks
+are published binds the heap at their offsets (`fill_vertex_layout_state` takes one offset per interleaved block) and
+copies nothing. Blocks that no job wrote (a static stream of the model next to the job's stream) are copied into the
+heap by the render thread, so that the rest of the draw still needs no copy.
+
+- The render thread's vertex copying falls from about 13.6 to 1.6 MB a frame; its working time per frame from 16.95
+  to 15.28 ms and from 17.82 to 14.28 ms (two sessions, `tools/abwait.sh`), busy 90% to 77-83%.
+- Checked: live control 19 = 2 compares every range used with guest memory at the draw. 19.8, 13.0 and 10.6 million
+  ranges over fights with deaths and checkpoint restarts: none differed.
+- What is tracked and what is not is in the header. Only the geometry job's PUTs are published (recognised by the
+  code at the skinning loop): published for every program, Ratchet & Clank showed 5,379 differing ranges in 3.4
+  million, and in games without such a job the path replaced working caches with a copy per draw (Ratchet 52 FPS
+  instead of 60). Other games now never create the heap.
+- Userptr zero-copy (the GPU reading guest memory) was measured in the inFamous 2 work: amdgpu validates every
+  user page on each submission, a net loss. This is the copy-once alternative.
+
+**Whole-function kernels return and are called without a chunk change** (`SPULLVMRecompiler.cpp`). A kernel that
+replaces a function used to leave through the dispatcher; it now returns as the function's `BI $LR` would (stack
+mirror), and a `BRSL` whose target is such a function calls the kernel at the call site after comparing the target's
+first four instructions in the local store, never entering the function's chunk (whose entry loads the registers of
+a body that does not run). The noise function is called about 30,000 times a frame. Dispatcher against stack-mirror
+return in one session: 54.5 against 56.4 FPS (11 and 12 windows of 8 s), 51.0 against 52.5 (19 and 20 windows of
+6 s, no sampler). The function's stub chunk (5% of the noise thread's time) is gone with the call-site form.
+
+**What a frame waits for.** Three places counted as the main thread's own work are spin loops: `0x228ef0` (16 NOPs
+around a test of the halfword at `0x59b500`, which the job `d8b7eb58` clears once a frame), `0x22fb40` (the same
+block, offset 20) and the code after the submit at `0x230048`. With them the thread waits about 9 ms of a 19 ms
+frame and works 10 ms. The waits are a chain of synchronous hand-offs to SPU jobs and tasks: `cellSpursJoinTask2`
+for the frame's tasks (`0x7212d8`, 1.2 to 3.2 ms), the `d8b7eb58` flag (1 to 3 ms), the bounding sphere job (0.9),
+the job barrier (0.5 to 1.5), the geometry and RSX polls (1 to 2). Their sum stays the same when one of them is
+made faster: the time shows up at the next one. That is why single changes move the frame rate so little.
+
+How the SPUs are used (sampler, `.threads` and `.spurs`): the game's three geometry queues (workloads 10 to 12,
+priorities `05 05 05 00 00 00 00 03`, one active per frame) run on SPU 0 to 2 only, 86 to 87% of those SPUs' time,
+with 10% for workload 7 (`72cc647b`). SPU 3 and 4 run the tasks (`9d227620`, `fb56025d`) and are idle 41% of the
+time. A sixth SPU thread (a second SPURS instance) runs a serial chain: noise task, `a6df6c09`, `407ce898`,
+`672748c6`, busy 64%. The main thread joins that chain's tasks and its barrier waits while `a6df6c09` runs.
+
+**What the frame time follows** (`vk::live_ctl::probe_delay`, live controls 21 and 22: nanoseconds burnt at one
+place, switched inside one session; 8 to 10 windows of 6 s each): no delay 55.8 FPS; 1,500 ns at each published PUT
+of the geometry job (about 5 ms more per geometry worker and frame) 49.0; 1,000 ns at each draw's vertex upload on
+the render thread (2.5 to 3.3 ms more a frame) 52.8; 100 ns at each call of the noise kernel (3 ms more on that
+thread) 54.4. A millisecond more on each geometry worker costs about half a millisecond of frame time, a millisecond
+on the render thread a third, the noise chain next to nothing now (with the noise function skipped altogether:
+52.3 against 52.6 FPS).
+
+**The geometry SPUs kept for geometry** (`RPCS3_SPURS_RESERVE=1`, now a default; live control 20: 1 = off, 2 = on).
+Workload 7 (priorities `04 04 04 03 02 02`, `72cc647b` jobs) ranks one step above the geometry queues on SPU 0 to 2
+and takes 10% of their time, while SPU 3 and 4, where it ranks higher still, idle 41% of the time. The emulator
+rewrites its table to `06 06 06 03 02 02` the way `cellSpursSetPriorities` does (new table, update message to every
+SPURS kernel), when a kernel reads the first line of the SPURS structure; switching it off restores the game's
+table. Off against on in one session: 50.3 against 51.4 FPS and 52.4 against 54.4 (20 windows of 6 s per arm each
+time), windows under 50 FPS 16 against 8. Only a workload exactly one step above a queue that is tied to SPU 0 to 2,
+and with a higher priority on SPU 3 and 4, is touched: inFamous 2 measures the same with and without (59.2 and
+59.3 against 59.4 and 59.5).
+
+**No command-fetch lock for vertex PUTs.** With `RSX FIFO Fetch Accuracy: Atomic` (the default) every SPU PUT to
+main memory takes the lock that keeps the render thread's command reads whole. The geometry job's PUTs of 1 KB and
+more are vertex and index data (its command chunks are a third of a kilobyte), so they leave it out (live control
+19 = 4 keeps it). `do_dma_transfer` on the three geometry workers and the render thread: 8.8 and 8.6% of their time
+with the lock, 7.7 and 7.3% without.
+
+The test configuration `cfg-test.yml` has `SPU Block Size: Safe`; `play-config.yml` has `Mega`. Everything of this
+round was run with both: Mega 51.9 and 57.8 FPS, Safe 52.0 and 55.4 (alternating sessions), and the compare mode of
+the upload heap found no difference in 8 million ranges with Mega.
+
+Tried and not kept:
+
+- **Geometry on five SPUs.** The queues are created at `0x28dd24..0x28de3c` with three priority bytes and a count of
+  3 (`li r18, 3`, `li r19, 3`). A game patch that sets five (cold boot; the tables are built at start-up) and two
+  emulator-side variants (priorities through the SPURS update message, ready count 3 to 5) all stop the game as soon
+  as an SPU other than 0 to 2 has run a geometry job: the workload's contention count stays up with no SPU in it.
+  The job code has per-SPU state for three workers that I did not find.
+- **Keeping SPU 0 to 2 for geometry, first form** (workloads 6 and 7 both lowered below the queues' priority there): the geometry poll
+  went from 1.09 to 0.11 ms a frame, the `d8b7eb58` wait from 1 to 3 ms (that job then waits behind long tasks on
+  SPU 3 and 4). 53.9 against 53.9 FPS.
+- **Workload 6 ahead of geometry on SPU 0 to 2** (4 instead of the tie at 5, for the `d8b7eb58` job: 0.08 ms of work
+  a frame that the main thread waits 1 to 3 ms for, because SPU 3 and 4 take it only when a long `9d227620` job
+  ends and SPU 0 to 2 do not leave geometry for an equal priority): 50.3 against 53.5 FPS. The workload also carries
+  `72cc647b` jobs, and every change of workload reloads programs; the geometry polls grew by more than the flag wait
+  shrank.
+- **The noise loop's float arithmetic without the approximate mode's clamps** (FS, FM, FMA, FMS as plain host
+  operations in its two chunks): the chunks' share of the noise thread did not change (6.0 and 3.6% against 6.1 to
+  6.4 and 3.5 to 3.8%). Removed.
+- `MFC Commands Shuffling Limit` (deferred transfers): the game stops. Huge pages for guest memory: the game's heap is
+  made of 1 MB mappings, and TLB misses cost the render thread about 5% and the others 1%: not built.
+- An `a6df6c09` kernel: one function of 1,250 instructions with trigonometric polynomials; not attempted.
+- `SPU Reservation Busy Waiting`, short-sleep spinning (again): no change.
+
+The fight at the sustained 30 W with everything: 45.9 to 60.0 FPS in 5 second windows, mean 54.0 over 20 windows
+(three stretches of one session); later sessions of the same build gave means of 51.9, 57.8 (Mega) and 48.4 (Mega,
+a minute and a half into the session). Sessions differ by 3 to 4 FPS in the mean (49.5 and 56.9 were measured for states
+that A/B switching inside a session shows to be within 2 FPS of each other), so the absolute numbers of different
+rounds do not compare; the switches inside one session do.
+
+Tools added: `tools/chain.sh` (what each SPU thread runs), `tools/cold.sh` (boot without the savestate: the
+opening leads into the same fight after five minutes), `tools/patchtry.sh` (a game patch, cold boot, does it reach
+the fight), `tools/uptest.sh` (upload heap statistics), sampler files `.threads` (program per SPU thread, SPURS
+workload per SPU), `.spurs` (workload priorities, ready counts), `.prio` (PPU call chains when a priority table
+changes).
 
 ## Running it
 

@@ -77,7 +77,8 @@ namespace rsx
 			u32 vertex_count,
 			s32* buffer,
 			u32 persistent_offset_base,
-			u32 volatile_offset_base) const;
+			u32 volatile_offset_base,
+			const u32* persistent_block_offsets = nullptr) const; // set: where each interleaved block starts, instead of one after the other
 
 		void write_vertex_data_to_memory(
 			const vertex_input_layout& layout,

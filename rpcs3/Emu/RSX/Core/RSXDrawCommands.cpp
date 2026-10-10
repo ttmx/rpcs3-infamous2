@@ -294,7 +294,8 @@ namespace rsx
 		u32 vertex_count,
 		s32* buffer,
 		u32 persistent_offset_base,
-		u32 volatile_offset_base) const
+		u32 volatile_offset_base,
+		const u32* persistent_block_offsets) const
 	{
 		std::array<s32, 16> offset_in_block = {};
 		u32 volatile_offset = volatile_offset_base;
@@ -330,8 +331,15 @@ namespace rsx
 		}
 		else
 		{
+			u32 block_index = 0;
+
 			for (const auto& block : layout.interleaved_blocks)
 			{
+				if (persistent_block_offsets)
+				{
+					persistent_offset = persistent_offset_base + persistent_block_offsets[block_index++];
+				}
+
 				for (const auto& attrib : block->locations)
 				{
 					const u32 local_address = (REGS(m_ctx)->vertex_arrays_info[attrib.index].offset() & 0x7fffffff);

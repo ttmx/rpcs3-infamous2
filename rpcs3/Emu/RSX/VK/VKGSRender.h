@@ -370,7 +370,16 @@ private:
 	// Live control 9: 2 = on, 4 = on with the program of every texture change checked against a full lookup,
 	// 5 = on without texture and polygon offset changes inside a run (for comparisons)
 	static bool fast_draw_enabled() { const auto mode = vk::live_ctl::get(9); return mode == 2 || mode == 4 || mode == 5 || mode == 6; }
-	bool m_static_vertices_bound = false;
+	// Which buffer the persistent vertex stream is bound to: 0 = the ring, 1 = the geometry cache, 2 + n = window n of the SPU upload heap
+	u32 m_persistent_source_bound = 0;
+	static u32 persistent_source(const vk::vertex_upload_info& info) { return info.spu_window >= 0 ? 2u + info.spu_window : info.static_vertices ? 1u : 0u; }
+
+	// Vertex data that SPU jobs write, appended by their threads (Common/spu_upload.h): a heap and views of its windows
+	std::unique_ptr<vk::buffer> m_spu_upload_buffer;
+	std::vector<std::unique_ptr<vk::buffer_view>> m_spu_upload_views;
+	u64 m_spu_upload_window = 0;
+	void create_spu_upload_heap();
+	VkDescriptorBufferViewEx persistent_view(const vk::vertex_upload_info& info);
 	bool m_native_late_counters_armed = false;
 	u64 m_native_late_counter_generation = 0;
 	u64 m_native_late_counter_begin_ns = 0;

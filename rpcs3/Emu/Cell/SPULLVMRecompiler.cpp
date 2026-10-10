@@ -2559,6 +2559,7 @@ public:
 		const u32 start = m_pos;
 		const u32 end = start + m_size;
 
+
 		m_pp_id = 0;
 
 		std::string function_log;
@@ -2605,7 +2606,7 @@ public:
 			+ ((m_trace_06c30 || m_trace_06c30_return) ? "-trace-06c30-EGC0gjYw3PwftJbtb6hXj7Xby6m5-wall-v1" : "")
 			+ (g_spu_04ac8_contribution_trace ? "-trace-04ac8-Hc9ev2Q8JGX0Fcwtuv18zKbed58C-tree-v4" : "")
 			+ (g_spu_native_rwv_experiment ? "-native-rwv-v1" : "")
-			+ (spu_native_geometry::enabled() ? "-native-geometry-v1" : "")
+			+ (spu_native_geometry::enabled() ? "-native-geometry-v8" : "")
 			+ (spu_native_geometry::region_capture::get().pc ? "-region-capture" : "")
 			+ (spu_xfloat_fast_mode() && g_cfg.core.spu_xfloat_accuracy == xfloat_accuracy::accurate ? (spu_xfloat_fast_mode() == 2 ? "-xfloat-fast-check-v3" : "-xfloat-fast-v2") : "")
 			+ (g_spu_native_sxe_experiment ? "-native-sxe-v1" : "")
@@ -4205,6 +4206,16 @@ public:
 						{
 							// The kernel may decline (returns 0): the SPU code of the region follows as usual
 							ensure_gpr_stores();
+
+							// The return address and stack pointer of a whole function, read where both paths can use them
+							value_t<u32> return_addr{};
+
+							if (!kernel->exit)
+							{
+								return_addr = eval(extract(get_reg_fixed<u32[4]>(0), 3) & 0x3fffc);
+								get_reg_fixed<u32[4]>(1);
+							}
+
 							const auto handled = call(kernel->name, kernel->run, m_thread, m_lsptr);
 							const auto native_done = llvm::BasicBlock::Create(m_context, "", m_function);
 							const auto native_declined = llvm::BasicBlock::Create(m_context, "", m_function);
@@ -4217,7 +4228,9 @@ public:
 							}
 							else
 							{
-								tail_chunk(m_dispatch);
+								// A whole function: return as its BI $LR would, to the caller's code by the stack mirror
+								// instead of through the dispatcher (the noise function is called 30,000 times a frame)
+								m_ir->CreateBr(add_block_indirect(spu_opcode_t{0x35000000}, return_addr));
 							}
 							m_ir->SetInsertPoint(native_declined);
 						}
@@ -11599,6 +11612,42 @@ public:
 		set_link(op);
 
 		const u32 target = spu_branch_target(m_pos, op.i16);
+
+		// A call of a function that has a host version (SPUNativeGeometry.hpp): made right here, without entering the
+		// function's chunk (whose entry loads the registers of a body that is not going to run) and with this chunk's
+		// values kept. The target's code is not part of what is being compiled, so its first instructions are compared
+		// with the kernel's when the call runs. The kernel has written r3; the code after the call follows.
+		if (const auto kernel = spu_native_geometry::enabled() && !m_interp_magn && !(m_finfo && m_finfo->fn) && m_block ? spu_native_geometry::find_function(target) : nullptr)
+		{
+			u8 bytes[16];
+			for (u32 i = 0; i < 4; i++)
+			{
+				const be_t<u32> word = kernel->words[i];
+				std::memcpy(bytes + i * 4, &word, 4);
+			}
+
+			u64 expected[2];
+			std::memcpy(expected, bytes, 16);
+
+			ensure_gpr_stores();
+
+			const auto same0 = m_ir->CreateICmpEQ(m_ir->CreateLoad(get_type<u64>(), _ptr(m_lsptr, target)), m_ir->getInt64(expected[0]));
+			const auto same1 = m_ir->CreateICmpEQ(m_ir->CreateLoad(get_type<u64>(), _ptr(m_lsptr, target + 8)), m_ir->getInt64(expected[1]));
+			const auto native = llvm::BasicBlock::Create(m_context, "", m_function);
+			const auto done = llvm::BasicBlock::Create(m_context, "", m_function);
+			const auto declined = llvm::BasicBlock::Create(m_context, "", m_function);
+			m_ir->CreateCondBr(m_ir->CreateAnd(same0, same1), native, declined, m_md_likely);
+			m_ir->SetInsertPoint(native);
+			const auto handled = call(kernel->name, kernel->run, m_thread, m_lsptr);
+			m_ir->CreateCondBr(m_ir->CreateICmpNE(handled, m_ir->getInt32(0)), done, declined, m_md_likely);
+			m_ir->SetInsertPoint(declined);
+			BR(op);
+			m_ir->SetInsertPoint(done);
+			m_block->reg[3] = m_ir->CreateLoad(get_reg_type(3), init_reg_fixed(3));
+			m_block->block_end = m_ir->GetInsertBlock();
+			m_ir->CreateBr(add_block(m_pos + 4));
+			return;
+		}
 
 		if (m_finfo && m_finfo->fn && target != m_pos + 4)
 		{

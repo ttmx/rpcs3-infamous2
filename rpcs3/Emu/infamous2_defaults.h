@@ -43,6 +43,8 @@ namespace infamous2
 			{"RPCS3_SPU_PUTLLC_PIECEWISE", "1"},
 			{"RPCS3_SPU_NATIVE_GEOMETRY", "1"},
 			{"RPCS3_RSX_STREAM_VERTEX_COPY", "1"},
+			{"RPCS3_SPU_VERTEX_UPLOAD", "1"},
+			{"RPCS3_SPURS_RESERVE", "1"},
 		};
 
 		for (const entry& e : defaults)

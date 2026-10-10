@@ -1,5 +1,8 @@
 #include "Emu/RSX/VK/VKLiveCtl.hpp"
 #include "Emu/RSX/VK/VKNativeAA.h"
+#include "Emu/RSX/VK/VKReadbackCopy.hpp"
+#include "Emu/RSX/Common/spu_upload.h"
+#include "util/sysinfo.hpp"
 #include "stdafx.h"
 #include "Utilities/JIT.h"
 #include "Utilities/date_time.h"
@@ -2393,6 +2396,103 @@ static void spu_light_capture(spu_thread* spu, bool kernel_load, u32 eal, u32 ls
 	}
 }
 
+// SPURS: the workload that sits one step above a game's geometry queues on their SPUs moves below them there
+// (RPCS3_SPURS_RESERVE=1; live control 20: 1 = off, 2 = on). God of War III runs its three geometry job queues on SPU
+// 0 to 2 only (priorities 5 5 5 0 0 0 0 3; the job code has state for three workers, more stop the game) and
+// workload 7 with 4 4 4 3 2 2: on SPU 0 to 2 that workload's jobs (program 72cc647b) take 10% of the time, while SPU
+// 3 and 4, where it ranks higher still, are idle 41% of the time. A delay probe shows the frame time following
+// the geometry workers' time more than anything else. Here such a workload gets priority 6 on SPU 0 to 2, written the
+// way cellSpursSetPriorities writes it, when a worker's SPURS kernel reads the first line of the SPURS structure.
+// Workloads that tie with the queues or rank two or more steps above them are left alone: lowering the tie (workload
+// 6) made the main thread wait three times as long for a job of it.
+namespace spurs_reserve
+{
+	static bool enabled()
+	{
+		static const bool value = []
+		{
+			const char* option = std::getenv("RPCS3_SPURS_RESERVE");
+			return option && option[0] == '1' && !option[1];
+		}();
+
+		const u64 live = vk::live_ctl::get(20);
+		return live ? live == 2 : value;
+	}
+
+	// Priorities the game set, by workload, while they are replaced; 0 = untouched
+	static atomic_t<u64> s_original[16]{};
+	static atomic_t<u32> s_spurs{0};
+
+	static void on_getllar(spu_thread& spu, u32 addr)
+	{
+		static const bool wanted = std::getenv("RPCS3_SPURS_RESERVE") != nullptr || std::getenv("RPCS3_VK_LIVE_CTL") != nullptr;
+		if (!wanted) [[likely]] return;
+
+		// The kernel context holds the structure's address at 0x1c0
+		be_t<u32> spurs;
+		std::memcpy(&spurs, spu.ls + 0x1c4, 4);
+
+		if (spurs != addr || !addr || !vm::check_addr(addr, vm::page_writable, 0x2000)) return;
+
+		u8* sp = vm::_ptr<u8>(addr);
+		const auto table = [&](u32 wid) { return reinterpret_cast<atomic_t<u64>*>(sp + 0xb00 + wid * 32 + 0x18); };
+		const auto notify = [&]
+		{
+			reinterpret_cast<atomic_t<u8>*>(sp + 0xbd)->release(0xff);
+			reinterpret_cast<atomic_t<u8>*>(sp + 0x72)->release(0xff);
+		};
+
+		if (!enabled())
+		{
+			if (s_spurs == addr)
+			{
+				for (u32 wid = 0; wid < 16; wid++)
+				{
+					if (const u64 original = s_original[wid].exchange(0))
+					{
+						table(wid)->release(original);
+						notify();
+					}
+				}
+			}
+
+			return;
+		}
+
+		// The priority of a queue tied to SPU 0 to 2
+		u8 queue = 0;
+
+		for (u32 wid = 0; wid < 16 && !queue; wid++)
+		{
+			const u8* p = sp + 0xb00 + wid * 32 + 0x18;
+			if (p[0] > 2 && p[0] < 14 && p[1] == p[0] && p[2] == p[0] && !p[3] && !p[4] && !p[5]) queue = p[0];
+		}
+
+		if (!queue) return;
+
+		for (u32 wid = 0; wid < 16; wid++)
+		{
+			u8 p[8];
+			const u64 old = table(wid)->load();
+			std::memcpy(p, &old, 8);
+
+			// One step above the queues on SPU 0 to 2, and higher still on SPU 3 and 4
+			if (p[0] != queue - 1 || p[1] != p[0] || p[2] != p[0] || !p[3] || !p[4] || p[3] >= p[0] || p[4] >= p[0]) continue;
+
+			p[0] = p[1] = p[2] = queue + 1;
+			u64 changed;
+			std::memcpy(&changed, p, 8);
+
+			if (table(wid)->compare_and_swap_test(old, changed))
+			{
+				s_original[wid].compare_and_swap_test(0, old);
+				s_spurs = addr;
+				notify();
+			}
+		}
+	}
+}
+
 // Diagnostic (RPCS3_SPU_XFER_TRACE=file): every transfer of every SPU thread while the file "<file>.go" exists:
 // time in microseconds, thread, program (hash of local store 0x4040..0x4140), pc, G or P, address, local store address,
 // size, and for a GET of at most 128 bytes the data. List transfers are written element by element (L lines).
@@ -2583,9 +2683,31 @@ void spu_thread::do_dma_transfer(spu_thread* _this, const spu_mfc_cmd& args, u8*
 				std::map<std::tuple<u32, u32, u32>, u64> counts;
 				std::map<std::tuple<u32, u32, u32>, u64> ppu_counts;
 				std::map<std::array<u32, 7>, u64> stack_counts;
+				std::map<std::tuple<u32, u32, u32>, u64> blocked_counts;
+				std::map<std::tuple<u32, u32, u32>, u64> thread_counts;
+				std::map<u32, u32> running_now;
+				std::map<std::tuple<u32, u32, u32, u32>, u64> workload_counts;
+				u32 spurs_addr = 0;
+				u64 last_prio[16]{};
+				std::map<std::tuple<u32, u8, u8>, u64> ready_hist;
+				std::map<std::tuple<u32, u64, u8>, std::array<u64, 3>> spurs_counts;
+				std::map<std::pair<u32, u32>, u64> concurrency_counts;
+				u64 rsx_counts[8]{};
 				for (u64 n = 1;; n++)
 				{
 					std::this_thread::sleep_for(std::chrono::microseconds(500));
+					// The render thread's command queue state (running, empty, spinning on a jump to self, ...)
+					if (auto rsxthr = rsx::get_current_renderer()) rsx_counts[static_cast<u32>(rsxthr->performance_counters.state) & 7]++;
+
+					// Where the main PPU thread waits or spins for jobs right now (0 = it runs)
+					u32 main_state = 0;
+					idm::select<named_thread<ppu_thread>>([&](u32 id, ppu_thread& ppu)
+					{
+						if (id != 0x1000000) return;
+						const bool waits = !!(ppu.state.load() & (cpu_flag::wait + cpu_flag::suspend + cpu_flag::stop));
+						main_state = (waits || ppu.cia == 0x2eafe8 || ppu.cia == 0x22fb28) ? ppu.cia : 0;
+					});
+					running_now.clear();
 					idm::select<named_thread<spu_thread>>([&](u32, spu_thread& spu)
 					{
 						const u8* ls = spu.ls;
@@ -2594,12 +2716,24 @@ void spu_thread::do_dma_transfer(spu_thread* _this, const spu_mfc_cmd& args, u8*
 						for (u32 i = 0x4040; i < 0x4140; i++) hash = (hash ^ ls[i]) * 0x01000193;
 						const bool waits = !!(spu.state.load() & (cpu_flag::wait + cpu_flag::suspend + cpu_flag::stop));
 						counts[{hash, spu.pc & 0x3fffc, waits ? 1 : 0}]++;
+						if (main_state) blocked_counts[{main_state, hash, (spu.pc & 0x3fffc) | (waits ? 1 : 0)}]++;
+						{
+							// The SPURS kernel's current workload on this SPU (kernel context: workload id at 0x1dc, SPU number at 0x1c8)
+							be_t<u32> wid, number;
+							std::memcpy(&wid, ls + 0x1dc, 4);
+							std::memcpy(&number, ls + 0x1c8, 4);
+							if (number < 8 && wid <= 32) workload_counts[{number, wid, hash, waits ? 1 : 0}]++;
+						}
+						thread_counts[{spu.lv2_id, hash, waits ? 1 : 0}]++;
+						if (!spurs_addr) { be_t<u32> a; std::memcpy(&a, ls + 0x1c4, 4); if (a >= 0x10000 && !(a & 127) && vm::check_addr(a, vm::page_readable, 0x2000)) spurs_addr = a; }
+						// How many threads run each program at the same instant
+						if (!waits) running_now[hash]++;
 					});
 					idm::select<named_thread<ppu_thread>>([&](u32 id, ppu_thread& ppu)
 					{
 						const bool waits = !!(ppu.state.load() & (cpu_flag::wait + cpu_flag::suspend + cpu_flag::stop));
 						ppu_counts[{id, ppu.cia, waits ? 1 : 0}]++;
-						if (id == 0x1000000 && waits)
+						if (id == 0x1000000 && (waits || ppu.cia == 0x2eafe8 || ppu.cia == 0x22fb28))
 						{
 							// Who the main thread waits for: the return addresses up its stack (read while it sleeps)
 							std::array<u32, 7> chain{ppu.cia, static_cast<u32>(ppu.lr)};
@@ -2613,11 +2747,83 @@ void spu_thread::do_dma_transfer(spu_thread* _this, const spu_mfc_cmd& args, u8*
 							stack_counts[chain]++;
 						}
 					});
+					for (const auto& [hash, threads] : running_now) concurrency_counts[{hash, threads}]++;
+
+					// The game's SPURS instance (its address is in every worker's kernel context): for each workload the
+					// priorities per SPU, the contention limit, and how many SPUs it asks for and has
+					if (spurs_addr && vm::check_addr(spurs_addr, vm::page_readable, 0x2000))
+					{
+						const u8* sp = vm::get_super_ptr<const u8>(spurs_addr);
+						for (u32 w = 0; w < 16; w++)
+						{
+							u64 prio;
+							std::memcpy(&prio, sp + 0xb00 + w * 32 + 0x18, 8);
+
+							if (prio != last_prio[w])
+							{
+								// A priority table changed: who is setting it (every PPU thread's place and call chain, at most 500 microseconds late)
+								if (FILE* f = std::fopen((std::string(sampler_path) + ".prio").c_str(), "a"))
+								{
+									std::fprintf(f, "wid %u %016llx -> %016llx ready %u\n", w, static_cast<unsigned long long>(std::bit_cast<be_t<u64>>(last_prio[w])), static_cast<unsigned long long>(std::bit_cast<be_t<u64>>(prio)), sp[w]);
+									idm::select<named_thread<ppu_thread>>([&](u32 id, ppu_thread& ppu)
+									{
+										if (ppu.state.load() & (cpu_flag::wait + cpu_flag::suspend + cpu_flag::stop) && id != 0x1000000) return;
+										std::fprintf(f, "  %x: %x %x", id, ppu.cia, static_cast<u32>(ppu.lr));
+										u32 frame = static_cast<u32>(ppu.gpr[1]);
+										for (u32 i = 0; i < 12 && frame && vm::check_addr(frame, vm::page_readable, 24); i++)
+										{
+											frame = vm::_ref<be_t<u32>>(frame + 4);
+											if (!frame || !vm::check_addr(frame, vm::page_readable, 24)) break;
+											std::fprintf(f, " %x", +vm::_ref<be_t<u32>>(frame + 20));
+										}
+										std::fprintf(f, " r3 %llx r4 %llx r5 %llx\n", static_cast<unsigned long long>(ppu.gpr[3]), static_cast<unsigned long long>(ppu.gpr[4]), static_cast<unsigned long long>(ppu.gpr[5]));
+									});
+									std::fclose(f);
+								}
+								last_prio[w] = prio;
+							}
+							if (!prio && !sp[w]) continue;
+							ready_hist[{w, sp[w], sp[0x20 + w]}]++;
+							auto& e = spurs_counts[{w, prio, sp[0x50 + w]}];
+							e[0]++;
+							e[1] += sp[w];
+							e[2] += sp[0x20 + w];
+						}
+					}
+
 					if (n % 4000 == 0)
 					{
+						if (FILE* f = std::fopen((std::string(sampler_path) + ".spurs").c_str(), "w"))
+						{
+							// workload, priorities for SPU 0..7 (as stored), contention limit byte, samples, sum of ready counts, sum of current contention bytes
+							std::fprintf(f, "spurs %x\n", spurs_addr);
+							for (const auto& [key, n] : ready_hist) std::fprintf(f, "R %u ready %u running %u: %llu\n", std::get<0>(key), std::get<1>(key), std::get<2>(key), static_cast<unsigned long long>(n));
+							for (const auto& [key, e] : spurs_counts) std::fprintf(f, "%u %016llx %02x %llu %llu %llu\n", std::get<0>(key), static_cast<unsigned long long>(std::bit_cast<be_t<u64>>(std::get<1>(key))), std::get<2>(key), static_cast<unsigned long long>(e[0]), static_cast<unsigned long long>(e[1]), static_cast<unsigned long long>(e[2]));
+							std::fclose(f);
+						}
+						if (FILE* f = std::fopen((std::string(sampler_path) + ".threads").c_str(), "w"))
+						{
+							// T: SPU thread, program, waits, samples. C: program, threads running it at once, samples
+							for (const auto& [key, count] : thread_counts) std::fprintf(f, "T %x %08x %u %llu\n", std::get<0>(key), std::get<1>(key), std::get<2>(key), static_cast<unsigned long long>(count));
+							for (const auto& [key, count] : workload_counts) std::fprintf(f, "W %u %u %08x %u %llu\n", std::get<0>(key), std::get<1>(key), std::get<2>(key), std::get<3>(key), static_cast<unsigned long long>(count));
+							for (const auto& [key, count] : concurrency_counts) std::fprintf(f, "C %08x %u %llu\n", key.first, key.second, static_cast<unsigned long long>(count));
+							std::fclose(f);
+						}
+
 						if (FILE* f = std::fopen((std::string(sampler_path) + ".ppu").c_str(), "w"))
 						{
 							for (const auto& [key, count] : ppu_counts) std::fprintf(f, "%08x %08x %u %llu\n", std::get<0>(key), std::get<1>(key), std::get<2>(key), static_cast<unsigned long long>(count));
+							std::fclose(f);
+						}
+						if (FILE* f = std::fopen((std::string(sampler_path) + ".rsx").c_str(), "w"))
+						{
+							for (const u64 count : rsx_counts) std::fprintf(f, "%llu ", static_cast<unsigned long long>(count));
+							std::fclose(f);
+						}
+						if (FILE* f = std::fopen((std::string(sampler_path) + ".blocked").c_str(), "w"))
+						{
+							// SPU threads while the main thread waits or spins: its address, program, pc (bit 0: waits), samples
+							for (const auto& [key, count] : blocked_counts) std::fprintf(f, "%x %08x %05x %llu\n", std::get<0>(key), std::get<1>(key), std::get<2>(key), static_cast<unsigned long long>(count));
 							std::fclose(f);
 						}
 						if (FILE* f = std::fopen((std::string(sampler_path) + ".stack").c_str(), "w"))
@@ -2804,7 +3010,31 @@ void spu_thread::do_dma_transfer(spu_thread* _this, const spu_mfc_cmd& args, u8*
 		src = zero_buf;
 	}
 
-	rsx::reservation_lock<false, 1> rsx_lock(eal, args.size, !is_get && (g_cfg.video.strict_rendering_mode || (g_cfg.core.rsx_fifo_accuracy && !g_cfg.core.spu_accurate_dma && eal < rsx::constants::local_mem_base)));
+	// The render thread's vertex source (spu_upload.h): the bytes of this PUT go to its heap too, while they are hot
+	// A known job's vertex data (its command chunks are a third of a kilobyte) is not something the render thread's
+	// command reader can run into: the lock that makes command fetches atomic is left out for it (live control 19 = 4 keeps it)
+	bool vertex_data = false;
+
+	if (!is_get && rsx::spu_upload::enabled() && eal < rsx::constants::local_mem_base && dst == vm::_ptr<u8>(eal)) [[likely]]
+	{
+		if (!rsx::spu_upload::from_known_job(ls))
+		{
+			rsx::spu_upload::invalidate(eal, args.size);
+		}
+		else vertex_data = args.size >= 0x400 && rsx::spu_upload::g_state.mapped.load(std::memory_order_relaxed) && rsx::spu_upload::mode() != 4, rsx::spu_upload::publish(eal, src, args.size, [](u8* to, const void* from, u32 bytes)
+		{
+			if (utils::has_avx512())
+			{
+				vk::readback_copy::stream(to, from, bytes);
+			}
+			else
+			{
+				std::memcpy(to, from, bytes);
+			}
+		});
+	}
+
+	rsx::reservation_lock<false, 1> rsx_lock(eal, args.size, !is_get && !vertex_data && (g_cfg.video.strict_rendering_mode || (g_cfg.core.rsx_fifo_accuracy && !g_cfg.core.spu_accurate_dma && eal < rsx::constants::local_mem_base)));
 
 	if (!is_get || g_cfg.core.spu_accurate_dma)  [[unlikely]]
 	{
@@ -3995,6 +4225,12 @@ NEVER_INLINE static bool do_list_transfer_diagnostic(spu_thread& self, spu_mfc_c
 
 		const u32 size = items[index].ts & ts_mask;
 		const u32 addr = items[index].ea;
+
+		if ((transfer.cmd & MFC_PUT_CMD) && addr < rsx::constants::local_mem_base && rsx::spu_upload::enabled())
+		{
+			// A list PUT is not published; elements that go through do_dma_transfer publish themselves afterwards
+			rsx::spu_upload::invalidate(addr, size);
+		}
 		if (optimization_compatible == MFC_GET_CMD || optimization_compatible == MFC_PUT_CMD)
 			rsx::tail_demand_trace::observe(addr, size, arg_lsa + (addr & 0xf),
 				optimization_compatible == MFC_GET_CMD, self.pc, self.lv2_id, 2);
@@ -4756,6 +4992,12 @@ bool spu_thread::do_list_transfer(spu_mfc_cmd& args)
 		const u32 size = items[index].ts & ts_mask;
 		const u32 addr = items[index].ea;
 
+		if ((transfer.cmd & MFC_PUT_CMD) && addr < rsx::constants::local_mem_base && rsx::spu_upload::enabled())
+		{
+			// A list PUT is not published; elements that go through do_dma_transfer publish themselves afterwards
+			rsx::spu_upload::invalidate(addr, size);
+		}
+
 		// Try to inline the transfer
 		if (size && infamous_native::current().in_occlusion(addr) && native_ssao_skips_spu_work()) [[unlikely]]
 		{
@@ -5022,6 +5264,8 @@ bool spu_thread::do_putllc(const spu_mfc_cmd& args)
 
 	// Store conditionally
 	const u32 addr = args.eal & -128;
+
+	rsx::spu_upload::invalidate(addr, 128);
 
 	if ([&]()
 	{
@@ -5441,6 +5685,8 @@ void spu_thread::do_putlluc(const spu_mfc_cmd& args)
 	perf_meter<"PUTLLUC"_u64> perf0;
 
 	const u32 addr = args.eal & -128;
+
+	rsx::spu_upload::invalidate(addr, 128);
 
 	if (raddr && addr == raddr && g_cfg.core.spu_accurate_reservations)
 	{
@@ -5995,6 +6241,8 @@ bool spu_thread::process_mfc_cmd()
 
 		const u32 addr = ch_mfc_cmd.eal & -128;
 		const auto& data = vm::_ref<spu_rdata_t>(addr);
+
+		spurs_reserve::on_getllar(*this, addr);
 
 		if (addr == last_faddr)
 		{
