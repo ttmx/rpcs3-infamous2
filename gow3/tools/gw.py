@@ -254,4 +254,12 @@ if __name__ == '__main__':
         while fps(2, 'revive', quiet=True)['spu_cores'] < 3 and n < 6: send_keys(game_window(), 'x', .06); time.sleep(14); n += 1
         print('revived', n)
     elif cmd == 'ab': ab(float(sys.argv[2]), int(sys.argv[3]), sys.argv[4:])
+    elif cmd == 'fightfps':
+        # fightfps <seconds> <label>: fps, but a window in which Kratos died (the fight's load is gone) is measured
+        # again after a restart from the checkpoint
+        for attempt in range(6):
+            r = fps(float(sys.argv[2]), sys.argv[3] if len(sys.argv) > 3 else '', quiet=True)
+            if r['spu_cores'] >= 4.5 and r['W'] is not None and r['W'] > 28: break
+            send_keys(game_window(), 'x', .06); time.sleep(14)
+        print(json.dumps(r))
     else: sys.exit(__doc__)

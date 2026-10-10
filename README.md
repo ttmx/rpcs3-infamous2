@@ -46,9 +46,11 @@ Stock with Strict Rendering off on the left, this build uncapped on the right (F
   lights, culls and packs the vertices, about 124,000 jobs a second. The anti-aliasing became a GPU pass, line stores
   no longer stop every PPU thread, the hot loops of the geometry job and of three other jobs run as host code
   (thirteen kernels, developed against an offline replay of captured jobs), the job's vertex output goes to the GPU
-  buffer from the SPU thread that wrote it, and the SPUs the game ties geometry to are kept for it. The first fight
-  went from 29 FPS to session means of 48 to 58 at 30 W; the menu and cutscenes hold 60. See
-  [`gow3/`](gow3/README.md).
+  buffer from the SPU thread that wrote it (index lists too, already converted), and the game's SPURS instance gets
+  a sixth SPU that runs geometry jobs only. Recompiled SPU code is compared with the local store once per change
+  instead of at every chunk entry, which was 11 to 13% of all SPU time here and 9% in inFamous. The first fight went
+  from 29 FPS to session means of 57 to 59 at 30 W, most of it at the 60 FPS cap; the menu and cutscenes hold 60.
+  See [`gow3/`](gow3/README.md).
 
 All three were tested for an evening each, in their first minutes (and one open-city district of inFamous).
 

@@ -28,7 +28,7 @@ All figures: Ryzen 7 8845HS / Radeon 780M on AC, power profile "balanced" (30 W 
 |---|---|---|---|
 | main menu | 33.7 FPS | 42 to 46 FPS | 60.0 FPS, render thread at 0.54 of a core |
 | opening cutscene (in engine), 30 s | | 44.9 FPS (without the two main changes below) | 60.0 FPS at 21 W, render thread at 0.41 of a core |
-| first fight on Gaia | 29 FPS (one load) | 32 to 35 FPS (single loads) | 41 to 42 FPS after the first night (means of 6 or 7 loads); about 44 after the second round; 50.6 after the third (host kernels, see below); 56.9 after the fourth (ten kernels, non-temporal vertex copies); the fifth (three more kernels) takes 0.7 to 1.5 ms off the main thread's waits, between 0 and 5 FPS depending on the stretch; all at 30 W |
+| first fight on Gaia | 29 FPS (one load) | 32 to 35 FPS (single loads) | 41 to 42 FPS after the first night (means of 6 or 7 loads); about 44 after the second round; 50.6 after the third (host kernels, see below); 56.9 after the fourth (ten kernels, non-temporal vertex copies); the fifth (three more kernels) takes 0.7 to 1.5 ms off the main thread's waits, between 0 and 5 FPS depending on the stretch; 57 to 59 in session means after the eighth (code verification once per change, a sixth SPU for geometry, index lists from the SPU side), most 5 second windows at the 60 FPS cap; all at 30 W |
 | first fight, `launch.py --fast` (relaxed SPU floats) | | | 44.8 FPS (mean of 6 loads, first night; not measured again) |
 | first fight, performance power profile (54 W) | | | 49 FPS before the third round; 54 to 60 after it |
 
@@ -539,6 +539,57 @@ pictures correct.
 Tools added: `tools/coldfight.sh` (cold boot, N windows of the fight with watts per window), `tools/patchfight.sh`,
 `tools/dmashare.sh`, the sampler's `.kctx` (per SPU: pc, state, reservation address, SPURS workload, contention and
 priority tables from the kernel's local store).
+
+## Eighth round: where the SPU threads' time really went
+
+The first fight at the sustained 30 W after this round: 57.5 to 59 FPS in session means, most 5 second windows at
+the 60 FPS cap, dips to the low 50s (54 to 56 before it). What was found, in the order it mattered:
+
+- **Code verification at every chunk entry was 11 to 13% of all SPU time** (`perf` with the recompiler's symbols:
+  the entry functions `__spu-0x...` against the chunk bodies `__spu-cx...`). A recompiled chunk compares the local
+  store with the code it was compiled from each time it is entered, and this game's jobs call small functions per
+  element (the frustum test `0x4c48` of the culling job is 81 instructions and was a fifth of that job's time).
+  Now a chunk that passed notes it per thread (`spu_thread::verify_cache`, by entry pc: an identifier from the
+  chunk's hash and the thread's generation) and marks the 128-byte lines of its code; the next entry finds the note
+  and skips the comparison. Every transfer into the local store (GET, the list forms with their real extent,
+  GETLLAR) that touches a marked line starts another generation. Comparisons went from 26 to 2.2 million a second,
+  the entry functions from 11-13% to 1-2% of the SPU threads; SPU time a frame 104.6 against 112.6 core-ms and
+  58.0 against 56.4 FPS inside one session (live control 23 bit 2). inFamous: 3.39 against 3.71 SPU cores at its
+  cap. `RPCS3_SPU_VERIFY_ONCE=1`, a default of the fork; `=2` runs every comparison and reports a chunk that
+  changed without a transfer (stores of the program into its own code are the one thing not seen): none in this
+  game, inFamous or Ratchet & Clank, a minute each. RawSPU threads keep the full check.
+- **A sixth SPU for the geometry jobs** (`RPCS3_GOW3_SIX_SPUS=1`, default; `RPCS3_SPU_EXTRA_THREADS`,
+  `RPCS3_SPURS_EXTRA_WORKLOADS`). The game's SPURS instance has five SPUs; its count is `li r6, 5` at `0x28ec7c`.
+  With six, the sixth took a job of workload 6 and read from address 0: that job has five buffers of 0xA280 bytes,
+  one per SPU (`0x229410`, `cmpdi r30, 5`). With that fixed the main thread crashed on memory another per-SPU
+  array had overrun. So the sixth SPU is kept out of every workload but the three geometry queues, whose per-worker
+  structures are the ones the seventh round found (rings and count for six, priorities 5 5 5 0 0 5): 54.9 against
+  53.5 FPS (three pairs of sessions). Geometry on all six: 56.7 against 58.4, not kept. `states/menu6` is the
+  menu state of this boot (`tools/sixboot.sh`; `FIGHT_STATE=menu6 tools/fight.sh ...`).
+- **What the main thread waits for.** Its three spin loops are 42% of its time on the CPU. During the two long ones
+  (`0x228ef0` and the one at `0x2303e4`) SPU 3 and 4 run the culling job `72cc647b` and SPU 0 to 2 geometry: the
+  flag is cleared when a batch of those jobs is done (`0x28cf50` submits them with a counter word). After the
+  verification change the waits are a third of the frame instead of half.
+- **Index lists from the upload heap** (`RPCS3_SPU_INDEX_UPLOAD=1`, default). The render thread converted every
+  draw's index list (byte swap, smallest and largest index: 9% of its time). The publishing SPU thread now writes
+  a second heap with every byte pair swapped and the extremes of each 256-byte granule; a draw whose list lies in
+  one published range binds that heap. 1.2 million lists compared with guest memory, none differing; 15.0 against
+  15.25 ms of render thread time a frame, 57.7 against 57.3 FPS.
+- **The geometry jobs' wait for their output ring** (`0xd7e8`) became 14 to 22% of the workers' time once they
+  were faster: a GET of the RSX label, then a delay of 2,400 decrementer reads. `RPCS3_SPU_DELAY_LOOPS=1` makes
+  such a loop cheap (the time is read in the last turn only, PAUSE every 16th): no change (56.4 against 56.6), the
+  workers wait for the render thread either way. Off.
+
+Tried and not kept: `RSX FIFO Fetch Accuracy: Fast` (the render thread reads unmapped memory), two pinning layouts
+for the nine busy threads (56.3 against 58.1 and 50.7 against 56.4 unpinned), a kernel for a sort function of a
+`72cc647b` binary that the fight does not run (the sampler's program hash covers only 256 bytes of the job
+manager: two builds of the job share it; `RPCS3_SPU_REGION_CAPTURE=<dir>,<pc>,0` now captures whatever is at an
+address). `RPCS3_PPU_SPIN_PAUSE=1` (two PAUSE per turn of a PPU loop that only reads memory and compares) is built
+and not measured properly.
+
+Measuring: `tools/statepair.sh`, `tools/envpair.sh` (alternating sessions for what cannot be switched live),
+`tools/rsxwork.sh` (the render thread's working time per frame in one session). A recompiler change that fails
+LLVM's verification leaves the SPU cache build standing at the last modules: look for `·F` in the log first.
 
 ## Running it
 
