@@ -10,10 +10,6 @@ MSYS2="${2:-clang64}"
 # shellcheck disable=SC2046
 git submodule -q update --init $(awk '/path/ && !/llvm/ && !/opencv/ && !/ffmpeg/ && !/curl/ && !/FAudio/ && !/zlib/ { print $3 }' .gitmodules)
 
-# Newer libc++ (MSYS2) cannot resolve the address of unique_ptr::operator* that this OpenAL revision passes to
-# std::views::transform; a lambda does the same
-sed -i 's/std::views::transform(&ContextBase::EffectSlotCluster::operator\*)/std::views::transform([](const ContextBase::EffectSlotCluster \&c) -> auto \& { return *c; })/' 3rdparty/OpenAL/openal-soft/alc/alc.cpp
-
 mkdir build && cd build || exit 1
 
 export CC="clang"
