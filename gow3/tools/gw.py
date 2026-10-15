@@ -86,7 +86,9 @@ def launch(args):
             if not n: text = text.replace('Video:\n', f'Video:\n  {name}: {value}\n', 1)
         cfg = session / 'config.yml'; cfg.write_text(text)
     boot = str(W / 'states' / (opts['--state'] + '.SAVESTAT.zst')) if '--state' in opts else GAME
-    argv = [str(STOCK if stock else FORK), '--no-gui', '--input-config=ProfilingKeyboard', '--config=' + str(cfg), boot]
+    argv = [opts.get('--bin') or str(STOCK if stock else FORK), '--no-gui', '--input-config=ProfilingKeyboard', '--config=' + str(cfg), boot]
+    # --bin=PATH runs another build of the fork (a release AppImage) with the same settings; with an AppImage the
+    # per-thread core figures read 0 (the emulator is a child of the AppImage runtime), frame rate and power are right
     # --perf: hold the performance power profile for the session, as the inFamous 2 launcher does
     if '--perf' in opts: argv = ['powerprofilesctl', 'launch', '--profile', 'performance', '--reason', 'RPCS3 test', '--appid', 'rpcs3', *argv]
     # GW_WRAP: a command in front of the emulator's (strace -f -c -o file ...)
