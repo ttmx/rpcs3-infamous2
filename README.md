@@ -1,11 +1,38 @@
-# RPCS3: inFamous 2 optimizations
+# RPCS3: optimizations for inFamous, Ratchet & Clank and God of War III
 
 A fork of [RPCS3](https://github.com/RPCS3/rpcs3) (upstream commit `0ca1c58`, version 0.0.43) with changes that make
-inFamous 2 (BCES01143, v1.04) lighter to run on the Vulkan renderer. Upstream's own README is in
-[README.upstream.md](README.upstream.md).
+five PS3 games lighter to run on the Vulkan renderer. It started with inFamous 2, hence the repository name. Upstream's
+own README is in [README.upstream.md](README.upstream.md).
 
-Everything was measured on one machine: a Ryzen 7 8845HS laptop with its integrated Radeon 780M (RADV), Linux, game
-at 1280x720 with no quality settings lowered, on AC with the GPU left on its default governor.
+## Supported games and benchmarks
+
+Everything was measured on one machine: a Ryzen 7 8845HS laptop with its integrated Radeon 780M (RADV), Linux,
+1280x720 with no quality settings lowered, on AC, the GPU left on its default governor; the inFamous, Ratchet & Clank and
+God of War III figures with the power profile "balanced" (30 W package limit). "RPCS3 paths" is this same binary with every switch of the fork off, which leaves RPCS3's own code;
+"uncapped" turns the frame limit off, which shows headroom but is a benchmark setting, not a way to play.
+
+| Game | Version | Scene | RPCS3 paths | This build | Launcher, notes |
+|---|---|---|---|---|---|
+| inFamous 2 | BCES01143 v1.04 | burning dock | 27.6 FPS | 60.0 FPS at the cap, 95.7 uncapped | `infamous2/launch.py`, table below, [`infamous2/docs/`](infamous2/docs/INVESTIGATION.md) |
+| inFamous 2 | | city street, about 10,000 draws per frame | 31.8 FPS | 59.0 FPS at the cap, 60.5 uncapped | |
+| inFamous: Festival of Blood | NPEA00322 v1.00 | opening hall | 29.5 FPS uncapped | 60.0 FPS at the cap, 89.2 uncapped | `infamous2/launch.py`, [`festival/`](festival/README.md) |
+| inFamous | BCES00609 v1.00 | first gameplay (crater) | 47.3 FPS uncapped | 59.3 FPS at the cap, 66.5 uncapped | `infamous1/launch.py`, [`infamous1/`](infamous1/README.md) |
+| inFamous | | in-engine city behind the title screen | 54.3 FPS uncapped | 60.0 FPS at the cap, 76.5 uncapped | |
+| Ratchet & Clank Future: Tools of Destruction | BCES00052 v1.00 | opening view of Metropolis | 31.2 FPS uncapped | 58.4 to 59.5 FPS at the cap (hot laptop), 64 to 66 uncapped | `ratchet/launch.py`, [`ratchet/`](ratchet/README.md) |
+| God of War III | BCES00510 v1.03 | first fight on Gaia, about 15 soldiers | 29 FPS at the cap | 57 to 59 FPS at the cap (session means, most 5-second windows at 60) | `gow3/launch.py`, [`gow3/`](gow3/README.md) |
+| God of War III | | main menu, opening cutscene | 33.7 FPS (menu) | 60.0 FPS | |
+
+Each game's folder has the method behind its figures (savestates or a scripted route, number of samples, what was
+compared live inside one boot) and its limits. In short: inFamous 2, Festival of Blood, inFamous and Ratchet & Clank
+are means of 10-second samples from one savestate boot per arm; God of War III has no savestates in gameplay and an
+unrepeatable fight, so its figure is the mean of 24 to 30 five-second windows over whole fight sessions, and session
+means of the same build still differ by 3 to 4 FPS.
+
+Every game was tested in its first minutes (and one open-city district of inFamous and of inFamous 2), for an evening
+or two each, not played through. Other games run with the general renderer and SPU changes, which are on for every
+title, but were not tested.
+
+### inFamous 2 in detail
 
 | Scene | Stock, Strict Rendering on | Stock, Strict Rendering off | This build, 60 FPS cap | This build, uncapped |
 |---|---|---|---|---|
@@ -14,11 +41,10 @@ at 1280x720 with no quality settings lowered, on AC with the GPU left on its def
 | City, savestate spawn view | 26.5 FPS | 33.1 FPS | 59.9 FPS | 69.9 FPS |
 | Swamp pier (mission start) | 34.7 FPS | 34.3 FPS | 60.0 FPS | 108.0 FPS |
 
-"Stock" is this same binary with every switch unset, which leaves RPCS3's own code paths; Strict Rendering Mode is
-an RPCS3 setting, so the second column is the fair baseline. The game caps itself at 60 FPS. "Uncapped" turns the
-frame limit off and sets the vblank rate to 120, which shows the headroom but is a benchmark setting, not a way to
-play. Each figure is the mean of three 10-second samples from one boot of a savestate
-(`infamous2/bench/compare.sh`); package power went from 31 W (stock, Strict off) to 38 W at the dock's 60 FPS cap.
+"Stock" is this same binary with every switch unset; Strict Rendering Mode is an RPCS3 setting, so the second column
+is the fair baseline. The game caps itself at 60 FPS. "Uncapped" also sets the vblank rate to 120. Each figure is the
+mean of three 10-second samples from one boot of a savestate (`infamous2/bench/compare.sh`); package power went from
+31 W (stock, Strict off) to 38 W at the dock's 60 FPS cap.
 
 Stock with Strict Rendering off on the left, this build uncapped on the right (FPS counter top left):
 
@@ -26,7 +52,9 @@ Stock with Strict Rendering off on the left, this build uncapped on the right (F
 
 ![City street: 31.7 FPS stock, 62.0 FPS with this build](infamous2/docs/images/street-before-after.jpg)
 
-## Other games
+## The other games
+
+What each game needed:
 
 - **inFamous: Festival of Blood** (NPEA00322) runs the same two SPU jobs as inFamous 2 at other guest addresses, so
   both GPU passes now cover it: 29.5 to 89.2 FPS uncapped in its opening catacombs, 60 FPS at the cap with 2.3 SPU
@@ -52,12 +80,10 @@ Stock with Strict Rendering off on the left, this build uncapped on the right (F
   from 29 FPS to session means of 57 to 59 at 30 W, most of it at the 60 FPS cap; the menu and cutscenes hold 60.
   See [`gow3/`](gow3/README.md).
 
-All three were tested for an evening each, in their first minutes (and one open-city district of inFamous).
-
 These are software changes. The two host tuning steps that were also tried (a GPU clock floor and a power profile)
 are kept apart in [`infamous2/hardware/`](infamous2/hardware/) and are off unless you ask for them.
 
-This is experimental work on one game, tested in three areas of it, on one GPU driver. The changes that helped are on by
+This is experimental work, tested on one machine and one GPU driver. The changes that helped are on by
 default (see below), and the tree still contains the diagnostics and the rejected experiments of the whole project.
 It is not affiliated with or endorsed by the RPCS3 team.
 
@@ -68,10 +94,15 @@ Build as upstream describes in [BUILDING.md](BUILDING.md), or download the AppIm
 (you still need this repository for the launcher and its configuration). Then:
 
 ```sh
-infamous2/launch.py /path/to/inFamous2          # the disc folder that contains PS3_GAME
+infamous2/launch.py /path/to/inFamous2                    # the disc folder that contains PS3_GAME
+infamous2/launch.py /path/to/dev_hdd0/game/NPEA00322      # Festival of Blood
+infamous1/launch.py /path/to/inFamous                     # the first game
+ratchet/launch.py /path/to/RatchetToD                     # Ratchet & Clank: Tools of Destruction
+gow3/launch.py /path/to/GodOfWar3.iso                     # God of War III, disc folder or decrypted .iso
 ```
 
-or set `INFAMOUS2_GAME` and `RPCS3_BIN` once and run `infamous2/launch.py`. The launcher finds `build/bin/rpcs3` of this
+Each launcher takes the same options (`--rpcs3`, `--config`, `--set`; `--help` lists them) and uses the
+`play-config.yml` of its own folder. For inFamous 2 you can also set `INFAMOUS2_GAME` and `RPCS3_BIN` once and run `infamous2/launch.py`. The launcher finds `build/bin/rpcs3` of this
 checkout by itself, uses your normal RPCS3 profile (firmware, saves, controller), a cache of its own
 (`~/.cache/rpcs3-infamous2`), and the configuration in [`infamous2/play-config.yml`](infamous2/play-config.yml).
 `infamous2/launch.py --help` lists the options; `--set NAME=VALUE` changes one switch, for example
@@ -80,8 +111,12 @@ checkout by itself, uses your normal RPCS3 profile (firmware, saves, controller)
 Requirements and limits:
 - The AppImage asks at every start whether to run an unofficial build. That is RPCS3's own warning for builds made
   outside its master branch; answer Yes.
-- Linux, Vulkan. Nothing was tried on Windows, macOS, the OpenGL renderer, or Nvidia and Intel drivers.
-- The exact game version above (European disc, BCES01143, patched to 1.04). The GPU lighting and occlusion passes
+- Linux, Vulkan. The releases include a Windows build made by the same CI, but nothing was tried on Windows, macOS,
+  the OpenGL renderer, or Nvidia and Intel drivers.
+- The exact game versions in the table. God of War III's sixth SPU is a built-in patch of the game's job queue set-up
+  that applies only to the v1.03 executable (checked by its hash, and not when a savestate is loaded); its host
+  kernels are matched by the bytes of the SPU code they replace, which runs as before when they differ.
+- inFamous 2: the exact version above (European disc, BCES01143, patched to 1.04). The GPU lighting and occlusion passes
   only switch on for that title ID, so other regional releases run the game's own SPU jobs and get only the general
   renderer changes. The passes also rely on fixed guest addresses from that executable: the lighting job is checked
   by its bytes and falls back to the SPU code when they differ, the occlusion pass is not, so another patch level of
@@ -97,9 +132,9 @@ Requirements and limits:
 Each line is one change, with its switch in parentheses. The ones listed here are on by default: the emulator sets
 them itself at startup (`rpcs3/Emu/infamous2_defaults.h`) unless the variable is already in the environment, so
 `RPCS3_VK_FAST_DRAWS=0 rpcs3` turns one off, and the launcher still sets them explicitly. These switches are not
-specific to the game (only the two GPU passes and the material binding default check the title ID), so they are on for every title, and nothing but
-inFamous 2 was tested with them. Figures are
-from the machine above and are not additive: they were measured at different stages and scenes.
+specific to the game (only the two GPU passes and the material binding default check the title ID), so they are on
+for every title, and only the five games above were tested with them. This list covers the inFamous 2 work; the
+changes made for the other games are listed change by change in their folders. Figures are from the machine above and are not additive: they were measured at different stages and scenes.
 
 ### The game's SPU rendering jobs, moved to the GPU
 
